@@ -160,6 +160,9 @@ pub struct Model {
     pub settings: Settings,
     background_since: Vec<(String, i64)>,
     effects: Vec<Effect>,
+    /// Recently closed tabs as (session, url, layout), newest last.
+    // shortcut: in-memory only, lost on quit; persist to SQLite if users want it across restarts.
+    closed: Vec<(String, String, String)>,
 }
 
 impl Model {
@@ -175,6 +178,7 @@ impl Model {
             settings: Settings::default(),
             background_since: Vec::new(),
             effects: Vec::new(),
+            closed: Vec::new(),
         };
         model.reload()?;
         if model.profiles.is_empty() {
@@ -436,6 +440,12 @@ impl Model {
             return Ok(());
         }
         let remaining = self.session_tabs().len();
+        if tab.url != "nxbrowser://home" && !tab.url.is_empty() {
+            self.closed.push((tab.session_id.clone(), tab.url.clone(), tab.layout.clone()));
+            if self.closed.len() > 20 {
+                self.closed.remove(0);
+            }
+        }
         self.storage.execute("DELETE FROM tabs WHERE id = ?1", params![tab_id])?;
         self.effects.push(Effect::CloseTab {
             tab_id: tab_id.to_string(),
@@ -452,6 +462,17 @@ impl Model {
         self.reload()?;
         self.queue_show_active();
         Ok(())
+    }
+
+    /// Reopens this session's most recently closed tab, returning its new id.
+    pub fn reopen_closed(&mut self) -> anyhow::Result<Option<String>> {
+        let Some(index) = self.closed.iter().rposition(|(session, ..)| *session == self.active_session_id) else {
+            return Ok(None);
+        };
+        let (_, url, layout) = self.closed.remove(index);
+        let id = self.create_tab(&url)?;
+        self.set_tab_layout(&id, &layout)?;
+        Ok(Some(id))
     }
 
     pub fn activate_tab(&mut self, tab_id: &str) -> anyhow::Result<()> {
@@ -627,6 +648,25 @@ impl Model {
                 visited_at: row.get(4)?,
             })
         })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Address bar matches as (url, title): bookmarks first, then history by recency, one row per url.
+    pub fn suggest(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.storage.conn().prepare(
+            "SELECT url, title, MIN(rank), MAX(at) FROM (
+                SELECT url, title, 0 AS rank, created_at AS at FROM bookmarks WHERE profile_id = ?1
+                UNION ALL
+                SELECT url, title, 1 AS rank, visited_at AS at FROM history WHERE profile_id = ?1
+             ) WHERE url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\'
+             GROUP BY url ORDER BY MIN(rank), MAX(at) DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![self.active_profile_id, pattern, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1135,6 +1175,33 @@ mod tests {
         loaded.switch_profile(&profile_id).unwrap();
         assert_eq!(loaded.active_tab().unwrap().url, url);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn closed_tab_reopens_with_its_layout() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let id = model.create_tab("https://example.com/").unwrap();
+        model.set_tab_layout(&id, "{\"x\":1}").unwrap();
+        model.close_tab(&id).unwrap();
+        let again = model.reopen_closed().unwrap().unwrap();
+        let tab = model.tabs.iter().find(|tab| tab.id == again).unwrap();
+        assert_eq!((tab.url.as_str(), tab.layout.as_str()), ("https://example.com/", "{\"x\":1}"));
+        assert!(model.reopen_closed().unwrap().is_none());
+    }
+
+    #[test]
+    fn suggestions_rank_bookmarks_then_recent_history() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let tab = model.active_tab().unwrap().id.clone();
+        model.note_navigation(&tab, "https://rust-lang.org/", "Rust").unwrap();
+        model.note_navigation(&tab, "https://docs.rs/", "Docs rust").unwrap();
+        model.note_navigation(&tab, "https://example.com/", "Example").unwrap();
+        model.navigate_active("https://rust-lang.org/").unwrap();
+        model.note_navigation(&tab, "https://rust-lang.org/", "Rust").unwrap();
+        model.toggle_bookmark().unwrap();
+        let urls: Vec<String> = model.suggest("rust", 5).unwrap().into_iter().map(|(url, _)| url).collect();
+        assert_eq!(urls, ["https://rust-lang.org/", "https://docs.rs/"]);
+        assert!(model.suggest("100%", 5).unwrap().is_empty());
     }
 
     #[test]

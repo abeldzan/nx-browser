@@ -1,6 +1,6 @@
 use crate::settings::{measure_overlay, toggle};
 use crate::ui::{action_button, Kind};
-use crate::window::{paint, site_color, BrowserWindow, Paint, TITLEBAR_H};
+use crate::window::{paint, site_color, BrowserWindow, Paint};
 use browser_extensions::store_id;
 use gpui::{div, img, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
 use gpuikit::elements::icon_button::icon_button;
@@ -58,7 +58,7 @@ impl BrowserWindow {
         v_stack()
             .id("extensions-popover")
             .absolute()
-            .top(px(TITLEBAR_H + 6.))
+            .top(px(self.titlebar_h() + 6.))
             .right(px(8.))
             .w(px(400.))
             .h(px(height))

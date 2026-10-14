@@ -12,7 +12,7 @@ use browser_engine_macos::{choose_folder_path, choose_open_path, choose_save_pat
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
 use browser_storage::Storage;
 use gpui::{
-    canvas, div, img, prelude::*, px, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
+    canvas, div, img, prelude::*, px, relative, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
     Subscription, Window,
 };
@@ -102,12 +102,68 @@ pub struct BrowserWindow {
     metrics: SharedString,
     self_test: Option<SelfTest>,
     cookies_saved: Instant,
-    /// Window dock under the title bar: hovered state, progress when it last changed, and when.
-    dock_open: bool,
+    /// Window dock under the title bar.
+    dock: Tween,
     /// Pointer over the dock; it stays shut while a window drag is in progress.
     dock_hovered: bool,
-    dock_from: f32,
-    dock_at: Instant,
+    find: Tween,
+    panel_tween: Tween,
+    /// Sidebar page still drawn while its panel slides shut.
+    shown_panel: Option<SidebarPage>,
+    /// Status message shown as a toast, and when it changed.
+    toast: (SharedString, Instant),
+    /// Load bar width for the active tab, and when its load finished (the bar then fades).
+    load_bar: f32,
+    load_done: Option<Instant>,
+    /// New windows growing in, and windows shrinking away before their tabs close.
+    opened: HashMap<String, Instant>,
+    closing: HashMap<String, Instant>,
+    /// Address bar matches (url, title) and the one picked with the arrow keys.
+    suggestions: Vec<(String, String)>,
+    suggestion: Option<usize>,
+    address_bounds: Option<gpui::Bounds<Pixels>>,
+    pub(crate) compact: bool,
+    reduce_motion: bool,
+    /// Theme variant and accent last applied, so the global theme is only swapped on change.
+    applied_theme: String,
+}
+
+/// Eased 0..=1 progress toward open (1) or shut (0), restarting from wherever it is when flipped.
+#[derive(Clone, Copy)]
+struct Tween {
+    open: bool,
+    from: f32,
+    at: Instant,
+    dur: Duration,
+}
+
+impl Tween {
+    fn new(open: bool) -> Self {
+        Self { open, from: if open { 1.0 } else { 0.0 }, at: Instant::now(), dur: Duration::ZERO }
+    }
+
+    fn progress(&self) -> f32 {
+        let target = if self.open { 1.0 } else { 0.0 };
+        if self.dur.is_zero() {
+            return target;
+        }
+        self.from + (target - self.from) * ease(self.at.elapsed().as_secs_f32() / self.dur.as_secs_f32())
+    }
+
+    fn set(&mut self, open: bool, dur: Duration) -> bool {
+        if open == self.open {
+            return false;
+        }
+        self.from = self.progress();
+        self.open = open;
+        self.at = Instant::now();
+        self.dur = dur;
+        true
+    }
+
+    fn running(&self) -> bool {
+        self.at.elapsed() < self.dur
+    }
 }
 
 struct SelfTest {
@@ -160,6 +216,12 @@ impl BrowserWindow {
                     this.address_focused = false;
                     this.address_editing = false;
                     this.refresh_url(cx);
+                }
+                InputStateEvent::TextChanged => {
+                    let typed = input.read(cx).content().to_string();
+                    this.suggestions = this.model.lock().expect("model").suggest(&typed, 6).unwrap_or_default();
+                    this.suggestion = None;
+                    cx.notify();
                 }
                 _ => {}
             }),
@@ -282,10 +344,22 @@ impl BrowserWindow {
                 started: Instant::now(),
             }),
             cookies_saved: Instant::now(),
-            dock_open: false,
+            dock: Tween::new(false),
             dock_hovered: false,
-            dock_from: 0.0,
-            dock_at: Instant::now(),
+            find: Tween::new(false),
+            panel_tween: Tween::new(false),
+            shown_panel: None,
+            toast: ("Ready".into(), Instant::now() - TOAST_LIFE),
+            load_bar: 0.0,
+            load_done: None,
+            opened: HashMap::new(),
+            closing: HashMap::new(),
+            suggestions: Vec::new(),
+            suggestion: None,
+            address_bounds: None,
+            compact: false,
+            reduce_motion: false,
+            applied_theme: String::new(),
         };
         view.apply_settings();
         if view.self_test.is_none() {
@@ -416,9 +490,12 @@ impl BrowserWindow {
                 if active.as_deref() == Some(tab_id.as_str()) && !self.address_focused && !url.is_empty() {
                     self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
                 }
+                if is_web(&url) {
+                    let zoom = self.model.lock().expect("model").settings.zoom_for(&site_glyph(&url).1);
+                    self.engine.set_zoom(&tab_id, zoom);
+                }
                 if !loading {
                     self.save_cookies();
-                    self.status = if title.is_empty() { "Loaded".into() } else { title.into() };
                     let (_, host) = site_glyph(&url);
                     if self.self_test.is_none() && is_web(&url) && !favicon_path(&host).exists() {
                         self.engine.eval(&tab_id, "favicon", FAVICON_JS);
@@ -471,7 +548,7 @@ impl BrowserWindow {
                 self.extensions_open = true;
             }
             EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
-            EngineEvent::CloseTab { tab_id } => self.with_model(|model| { let _ = model.close_tab(&tab_id); }),
+            EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
         }
     }
 
@@ -482,21 +559,44 @@ impl BrowserWindow {
                 None => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
             },
             Shortcut::CloseTab => {
-                let id = self.model.lock().expect("model").active_tab().map(|tab| tab.id.clone());
-                if let Some(id) = id {
-                    self.with_model(|model| { let _ = model.close_tab(&id); });
+                if let Some(id) = self.active_tab_id() {
+                    self.close_tabs(vec![id], cx);
                 }
             }
-            Shortcut::FocusUrl => {
-                self.focus_address = true;
-                self.status = "Address bar".into();
-            }
+            Shortcut::FocusUrl => self.focus_address = true,
             Shortcut::Reload => self.reload(),
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
             Shortcut::Find => self.find_open = true,
             Shortcut::Bookmark => self.bookmark(),
             Shortcut::Settings => self.toggle_settings(cx),
+            Shortcut::ReopenTab => match self.with_model(|model| model.reopen_closed()) {
+                Ok(Some(id)) => self.focus_window(&id, cx),
+                _ => self.status = "No recently closed tabs".into(),
+            },
+            Shortcut::ZoomIn => self.zoom(1),
+            Shortcut::ZoomOut => self.zoom(-1),
+            Shortcut::ZoomReset => self.zoom(0),
+            Shortcut::SelectTab(n) => {
+                let ids = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+                let pick = if n == 9 { ids.last() } else { ids.get(n - 1) };
+                if let Some(id) = pick.cloned() {
+                    self.focus_window(&id, cx);
+                }
+            }
+            Shortcut::NextTab | Shortcut::PrevTab => {
+                let ids = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+                let at = self.active_tab_id().and_then(|id| ids.iter().position(|other| *other == id)).unwrap_or(0);
+                let step = if matches!(shortcut, Shortcut::NextTab) { 1 } else { ids.len().saturating_sub(1) };
+                if let Some(id) = ids.get((at + step) % ids.len().max(1)).cloned() {
+                    self.focus_window(&id, cx);
+                }
+            }
+            Shortcut::Print => {
+                if let Some(id) = self.active_tab_id() {
+                    self.engine.print(&id);
+                }
+            }
         }
         self.refresh_url(cx);
     }
@@ -672,7 +772,7 @@ impl BrowserWindow {
             Some(url) => self.open_extension_panel(id, &url, cx),
             None => {
                 let (store, tab) = (self.active_store(), self.active_tab_id());
-                let anchor = [f64::from(at) - 13., 0., 26., f64::from(TITLEBAR_H)];
+                let anchor = [f64::from(at) - 13., 0., 26., f64::from(self.titlebar_h())];
                 self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor);
             }
         }
@@ -730,21 +830,110 @@ impl BrowserWindow {
             fraud_warnings: settings.fraud_warnings,
             https_only: settings.https_only,
             inspectable: settings.inspector,
-            user_agent: settings.user_agent,
+            user_agent: settings.user_agent.clone(),
             page_zoom: settings.page_zoom,
         });
+        self.compact = settings.compact();
+        self.reduce_motion = settings.reduce_motion;
+        // set_settings reset every page to the default zoom.
+        let tabs = self.model.lock().expect("model").tabs.iter().map(|tab| (tab.id.clone(), tab.url.clone())).collect::<Vec<_>>();
+        for (id, url) in tabs.iter().filter(|(_, url)| is_web(url)) {
+            self.engine.set_zoom(id, settings.zoom_for(&site_glyph(url).1));
+        }
     }
 
-    fn apply_theme(&self, window: &Window, cx: &mut Context<Self>) {
-        let theme = self.model.lock().expect("model").settings.theme.clone();
+    /// Steps the active site's zoom through Chrome's levels; 0 resets it to the default.
+    fn zoom(&mut self, direction: i32) {
+        let Some(tab) = self.model.lock().expect("model").active_tab().cloned() else {
+            return;
+        };
+        if !is_web(&tab.url) {
+            return;
+        }
+        let host = site_glyph(&tab.url).1;
+        let (current, default) = {
+            let model = self.model.lock().expect("model");
+            (model.settings.zoom_for(&host), model.settings.page_zoom)
+        };
+        let next = match direction {
+            0 => default,
+            d if d > 0 => ZOOM_LEVELS.iter().copied().find(|level| *level > current + 0.001).unwrap_or(ZOOM_LEVELS[ZOOM_LEVELS.len() - 1]),
+            _ => ZOOM_LEVELS.iter().rev().copied().find(|level| *level < current - 0.001).unwrap_or(ZOOM_LEVELS[0]),
+        };
+        let _ = self.model.lock().expect("model").update_settings(|s| {
+            if (next - default).abs() < 0.001 {
+                s.site_zoom.remove(&host);
+            } else {
+                s.site_zoom.insert(host.clone(), next);
+            }
+        });
+        self.engine.set_zoom(&tab.id, next);
+        self.status = format!("Zoom {:.0}%", next * 100.0).into();
+    }
+
+    fn anim(&self, duration: Duration) -> Duration {
+        if self.reduce_motion { Duration::ZERO } else { duration }
+    }
+
+    /// Closes tabs; a whole window shrinks away first, then its tabs close.
+    pub(crate) fn close_tabs(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(first) = ids.first() else {
+            return;
+        };
+        let group = self.group_id(first);
+        let whole = self.chrome.keys().filter(|id| self.group_id(id) == group).all(|id| ids.contains(id));
+        if whole && !self.reduce_motion && self.self_test.is_none() {
+            for id in ids {
+                self.closing.entry(id).or_insert_with(Instant::now);
+            }
+        } else {
+            self.with_model(|model| {
+                for id in &ids {
+                    let _ = model.close_tab(id);
+                }
+            });
+            self.refresh_url(cx);
+        }
+        cx.notify();
+    }
+
+    /// Scale and opacity for a window opening or closing; (1, 1) when at rest.
+    fn window_motion(&self, id: &str) -> (f32, f32) {
+        let t = |at: &Instant| ease(at.elapsed().as_secs_f32() / WINDOW_ANIM.as_secs_f32());
+        let p = match (self.closing.get(id), self.opened.get(id)) {
+            (Some(at), _) => 1.0 - t(at),
+            (None, Some(at)) => t(at),
+            _ => return (1.0, 1.0),
+        };
+        (WINDOW_FROM_SCALE + (1.0 - WINDOW_FROM_SCALE) * p, p)
+    }
+
+    pub(crate) fn titlebar_h(&self) -> f32 {
+        if self.compact { 30.0 } else { TITLEBAR_H }
+    }
+
+    fn title_h(&self) -> f64 {
+        if self.compact { 28.0 } else { TITLE_H }
+    }
+
+    fn apply_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let (theme, accent) = {
+            let model = self.model.lock().expect("model");
+            (model.settings.theme.clone(), model.settings.accent.clone())
+        };
         let dark = match theme.as_str() {
             "light" => false,
             "dark" => true,
             _ => matches!(window.appearance(), gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark),
         };
-        if (cx.theme().variant == ThemeVariant::Dark) != dark {
-            let next = if dark { Theme::default() } else { Theme::gruvbox_light() };
+        let key = format!("{dark}{accent}");
+        if key != self.applied_theme || (cx.theme().variant == ThemeVariant::Dark) != dark {
+            let mut next = if dark { Theme::default() } else { Theme::gruvbox_light() };
+            if !accent.is_empty() {
+                next.accent_color = parse_hex(&accent);
+            }
             cx.set_global(GlobalTheme(Arc::new(next)));
+            self.applied_theme = key;
         }
     }
 
@@ -770,6 +959,8 @@ impl BrowserWindow {
         };
         self.address_focused = false;
         self.address_editing = false;
+        self.suggestions.clear();
+        self.suggestion = None;
         self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         self.with_model(|model| {
             let _ = model.navigate_active(&url);
@@ -1023,6 +1214,8 @@ impl BrowserWindow {
         }
         self.focus_address = false;
         self.address_editing = true;
+        self.suggestions.clear();
+        self.suggestion = None;
         if let Some(id) = self.active_tab_id() {
             self.chrome.entry(id).or_default().minimized = false;
         }
@@ -1097,6 +1290,7 @@ impl Render for BrowserWindow {
         self.prepare_frames(&tabs);
         self.sync_groups();
         self.save_layouts(&tabs);
+        self.step_motion(cx);
         if self.animating() {
             window.request_animation_frame();
         }
@@ -1134,7 +1328,7 @@ impl Render for BrowserWindow {
                     .h_full()
                     .overflow_hidden()
                     .child(self.stage(&tabs, entity, cx))
-                    .when_some(self.panel, |column, page| {
+                    .when_some(self.shown_panel, |column, page| {
                         column.child(self.panel_view(
                             page,
                             &profiles,
@@ -1148,6 +1342,8 @@ impl Render for BrowserWindow {
             ),
             )
             .child(self.dock(&tabs, cx))
+            .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
+            .child(self.toast_view(cx))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
@@ -1158,6 +1354,128 @@ impl Render for BrowserWindow {
 }
 
 impl BrowserWindow {
+    /// Moves every animation one frame along: tweens follow their targets, finished closes run.
+    fn step_motion(&mut self, cx: &mut Context<Self>) {
+        let (find, panel) = (self.anim(PANEL_ANIM), self.anim(PANEL_ANIM));
+        self.find.set(self.find_open, find);
+        if self.panel.is_some() {
+            self.shown_panel = self.panel;
+        }
+        self.panel_tween.set(self.panel.is_some(), panel);
+        if self.panel.is_none() && self.panel_tween.progress() <= 0.0 {
+            self.shown_panel = None;
+        }
+        if self.status != self.toast.0 {
+            self.toast = (self.status.clone(), Instant::now());
+        }
+        let progress = self.active_tab_id().and_then(|id| self.engine.progress(&id));
+        match progress {
+            Some(target) => {
+                let target = (target as f32).max(0.08);
+                self.load_bar = if self.reduce_motion { target } else { self.load_bar + (target - self.load_bar) * 0.2 };
+                self.load_done = None;
+            }
+            None if self.load_bar > 0.0 && self.load_done.is_none() => {
+                self.load_bar = 1.0;
+                self.load_done = Some(Instant::now());
+            }
+            None if self.load_done.is_some_and(|at| at.elapsed() >= LOAD_FADE) => {
+                self.load_bar = 0.0;
+                self.load_done = None;
+            }
+            None => {}
+        }
+        self.opened.retain(|_, at| at.elapsed() < WINDOW_ANIM);
+        let done = self.closing.iter().filter(|(_, at)| at.elapsed() >= WINDOW_ANIM).map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        if !done.is_empty() {
+            self.closing.retain(|id, _| !done.contains(id));
+            self.with_model(|model| {
+                for id in &done {
+                    let _ = model.close_tab(id);
+                }
+            });
+            self.refresh_url(cx);
+        }
+    }
+
+    fn toast_view(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let age = self.toast.1.elapsed();
+        if age >= TOAST_LIFE || self.toast.0.is_empty() || self.self_test.is_some() {
+            return div();
+        }
+        let paint = paint(cx);
+        let fade = TOAST_LIFE - TOAST_IN;
+        let p = if self.reduce_motion {
+            1.0
+        } else if age < TOAST_IN {
+            ease(age.as_secs_f32() / TOAST_IN.as_secs_f32())
+        } else if age > fade {
+            1.0 - ease((age - fade).as_secs_f32() / TOAST_IN.as_secs_f32())
+        } else {
+            1.0
+        };
+        // The pill stays opaque: pages are cut out beneath it, so only its contents fade.
+        div().absolute().bottom(px(18. - (1. - p) * 14.)).left_0().right_0().flex().justify_center().child(
+            div()
+                .relative()
+                .max_w(px(420.))
+                .px(px(14.))
+                .py(px(7.))
+                .rounded(px(10.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(px(12.))
+                .child(measure_overlay(10., cx))
+                .child(div().opacity(p).truncate().child(self.toast.0.clone())),
+        )
+    }
+
+    fn suggestions_view(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(bounds) = self.address_bounds else {
+            return div();
+        };
+        let paint = paint(cx);
+        let mut list = v_stack()
+            .id("address-suggestions")
+            .absolute()
+            .left(bounds.origin.x)
+            .top(bounds.origin.y + bounds.size.height + px(4.))
+            .w(bounds.size.width.max(px(320.)))
+            .p(px(4.))
+            .rounded(px(10.))
+            .bg(paint.surface)
+            .border_1()
+            .border_color(paint.border)
+            .shadow_md()
+            .occlude()
+            .child(measure_overlay(10., cx));
+        for (index, (url, title)) in self.suggestions.iter().enumerate() {
+            let target = url.clone();
+            let picked = self.suggestion == Some(index);
+            list = list.child(
+                h_stack()
+                    .id(SharedString::from(format!("suggestion-{index}")))
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(5.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .when(picked, |row| row.bg(paint.accent_bg))
+                    .hover(|row| row.bg(paint.secondary))
+                    .child(div().flex_none().max_w(px(220.)).truncate().child(if title.is_empty() { display_url(url) } else { title.clone() }))
+                    .child(div().flex_1().min_w_0().truncate().text_color(paint.muted).child(display_url(url)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.commit_navigation(&target, cx);
+                    })),
+            );
+        }
+        div().child(list)
+    }
+
     fn toggle_panel(&mut self, page: SidebarPage, cx: &mut Context<Self>) {
         self.panel = if self.panel == Some(page) { None } else { Some(page) };
         cx.notify();
@@ -1298,6 +1616,9 @@ impl BrowserWindow {
             let entry = self.chrome.entry(tab.id.clone()).or_default();
             if entry.frame.is_some() {
                 continue;
+            }
+            if self.layout_stage.is_some() && self.self_test.is_none() && !self.reduce_motion {
+                self.opened.insert(tab.id.clone(), Instant::now());
             }
             let col = (index % cols) as f32;
             let row = (index / cols) as f32;
@@ -1533,14 +1854,18 @@ impl BrowserWindow {
                 self.engine.place_tab(&id, None);
                 continue;
             };
-            let find = if active.as_deref() == Some(id.as_str()) && self.find_open { FIND_H } else { 0.0 };
+            let find = if active.as_deref() == Some(id.as_str()) { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
+            let (scale, alpha) = self.window_motion(&id);
+            let frame = scaled(frame, scale);
+            let title_h = self.title_h();
             let rect = LogicalRect {
                 x: origin_x + f64::from(frame.x) + PAGE_INSET,
-                y: origin_y + f64::from(frame.y) + TITLE_H + find,
+                y: origin_y + f64::from(frame.y) + title_h + find,
                 width: (f64::from(frame.w) - PAGE_INSET * 2.0).max(1.0),
-                height: (f64::from(frame.h) - TITLE_H - find - PAGE_INSET).max(1.0),
+                height: (f64::from(frame.h) - title_h - find - PAGE_INSET).max(1.0),
             };
             self.engine.place_tab(&id, Some(rect.clone()));
+            self.engine.set_alpha(&id, f64::from(alpha));
             let shell = LogicalRect {
                 x: origin_x + f64::from(frame.x),
                 y: origin_y + f64::from(frame.y),
@@ -1745,10 +2070,12 @@ impl BrowserWindow {
         let maximized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized);
         let frame = self.chrome.get(&tab.id).and_then(|chrome| chrome.frame)?;
         // Occlude so a press on this window never also reaches the windows stacked beneath it.
-        let mut shell = div().absolute().overflow_hidden().occlude();
+        let (scale, alpha) = self.window_motion(&tab.id);
+        let mut shell = div().absolute().overflow_hidden().occlude().opacity(alpha);
         shell = if maximized {
             shell.left(px(8.)).top(px(8.)).right(px(8.)).bottom(px(8.))
         } else {
+            let frame = scaled(frame, scale);
             shell.left(px(frame.x)).top(px(frame.y)).w(px(frame.w)).h(px(frame.h))
         };
         let mut body = div().relative().size_full().child(
@@ -1761,7 +2088,9 @@ impl BrowserWindow {
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .child(self.window_titlebar(tab, members, cx))
-                .when(active && self.find_open, |column| column.child(self.find_bar(cx)))
+                .when(active && self.find.progress() > 0.0, |column| {
+                    column.child(div().h(px(FIND_H as f32 * self.find.progress())).flex_none().overflow_hidden().child(self.find_bar(cx)))
+                })
                 .child(div().flex_1().min_h(px(0.))),
         );
         if !maximized {
@@ -1823,10 +2152,14 @@ impl BrowserWindow {
         let id = tab.id.clone();
         let nav = self.nav_controls(&tab.id, cx);
         let tools = self.window_tools(&tab.id, cx);
-        div().child(
+        let bar = (tab.active && self.load_bar > 0.0).then(|| {
+            let fade = self.load_done.map_or(1.0, |at| 1.0 - (at.elapsed().as_secs_f32() / LOAD_FADE.as_secs_f32()).min(1.0));
+            div().absolute().left_0().bottom_0().h(px(2.)).w(relative(self.load_bar)).bg(paint.accent).opacity(fade)
+        });
+        div().relative().children(bar).child(
             h_stack()
                 .id(SharedString::from(format!("title-{id}")))
-                .h(px(TITLE_H as f32))
+                .h(px(self.title_h() as f32))
                 .px(px(6.))
                 .items_center()
                 .gap(px(8.))
@@ -1919,8 +2252,7 @@ impl BrowserWindow {
                                     .child(Icons::cross_2().size(px(10.)).text_color(paint.fg))
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         cx.stop_propagation();
-                                        this.with_model(|model| { let _ = model.close_tab(&close_id); });
-                                        this.refresh_url(cx);
+                                        this.close_tabs(vec![close_id.clone()], cx);
                                     })),
                             ),
                     )
@@ -1936,15 +2268,12 @@ impl BrowserWindow {
         let meta = self.ext_meta.get(ext).cloned().unwrap_or_default();
         let (move_id, close_id) = (tab_id.to_string(), tab_id.to_string());
         let close = self.tool_button(format!("close-{tab_id}"), Icons::cross_2(), false, cx, move |this, cx| {
-            this.with_model(|model| {
-                let _ = model.close_tab(&close_id);
-            });
-            this.refresh_url(cx);
+            this.close_tabs(vec![close_id.clone()], cx);
         });
         div().child(
             h_stack()
                 .id(SharedString::from(format!("title-{tab_id}")))
-                .h(px(TITLE_H as f32))
+                .h(px(self.title_h() as f32))
                 .px(px(10.))
                 .items_center()
                 .gap(px(8.))
@@ -1989,9 +2318,29 @@ impl BrowserWindow {
             .border_1()
             .text_size(px(12.));
         if editing {
+            let watch = cx.entity();
             return pill
+                .relative()
                 .border_color(paint.accent.opacity(0.6))
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| this.end_address_edit(window, cx)))
+                // Runs before the input sees the key, so arrows move through suggestions instead of the caret.
+                .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    let count = this.suggestions.len();
+                    match event.keystroke.key.as_str() {
+                        "down" if count > 0 => this.suggestion = Some(this.suggestion.map_or(0, |at| (at + 1) % count)),
+                        "up" if count > 0 => this.suggestion = Some(this.suggestion.map_or(count - 1, |at| (at + count - 1) % count)),
+                        "enter" => match this.suggestion.and_then(|at| this.suggestions.get(at)).map(|(url, _)| url.clone()) {
+                            Some(url) => this.commit_navigation(&url, cx),
+                            None => return,
+                        },
+                        "escape" if count > 0 => this.suggestions.clear(),
+                        "escape" => this.end_address_edit(window, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+                .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.address_bounds = Some(bounds)), |_, _, _, _| {}).absolute().size_full())
                 .child(
                 input(&self.address, cx)
                     .placeholder("Search or enter an address")
@@ -2081,12 +2430,7 @@ impl BrowserWindow {
             .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
                 let group = this.group_id(&close_id);
                 let members = this.chrome.keys().filter(|id| this.group_id(id) == group).cloned().collect::<Vec<_>>();
-                this.with_model(|model| {
-                    for id in &members {
-                        let _ = model.close_tab(id);
-                    }
-                });
-                this.refresh_url(cx);
+                this.close_tabs(members, cx);
             }))
     }
 
@@ -2174,7 +2518,7 @@ impl BrowserWindow {
             this.refresh_url(cx);
         }));
         h_stack()
-            .h(px(TITLEBAR_H))
+            .h(px(self.titlebar_h()))
             .w_full()
             .flex_none()
             .items_center()
@@ -2299,7 +2643,7 @@ impl BrowserWindow {
         let radius = height / 2.0;
         div()
             .absolute()
-            .top(px(TITLEBAR_H))
+            .top(px(self.titlebar_h()))
             .left_0()
             .right_0()
             .flex()
@@ -2388,8 +2732,7 @@ impl BrowserWindow {
     }
 
     fn dock_progress(&self) -> f32 {
-        let target = if self.dock_open { 1.0 } else { 0.0 };
-        self.dock_from + (target - self.dock_from) * ease(self.dock_at.elapsed().as_secs_f32() / DOCK_ANIM.as_secs_f32())
+        self.dock.progress()
     }
 
     fn set_dock(&mut self, hovered: bool, cx: &mut Context<Self>) {
@@ -2400,17 +2743,19 @@ impl BrowserWindow {
     fn update_dock(&mut self, cx: &mut Context<Self>) {
         // A window dragged to the top edge passes over the dock; it should not pop open.
         let open = self.dock_hovered && self.gesture.is_none();
-        if open == self.dock_open {
-            return;
+        if self.dock.set(open, self.anim(DOCK_ANIM)) {
+            cx.notify();
         }
-        self.dock_from = self.dock_progress();
-        self.dock_open = open;
-        self.dock_at = Instant::now();
-        cx.notify();
     }
 
     fn animating(&self) -> bool {
-        self.dock_at.elapsed() < DOCK_ANIM
+        self.dock.running()
+            || self.find.running()
+            || self.panel_tween.running()
+            || self.toast.1.elapsed() < TOAST_LIFE
+            || self.load_bar > 0.0
+            || !self.opened.is_empty()
+            || !self.closing.is_empty()
     }
 
     fn panel_icon(
@@ -2445,8 +2790,11 @@ impl BrowserWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
+        let p = self.panel_tween.progress();
         div()
-            .h(px(260.))
+            .h(px(260. * p))
+            .flex_none()
+            .opacity(p)
             .w_full()
             .overflow_hidden()
             .px(px(12.))
@@ -2977,8 +3325,15 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
     }
 }
 
-pub(crate) const TITLEBAR_H: f32 = 38.0;
+const TITLEBAR_H: f32 = 38.0;
 const DOCK_ANIM: Duration = Duration::from_millis(260);
+const PANEL_ANIM: Duration = Duration::from_millis(180);
+const WINDOW_ANIM: Duration = Duration::from_millis(170);
+const WINDOW_FROM_SCALE: f32 = 0.94;
+const TOAST_IN: Duration = Duration::from_millis(180);
+const TOAST_LIFE: Duration = Duration::from_millis(2800);
+const LOAD_FADE: Duration = Duration::from_millis(300);
+const ZOOM_LEVELS: [f64; 13] = [0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 const DOCK_REST_W: f32 = 56.0;
 /// At rest the pill sits in the inset gap above top-snapped windows (2px + 5px < SNAP_INSET).
 const DOCK_REST_H: f32 = 5.0;
@@ -2989,6 +3344,15 @@ const DOCK_PAD: f32 = 6.0;
 const DOCK_ITEM_W: f32 = 54.0;
 const DOCK_NEW_W: f32 = 32.0;
 const DOCK_TILE_H: f32 = 32.0;
+
+/// The frame shrunk to `scale` around its centre.
+fn scaled(frame: Frame, scale: f32) -> Frame {
+    if scale >= 1.0 {
+        return frame;
+    }
+    let (w, h) = (frame.w * scale, frame.h * scale);
+    Frame { x: frame.x + (frame.w - w) / 2.0, y: frame.y + (frame.h - h) / 2.0, w, h }
+}
 
 /// Ease-out cubic over t in 0..=1: quick start, soft landing.
 fn ease(t: f32) -> f32 {

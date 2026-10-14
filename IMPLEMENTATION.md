@@ -71,6 +71,16 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 - [x] Extension management UI
 - [x] Profile import/export
 - [x] Crash recovery via session persistence
+- [x] Reopen closed tab (⌘⇧T, last 20 per run, keeps window layout)
+- [x] Per-site zoom (⌘+ / ⌘− / ⌘0), remembered per host and listed in Settings
+- [x] Address bar suggestions from bookmarks and history (↑/↓/Enter/Esc)
+- [x] ⌘1…9 and ⌃Tab / ⌃⇧Tab tab switching, ⌘P print, page load progress bar
+- [x] Status toasts
+
+## Phase 7 — customization and motion
+
+- [x] Accent color, interface density (comfortable / compact), reduce motion
+- [x] Animated find bar, library panel, window open/close, load bar and toasts; reduce motion turns them off
 
 ## Verification
 

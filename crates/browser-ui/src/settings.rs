@@ -469,7 +469,29 @@ impl BrowserWindow {
                         cx,
                     ),
                     paint,
-                )),
+                ))
+                .child(row("Accent color", Some("Highlights, focus rings and the active window border."), self.accent_picker(&settings.accent, paint, cx), paint))
+                .child(row(
+                    "Density",
+                    Some("Height of the title bar and window bars."),
+                    choice(
+                        "density",
+                        vec![("Comfortable", "comfortable".to_string()), ("Compact", "compact".into())],
+                        settings.density.clone(),
+                        |s, v| s.density = v,
+                        paint,
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Reduce motion",
+                    Some("Panels, windows and messages appear without animating."),
+                    switch("reduce-motion", settings.reduce_motion, |s, v| s.reduce_motion = v, paint, cx),
+                    paint,
+                ))
+                .child(heading("Site zoom", paint))
+                .child(self.site_zoom_list(&settings, paint, cx)),
             SettingsSection::Search => page.child(row(
                 "Search engine used in the address bar",
                 None,
@@ -708,6 +730,44 @@ impl BrowserWindow {
             self.settings_note = Some("Profile renamed".into());
         }
         cx.notify();
+    }
+
+    fn accent_picker(&self, current: &str, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+        let mut colors = h_stack().flex_wrap().justify_end().gap(px(6.)).max_w(px(360.));
+        for option in PROFILE_COLORS {
+            colors = colors.child(
+                swatch(format!("accent-{option}"), current == option, paint)
+                    .size(px(24.))
+                    // Empty means the theme's own accent, so show that rather than the current override.
+                    .bg(if option.is_empty() { cx.theme().fg_muted() } else { parse_hex(option) })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| s.accent = option.to_string()))),
+            );
+        }
+        colors
+    }
+
+    fn site_zoom_list(&self, settings: &Settings, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+        if settings.site_zoom.is_empty() {
+            return div().text_color(paint.muted).child("Zoom a site with ⌘+ or ⌘− and it is remembered here");
+        }
+        let mut list = v_stack().w_full().gap(px(4.));
+        for (index, (host, zoom)) in settings.site_zoom.iter().enumerate() {
+            let host = host.clone();
+            list = list.child(
+                h_stack()
+                    .w_full()
+                    .gap(px(8.))
+                    .items_center()
+                    .child(div().flex_1().child(host.clone()))
+                    .child(div().text_color(paint.muted).child(format!("{:.0}%", zoom * 100.0)))
+                    .child(action_button(SharedString::from(format!("zoom-reset-{index}")), "Reset", Kind::Secondary, true, cx, move |this, cx| {
+                        this.set_pref(cx, |s| {
+                            s.site_zoom.remove(&host);
+                        });
+                    })),
+            );
+        }
+        list
     }
 
     fn permission_list(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {

@@ -98,6 +98,15 @@ pub enum Shortcut {
     Find,
     Bookmark,
     Settings,
+    ReopenTab,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    /// 1-based position; 9 picks the last tab, as in Chrome.
+    SelectTab(usize),
+    NextTab,
+    PrevTab,
+    Print,
 }
 
 pub trait WebEngine {

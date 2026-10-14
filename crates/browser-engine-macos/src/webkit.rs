@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
@@ -275,7 +275,7 @@ define_class!(
             message: &WKScriptMessage,
         ) {
             if ns_string(&message.name()) == "nxShortcut" {
-                if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key))) {
+                if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key), false)) {
                     let _ = self.ivars().events.send(EngineEvent::Shortcut(shortcut));
                 }
             }
@@ -462,6 +462,44 @@ impl MacEngine {
             let view = live.view.clone();
             window.makeFirstResponder(Some(&view));
         }
+    }
+
+    pub fn set_zoom(&mut self, tab_id: &str, zoom: f64) {
+        if let Some(live) = self.tabs.get(tab_id) {
+            if (unsafe { live.view.pageZoom() } - zoom).abs() > f64::EPSILON {
+                unsafe { live.view.setPageZoom(zoom) };
+            }
+        }
+    }
+
+    /// Load progress in 0..=1 while the tab's page is loading.
+    pub fn progress(&self, tab_id: &str) -> Option<f64> {
+        let live = self.tabs.get(tab_id)?;
+        unsafe { live.view.isLoading() }.then(|| unsafe { live.view.estimatedProgress() })
+    }
+
+    /// Fades the page view; it is a native view, so GPUI opacity does not reach it.
+    pub fn set_alpha(&mut self, tab_id: &str, alpha: f64) {
+        if let Some(live) = self.tabs.get(tab_id) {
+            live.view.setAlphaValue(alpha);
+        }
+    }
+
+    pub fn print(&mut self, tab_id: &str) {
+        let Some(live) = self.tabs.get(tab_id) else {
+            return;
+        };
+        let Some(window) = live.view.window() else {
+            return;
+        };
+        let operation = unsafe { live.view.printOperationWithPrintInfo(&NSPrintInfo::sharedPrintInfo()) };
+        // WebKit's print view starts zero-sized and prints blank pages unless given the page's size.
+        if let Some(view) = operation.view() {
+            view.setFrame(live.view.bounds());
+        }
+        unsafe {
+            operation.runOperationModalForWindow_delegate_didRunSelector_contextInfo(&window, None, None, std::ptr::null_mut())
+        };
     }
 
     pub fn load_html(&mut self, tab_id: &str, html: &str, base_url: Option<&str>) {
@@ -1093,12 +1131,19 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
     let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
         let flags = event_ref.modifierFlags();
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command) {
+            if event_ref.charactersIgnoringModifiers().is_some_and(|chars| ns_string(&chars) == "\t") {
+                let _ = events.send(EngineEvent::Shortcut(if shift { Shortcut::PrevTab } else { Shortcut::NextTab }));
+                return std::ptr::null_mut();
+            }
+        }
         if flags.contains(NSEventModifierFlags::Command) && !flags.contains(NSEventModifierFlags::Control) {
             if let Some(chars) = event_ref.charactersIgnoringModifiers() {
                 let key = ns_string(&chars).to_ascii_lowercase();
                 // A focused page gets these first; the key script reports them back if it ignores them.
                 let page_first = PAGE_FIRST_KEYS.contains(&key.as_str()) && page_has_focus(event_ref);
-                if let Some(shortcut) = shortcut_for(&key).filter(|_| !page_first) {
+                if let Some(shortcut) = shortcut_for(&key, shift).filter(|_| !page_first) {
                     let _ = events.send(EngineEvent::Shortcut(shortcut));
                     return std::ptr::null_mut();
                 }
@@ -1233,8 +1278,9 @@ fn page_has_focus(event: &NSEvent) -> bool {
 
 /// App shortcuts. Ones a page may claim are offered to the page first while it has focus
 /// (as Chrome does): Excalidraw uses Cmd+D to duplicate, docs editors take Cmd+F.
-fn shortcut_for(key: &str) -> Option<Shortcut> {
+fn shortcut_for(key: &str, shift: bool) -> Option<Shortcut> {
     match key {
+        "t" if shift => Some(Shortcut::ReopenTab),
         "t" => Some(Shortcut::NewTab),
         "w" => Some(Shortcut::CloseTab),
         "l" => Some(Shortcut::FocusUrl),
@@ -1244,16 +1290,20 @@ fn shortcut_for(key: &str) -> Option<Shortcut> {
         "[" => Some(Shortcut::Back),
         "]" => Some(Shortcut::Forward),
         "," => Some(Shortcut::Settings),
-        _ => None,
+        "p" => Some(Shortcut::Print),
+        "=" | "+" => Some(Shortcut::ZoomIn),
+        "-" => Some(Shortcut::ZoomOut),
+        "0" => Some(Shortcut::ZoomReset),
+        _ => key.parse::<usize>().ok().filter(|n| (1..=9).contains(n)).map(Shortcut::SelectTab),
     }
 }
 
-const PAGE_FIRST_KEYS: [&str; 5] = ["d", "f", "r", "[", "]"];
+const PAGE_FIRST_KEYS: [&str; 10] = ["d", "f", "r", "[", "]", "p", "=", "+", "-", "0"];
 
 /// Runs in its own world; reports page-first shortcuts the page did not `preventDefault`.
 const KEY_FALLBACK_JS: &str = r#"addEventListener('keydown', (e) => {
   const key = (e.key || '').toLowerCase();
-  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']'].includes(key)) return;
+  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']', 'p', '=', '+', '-', '0'].includes(key)) return;
   setTimeout(() => { if (!e.defaultPrevented) webkit.messageHandlers.nxShortcut.postMessage(key); }, 0);
 }, true);"#;
 

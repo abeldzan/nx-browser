@@ -19,11 +19,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSOpenPanel",
     "NSPanel",
     "NSPopover",
+    "NSPrintInfo",
+    "NSPrintOperation",
     "NSResponder",
     "NSSavePanel",
     "NSTrackingArea",
     "NSView",
     "NSWindow",
+    "objc2-core-foundation",
     "objc2-quartz-core",
 ] }
 objc2-core-foundation = "0.3"
