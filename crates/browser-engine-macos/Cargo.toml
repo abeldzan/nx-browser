@@ -20,6 +20,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSPanel",
     "NSResponder",
     "NSSavePanel",
+    "NSTrackingArea",
     "NSView",
     "NSWindow",
     "objc2-quartz-core",

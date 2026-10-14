@@ -16,6 +16,7 @@ use gpui::{
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
     Subscription, Window,
 };
+use crate::settings::measure_overlay;
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
@@ -86,6 +87,14 @@ pub struct BrowserWindow {
     metrics: SharedString,
     self_test: Option<SelfTest>,
     cookies_saved: Instant,
+    /// Window dock under the title bar: hovered state, progress when it last changed, and when.
+    dock_open: bool,
+    /// Pointer over the dock; it stays shut while a window drag is in progress.
+    dock_hovered: bool,
+    dock_from: f32,
+    dock_at: Instant,
+    /// Windows whose tab strip just appeared, by group id, so it can slide open.
+    strip_since: HashMap<String, Instant>,
 }
 
 struct SelfTest {
@@ -240,6 +249,11 @@ impl BrowserWindow {
                 started: Instant::now(),
             }),
             cookies_saved: Instant::now(),
+            dock_open: false,
+            dock_hovered: false,
+            dock_from: 0.0,
+            dock_at: Instant::now(),
+            strip_since: HashMap::new(),
         };
         view.apply_settings();
         if view.self_test.is_none() {
@@ -328,7 +342,7 @@ impl BrowserWindow {
         for tab_id in suspend {
             // Every window on the stage is showing its page; suspending one makes it reload in place.
             let entry = self.chrome.get(&tab_id);
-            let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized));
+            let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized)) || !self.is_front(&tab_id);
             let mut model = self.model.lock().expect("model");
             if hidden {
                 let _ = model.mark_suspended(&tab_id);
@@ -399,7 +413,10 @@ impl BrowserWindow {
 
     fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
         match shortcut {
-            Shortcut::NewTab => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
+            Shortcut::NewTab => match self.active_tab_id() {
+                Some(id) => self.new_tab_in(&id, cx),
+                None => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
+            },
             Shortcut::CloseTab => {
                 let id = self.model.lock().expect("model").active_tab().map(|tab| tab.id.clone());
                 if let Some(id) = id {
@@ -888,6 +905,8 @@ impl Render for BrowserWindow {
         let profiles = self.model.lock().expect("model").profiles.clone();
         let active_profile = self.model.lock().expect("model").active_profile_id.clone();
         let sessions = self.model.lock().expect("model").profile_sessions().into_iter().cloned().collect::<Vec<_>>();
+        let active_session = self.model.lock().expect("model").active_session_id.clone();
+        let all_tabs = self.model.lock().expect("model").tabs.clone();
         let history = self.model.lock().expect("model").history().unwrap_or_default();
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
         let extensions = self.model.lock().expect("model").extensions.clone();
@@ -898,13 +917,22 @@ impl Render for BrowserWindow {
         self.order.retain(|id| live_ids.iter().any(|live| live == id));
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         self.prepare_frames(&tabs);
+        self.sync_groups();
         self.save_layouts(&tabs);
+        self.strip_since.retain(|_, since| since.elapsed() < STRIP_ANIM);
+        if self.animating() {
+            window.request_animation_frame();
+        }
         if self.self_test.is_none() {
+            // Spaces are separate desktops: pages from the others stay hidden.
+            for tab in all_tabs.iter().filter(|tab| tab.session_id != active_session) {
+                self.engine.place_tab(&tab.id, None);
+            }
             for tab in &tabs {
                 let entry = self.chrome.get(&tab.id);
                 let minimized = entry.is_some_and(|chrome| chrome.minimized);
                 let covered = maximized && !entry.is_some_and(|chrome| chrome.maximized);
-                if minimized || covered {
+                if minimized || covered || !self.is_front(&tab.id) {
                     self.engine.place_tab(&tab.id, None);
                 }
             }
@@ -915,7 +943,7 @@ impl Render for BrowserWindow {
             .bg(colors.bg)
             .text_color(colors.fg)
             .text_size(px(13.))
-            .child(self.titlebar(&tabs, cx))
+            .child(self.titlebar(&sessions, &all_tabs, &active_session, cx))
             .child(
                 h_stack()
                     .flex_1()
@@ -943,6 +971,7 @@ impl Render for BrowserWindow {
                     }),
             ),
             )
+            .child(self.dock(&tabs, cx))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
@@ -1185,9 +1214,12 @@ impl BrowserWindow {
                 entry.restore = None;
             }
         }
+        let group = self.group_id(&gesture.tab_id);
+        let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let others = self
             .chrome
             .iter()
+            .filter(|(id, _)| self.group_id(id) != group && current.contains(id))
             // Partners move with the border, so they must not attract it back to where they were.
             .filter(|(id, entry)| **id != gesture.tab_id && !entry.minimized && !entry.maximized)
             .filter(|(id, _)| !gesture.partners.iter().any(|(partner, _)| partner == *id))
@@ -1253,6 +1285,7 @@ impl BrowserWindow {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
+        self.update_dock(cx);
         if let (Some(snap), Some(stage)) = (gesture.snap, self.stage_bounds) {
             let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
             // The size the window had when the drag began is what dragging it out of the snap brings back.
@@ -1292,6 +1325,8 @@ impl BrowserWindow {
         let stage_w = f64::from(stage.size.width);
         let stage_h = f64::from(stage.size.height);
         let ids = self.order.clone();
+        // `order` spans every space; only this space's windows are on the stage.
+        let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
         let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
         for id in ids {
@@ -1309,7 +1344,7 @@ impl BrowserWindow {
                 };
                 stack.push((String::new(), shell, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }));
             }
-            if entry.minimized {
+            if entry.minimized || !self.is_front(&id) || !current.contains(&id) {
                 self.engine.place_tab(&id, None);
                 continue;
             }
@@ -1322,6 +1357,7 @@ impl BrowserWindow {
                 continue;
             };
             let find = if active.as_deref() == Some(id.as_str()) && self.find_open { FIND_H } else { 0.0 };
+            let find = find + self.strip_h(&id);
             let rect = LogicalRect {
                 x: origin_x + f64::from(frame.x) + PAGE_INSET,
                 y: origin_y + f64::from(frame.y) + TITLE_H + find,
@@ -1391,10 +1427,11 @@ impl BrowserWindow {
             entry.frame = Some(start);
         }
         // Snapped neighbours share borders with a snapped window, so they resize along with it.
+        let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let partners = if snapped {
             self.chrome
                 .iter()
-                .filter(|(other, entry)| *other != id && entry.snap.is_some() && !entry.minimized && !entry.maximized)
+                .filter(|(other, entry)| current.contains(other) && self.group_id(other) != self.group_id(id) && entry.snap.is_some() && !entry.minimized && !entry.maximized)
                 .filter_map(|(other, entry)| Some((other.clone(), entry.frame?)))
                 .collect()
         } else {
@@ -1451,7 +1488,9 @@ impl BrowserWindow {
             if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
                 stage = stage.child(self.snap_preview(*snap, cx));
             }
-            if let Some(window) = self.floating_window(tab, cx) {
+            let group = self.group_id(&tab.id);
+            let members = tabs.iter().filter(|other| self.group_id(&other.id) == group).collect::<Vec<_>>();
+            if let Some(window) = self.floating_window(tab, &members, cx) {
                 stage = stage.child(window);
             }
         }
@@ -1519,17 +1558,18 @@ impl BrowserWindow {
                 let entry = self.chrome.get(&tab.id);
                 let minimized = entry.is_some_and(|chrome| chrome.minimized);
                 let covered = maximized && !entry.is_some_and(|chrome| chrome.maximized);
-                !minimized && !covered
+                !minimized && !covered && self.is_front(&tab.id)
             })
             .collect()
     }
 
-    fn floating_window(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    fn floating_window(&self, tab: &browser_core::Tab, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> Option<gpui::Div> {
         let paint = paint(cx);
         let active = tab.active;
         let maximized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized);
         let frame = self.chrome.get(&tab.id).and_then(|chrome| chrome.frame)?;
-        let mut shell = div().absolute().overflow_hidden();
+        // Occlude so a press on this window never also reaches the windows stacked beneath it.
+        let mut shell = div().absolute().overflow_hidden().occlude();
         shell = if maximized {
             shell.left(px(8.)).top(px(8.)).right(px(8.)).bottom(px(8.))
         } else {
@@ -1545,6 +1585,7 @@ impl BrowserWindow {
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .child(self.window_titlebar(tab, cx))
+                .when(members.len() > 1, |column| column.child(self.window_tabs(&tab.id, members, cx)))
                 .when(active && self.find_open, |column| column.child(self.find_bar(cx)))
                 .child(div().flex_1().min_h(px(0.))),
         );
@@ -1705,6 +1746,7 @@ impl BrowserWindow {
     fn window_tools(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
         let reload_id = tab_id.to_string();
         let bookmark_id = tab_id.to_string();
+        let new_tab_id = tab_id.to_string();
         let min_id = tab_id.to_string();
         let zoom_id = tab_id.to_string();
         let close_id = tab_id.to_string();
@@ -1720,6 +1762,9 @@ impl BrowserWindow {
             .child(self.tool_button(format!("bookmark-{bookmark_id}"), Icons::star(), false, cx, move |this, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
+            }))
+            .child(self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
+                this.new_tab_in(&new_tab_id, cx);
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
             .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, cx| {
@@ -1739,7 +1784,13 @@ impl BrowserWindow {
                 this.focus_window(&zoom_id, cx);
             }))
             .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
-                this.with_model(|model| { let _ = model.close_tab(&close_id); });
+                let group = this.group_id(&close_id);
+                let members = this.chrome.keys().filter(|id| this.group_id(id) == group).cloned().collect::<Vec<_>>();
+                this.with_model(|model| {
+                    for id in &members {
+                        let _ = model.close_tab(id);
+                    }
+                });
                 this.refresh_url(cx);
             }))
     }
@@ -1760,12 +1811,73 @@ impl BrowserWindow {
         button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| action(this, cx)))
     }
 
-    fn titlebar(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
+    fn titlebar(
+        &self,
+        sessions: &[browser_core::Session],
+        all_tabs: &[browser_core::Tab],
+        active_session: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let paint = paint(cx);
-        let mut strip = h_stack().min_w(px(0.)).flex_shrink(1.).overflow_hidden().items_center().gap(px(4.));
-        for tab in tabs {
-            strip = strip.child(self.title_tab(tab, cx));
+        let mut spaces = h_stack().flex_none().items_center().gap(px(6.));
+        let closable = sessions.len() > 1;
+        for session in sessions {
+            let id = session.id.clone();
+            let close_id = session.id.clone();
+            let hover_group = SharedString::from(format!("space-{id}"));
+            let active = session.id == active_session;
+            let members = all_tabs.iter().filter(|tab| tab.session_id == session.id).collect::<Vec<_>>();
+            spaces = spaces.child(
+                h_stack()
+                    .id(SharedString::from(format!("space-{id}")))
+                    .group(hover_group.clone())
+                    .relative()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .gap(px(8.))
+                    .items_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .text_color(if active { paint.fg } else { paint.muted })
+                    .when(active, |chip| chip.bg(paint.secondary))
+                    .when(!active, |chip| chip.hover(|style| style.bg(paint.secondary.opacity(0.5)).text_color(paint.fg)))
+                    .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
+                    .child(session.name.clone())
+                    .when(closable, |chip| {
+                        chip.child(
+                            div()
+                                .id(SharedString::from(format!("space-close-{close_id}")))
+                                .absolute()
+                                .top(px(-5.))
+                                .left(px(-5.))
+                                .size(px(16.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(paint.muted)
+                                .border_1()
+                                .border_color(paint.surface)
+                                .opacity(0.)
+                                .group_hover(hover_group, |style| style.opacity(1.))
+                                .child(Icons::cross_2().size(px(9.)).text_color(paint.surface))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.with_model(|model| { let _ = model.delete_session(&close_id); });
+                                    this.refresh_url(cx);
+                                })),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.with_model(|model| { let _ = model.switch_session(&id); });
+                        this.refresh_url(cx);
+                    })),
+            );
         }
+        spaces = spaces.child(self.tool_button("new-space".to_string(), Icons::plus(), false, cx, |this, cx| {
+            this.with_model(|model| { let _ = model.create_session(); });
+            this.refresh_url(cx);
+        }));
         h_stack()
             .h(px(TITLEBAR_H))
             .w_full()
@@ -1777,25 +1889,16 @@ impl BrowserWindow {
             .bg(paint.surface)
             .border_b_1()
             .border_color(paint.border)
-            .child(strip)
-            .child(self.tool_button("new-tab".to_string(), Icons::plus(), false, cx, |this, cx| {
-                this.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); });
-                this.refresh_url(cx);
-            }))
-            .child(
-                div().flex_1().h_full().on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
-                    if event.click_count == 2 {
-                        window.titlebar_double_click();
-                    } else {
-                        window.start_window_move();
-                    }
-                }),
-            )
+            // Equal flex on both sides keeps the spaces centred in the bar.
+            .child(drag_area().flex_1())
+            .child(spaces)
             .child(
                 h_stack()
-                    .flex_none()
+                    .flex_1()
+                    .h_full()
                     .items_center()
                     .gap(px(2.))
+                    .child(drag_area().flex_1())
                     .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
                     .child(self.panel_icon("history-toggle", Icons::file_text(), Some(SidebarPage::History), cx))
                     .child(self.panel_icon("bookmarks-toggle", Icons::bookmark(), Some(SidebarPage::Bookmarks), cx))
@@ -1803,35 +1906,307 @@ impl BrowserWindow {
             )
     }
 
-    fn title_tab(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Blob hanging from the title bar; hovering grows it into a shelf of this space's windows.
+    fn dock(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        let id = tab.id.clone();
-        let close_id = tab.id.clone();
-        let minimized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.minimized);
-        h_stack()
-            .id(SharedString::from(format!("tab-{id}")))
-            .h(px(28.))
-            .min_w(px(36.))
-            .max_w(px(200.))
-            .flex_shrink(1.)
-            .pl(px(8.))
-            .pr(px(2.))
-            .gap(px(6.))
-            .items_center()
-            .rounded(px(7.))
-            .cursor_pointer()
-            .when(tab.active, |tab| tab.bg(paint.secondary))
-            .when(minimized, |tab| tab.opacity(0.55))
-            .child(favicon(tab))
-            .child(div().flex_1().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url)))
-            .child(self.tool_button(format!("tab-close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
-                this.with_model(|model| { let _ = model.close_tab(&close_id); });
-                this.refresh_url(cx);
-            }))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.chrome.entry(id.clone()).or_default().minimized = false;
-                this.focus_window(&id, cx);
-            }))
+        let p = self.dock_progress();
+        let active = self.active_tab_id().map(|id| self.group_id(&id));
+        let mut groups: Vec<(String, Vec<&browser_core::Tab>)> = Vec::new();
+        for tab in tabs {
+            let group = self.group_id(&tab.id);
+            match groups.iter_mut().find(|(id, _)| *id == group) {
+                Some((_, members)) => members.push(tab),
+                None => groups.push((group, vec![tab])),
+            }
+        }
+        let hover_bg = paint.fg.opacity(0.06);
+        let tile = |id: SharedString, width: f32| {
+            v_stack()
+                .id(id)
+                .relative()
+                .flex_none()
+                .w(px(width))
+                .py(px(6.))
+                .px(px(6.))
+                .gap(px(5.))
+                .items_center()
+                .rounded(px(12.))
+                .cursor_pointer()
+        };
+        let caption = |text: String, color: gpui::Hsla| {
+            div().w_full().text_size(px(11.)).text_color(color).text_center().truncate().child(text)
+        };
+        let mut shelf = h_stack().flex_none().items_center().gap(px(DOCK_GAP));
+        let mut count = 0;
+        for (group, members) in &groups {
+            let Some(front) = members.iter().find(|tab| self.is_front(&tab.id)).copied() else {
+                continue;
+            };
+            count += 1;
+            let id = front.id.clone();
+            let minimized = self.chrome.get(&id).is_some_and(|chrome| chrome.minimized);
+            let current = active.as_deref() == Some(group.as_str());
+            shelf = shelf.child(
+                tile(SharedString::from(format!("dock-{group}")), DOCK_ITEM_W)
+                    .when(current, |item| item.bg(paint.fg.opacity(0.09)))
+                    .when(!current, |item| item.hover(|style| style.bg(hover_bg)))
+                    .when(minimized, |item| item.opacity(0.45))
+                    .child(div().h(px(24.)).flex().items_center().child(favicon_stack(members, paint.surface)))
+                    .child(caption(tab_label(&front.title, &front.url), if current { paint.fg } else { paint.muted }))
+                    .when(members.len() > 1, |item| {
+                        item.child(
+                            div()
+                                .absolute()
+                                .top(px(4.))
+                                .right(px(6.))
+                                .min_w(px(16.))
+                                .h(px(16.))
+                                .px(px(4.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(paint.fg.opacity(0.16))
+                                .text_size(px(10.))
+                                .text_color(paint.fg)
+                                .child(members.len().to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.focus_window(&id, cx))),
+            );
+        }
+        let shelf = shelf
+            .child(div().flex_none().w(px(1.)).h(px(36.)).bg(paint.border))
+            .child(
+                tile("dock-new".into(), DOCK_NEW_W)
+                    .hover(|style| style.bg(hover_bg))
+                    .child(
+                        div()
+                            .size(px(24.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(paint.border)
+                            .child(Icons::plus().size(px(12.)).text_color(paint.muted)),
+                    )
+                    .child(caption("New".into(), paint.muted))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); });
+                        this.focus_address = true;
+                        this.refresh_url(cx);
+                    })),
+            );
+        // Every child has a fixed width, so the card opens to exactly fit its content.
+        let shelf_w = DOCK_PAD * 2.0 + 2.0 + count as f32 * (DOCK_ITEM_W + DOCK_GAP) + 1.0 + DOCK_GAP + DOCK_NEW_W;
+        let lerp = |a: f32, b: f32| a + (b - a) * p;
+        let height = lerp(DOCK_REST_H, DOCK_OPEN_H);
+        // A pill at rest; opening rounds off to a card corner rather than staying a stadium.
+        let radius = (height / 2.0).min(lerp(DOCK_REST_H / 2.0, 18.));
+        div()
+            .absolute()
+            .top(px(TITLEBAR_H))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                // Padding widens the hover target well past the resting pill.
+                div()
+                    .id("dock")
+                    .pt(px(lerp(2., 8.)))
+                    .px(px(28.))
+                    .pb(px(12.))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.set_dock(*hovered, cx)))
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(lerp(DOCK_REST_W, shelf_w)))
+                            .h(px(height))
+                            .overflow_hidden()
+                            .rounded(px(radius))
+                            .bg(mix(paint.fg.opacity(0.45), paint.surface, p))
+                            .border_1()
+                            .border_color(paint.border.opacity(p))
+                            .when(p > 0.01, |blob| blob.shadow_lg())
+                            .child(measure_overlay(f64::from(radius), cx))
+                            .child(
+                                // Laid out at full height and slid down into view, so items never squash while the card grows.
+                                h_stack()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(lerp(-12., 0.)))
+                                    .h(px(DOCK_OPEN_H - 2.))
+                                    .items_center()
+                                    .justify_center()
+                                    .opacity(((p - 0.3) / 0.7).clamp(0., 1.))
+                                    .child(shelf),
+                            ),
+                    ),
+            )
+    }
+
+    /// macOS-style tab row: equal-width tabs with centred titles, shown once a window holds two or more.
+    fn window_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let mut row = h_stack()
+            .h(px(self.strip_h(front) as f32))
+            .flex_none()
+            .w_full()
+            .overflow_hidden()
+            .bg(paint.bg)
+            .border_b_1()
+            .border_color(paint.border)
+            .text_size(px(12.));
+        for (index, tab) in members.iter().enumerate() {
+            let shown = tab.id == front;
+            let id = tab.id.clone();
+            let close_id = tab.id.clone();
+            let hover_group = SharedString::from(format!("wtab-{id}"));
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("wtab-{id}")))
+                    .group(hover_group.clone())
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(index > 0, |cell| cell.border_l_1().border_color(paint.border))
+                    .when(shown, |cell| cell.bg(paint.surface).text_color(paint.fg))
+                    .when(!shown, |cell| cell.text_color(paint.muted).hover(|style| style.bg(paint.secondary.opacity(0.5))))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.focus_window(&id, cx)))
+                    .child(
+                        h_stack()
+                            .min_w(px(0.))
+                            .px(px(26.))
+                            .gap(px(6.))
+                            .items_center()
+                            .child(favicon(tab, false))
+                            .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(3.))
+                            .top_0()
+                            .bottom_0()
+                            .flex()
+                            .items_center()
+                            .opacity(0.)
+                            .group_hover(hover_group, |style| style.opacity(1.))
+                            .child(self.tool_button(format!("wtab-close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
+                                this.with_model(|model| { let _ = model.close_tab(&close_id); });
+                                this.refresh_url(cx);
+                            })),
+                    ),
+            );
+        }
+        let front = front.to_string();
+        row.child(
+            div()
+                .flex_none()
+                .h_full()
+                .px(px(2.))
+                .flex()
+                .items_center()
+                .border_l_1()
+                .border_color(paint.border)
+                .child(self.tool_button(format!("wtab-new-{front}"), Icons::plus(), false, cx, move |this, cx| {
+                    this.new_tab_in(&front, cx);
+                })),
+        )
+    }
+
+    /// Opens a new tab inside the window holding `id`, sharing its frame.
+    fn new_tab_in(&mut self, id: &str, cx: &mut Context<Self>) {
+        let group = self.group_id(id);
+        let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
+        chrome.window = Some(group.clone());
+        let created = self.with_model(|model| model.create_tab(&model.settings.new_tab_url()));
+        let Ok(new) = created else {
+            return;
+        };
+        if self.group_len(id) == 1 {
+            self.strip_since.insert(group, Instant::now());
+        }
+        self.chrome.insert(new.clone(), chrome);
+        self.focus_window(&new, cx);
+        self.focus_address = true;
+    }
+
+    /// The window a tab belongs to; a tab never added to another window is its own.
+    fn group_id(&self, id: &str) -> String {
+        self.chrome.get(id).and_then(|chrome| chrome.window.clone()).unwrap_or_else(|| id.to_string())
+    }
+
+    fn group_len(&self, id: &str) -> usize {
+        let group = self.group_id(id);
+        self.chrome.keys().filter(|other| self.group_id(other) == group).count()
+    }
+
+    /// Whether this tab is the one its window shows: the group member raised most recently.
+    fn is_front(&self, id: &str) -> bool {
+        let group = self.group_id(id);
+        raised_last(&self.order, id, |other| self.group_id(other) == group)
+    }
+
+    /// Copies each window's frame and state from its shown tab to the hidden ones, so whichever is raised next sits in place.
+    fn sync_groups(&mut self) {
+        let fronts = self
+            .chrome
+            .iter()
+            .filter(|(id, _)| self.is_front(id) && self.group_len(id) > 1)
+            .map(|(id, chrome)| (self.group_id(id), id.clone(), chrome.clone()))
+            .collect::<Vec<_>>();
+        for (group, front, source) in fronts {
+            for (id, entry) in self.chrome.iter_mut() {
+                if *id != front && entry.window.as_deref().unwrap_or(id) == group {
+                    let window = entry.window.take();
+                    *entry = TabChrome { window, ..source.clone() };
+                }
+            }
+        }
+    }
+
+    /// Height of the window's tab row, sliding open just after a second tab joins.
+    fn strip_h(&self, id: &str) -> f64 {
+        if self.group_len(id) < 2 {
+            return 0.0;
+        }
+        let t = self.strip_since.get(&self.group_id(id)).map_or(1.0, |since| ease(since.elapsed().as_secs_f32() / STRIP_ANIM.as_secs_f32()));
+        TABS_H * f64::from(t)
+    }
+
+    fn dock_progress(&self) -> f32 {
+        let target = if self.dock_open { 1.0 } else { 0.0 };
+        self.dock_from + (target - self.dock_from) * ease(self.dock_at.elapsed().as_secs_f32() / DOCK_ANIM.as_secs_f32())
+    }
+
+    fn set_dock(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.dock_hovered = hovered;
+        self.update_dock(cx);
+    }
+
+    fn update_dock(&mut self, cx: &mut Context<Self>) {
+        // A window dragged to the top edge passes over the dock; it should not pop open.
+        let open = self.dock_hovered && self.gesture.is_none();
+        if open == self.dock_open {
+            return;
+        }
+        self.dock_from = self.dock_progress();
+        self.dock_open = open;
+        self.dock_at = Instant::now();
+        cx.notify();
+    }
+
+    fn animating(&self) -> bool {
+        self.dock_at.elapsed() < DOCK_ANIM || !self.strip_since.is_empty()
     }
 
     fn panel_icon(
@@ -2134,6 +2509,8 @@ struct TabChrome {
     snap: Option<Snap>,
     /// Floating frame to bring back when a snapped window is dragged out.
     restore: Option<Frame>,
+    /// Window (tab group) this tab lives in; `None` means its own, keyed by its id.
+    window: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2428,6 +2805,78 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
 }
 
 const TITLEBAR_H: f32 = 38.0;
+/// Height of a window's tab row once it holds two or more tabs.
+const TABS_H: f64 = 30.0;
+const STRIP_ANIM: Duration = Duration::from_millis(200);
+const DOCK_ANIM: Duration = Duration::from_millis(260);
+const DOCK_REST_W: f32 = 56.0;
+/// At rest the pill sits in the inset gap above top-snapped windows (2px + 5px < SNAP_INSET).
+const DOCK_REST_H: f32 = 5.0;
+const DOCK_OPEN_H: f32 = 74.0;
+const DOCK_GAP: f32 = 4.0;
+const DOCK_PAD: f32 = 8.0;
+/// Width of a window tile in the open dock, and of its new-window tile.
+const DOCK_ITEM_W: f32 = 84.0;
+const DOCK_NEW_W: f32 = 56.0;
+
+/// Ease-out cubic over t in 0..=1: quick start, soft landing.
+fn ease(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Colour `t` of the way from `a` to `b`.
+fn mix(a: gpui::Hsla, b: gpui::Hsla, t: f32) -> gpui::Hsla {
+    let at = |x: f32, y: f32| x + (y - x) * t;
+    gpui::hsla(at(a.h, b.h), at(a.s, b.s), at(a.l, b.l), at(a.a, b.a))
+}
+
+/// Empty title bar space that drags the app window and zooms it on double click.
+fn drag_area() -> gpui::Div {
+    div().h_full().on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
+        if event.click_count == 2 {
+            window.titlebar_double_click();
+        } else {
+            window.start_window_move();
+        }
+    })
+}
+
+/// Whether `id` sits above every other tab in `order` (back to front) that `same` puts in its group.
+fn raised_last(order: &[String], id: &str, same: impl Fn(&str) -> bool) -> bool {
+    let later = match order.iter().position(|other| other == id) {
+        Some(index) => &order[index + 1..],
+        None => order,
+    };
+    !later.iter().any(|other| other != id && same(other))
+}
+
+/// Width of `favicon_stack` for `count` tabs.
+fn stack_w(count: usize) -> f32 {
+    20.0 + 12.0 * (count.clamp(1, 3) - 1) as f32
+}
+
+/// Up to three round favicons overlapping left to right, ringed in `ring` so each reads against the next.
+fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
+    let mut row = div().relative().flex_none().w(px(stack_w(tabs.len()))).h(px(20.));
+    for (index, tab) in tabs.iter().take(3).enumerate() {
+        row = row.child(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(12. * index as f32))
+                .size(px(20.))
+                .rounded_full()
+                .border_2()
+                .border_color(ring)
+                .bg(ring)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(favicon(tab, true)),
+        );
+    }
+    row
+}
 const WINDOW_RADIUS: f64 = 10.0;
 /// Page URL and its icon URL, newline separated.
 const FAVICON_JS: &str = r#"(() => { const l = document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]'); return location.href + "\n" + (l ? l.href : location.origin + "/favicon.ico"); })()"#;
@@ -2578,13 +3027,14 @@ fn site_glyph(url: &str) -> (String, String) {
 }
 
 /// The site's icon once cached, otherwise a coloured initial.
-fn favicon(tab: &browser_core::Tab) -> gpui::AnyElement {
+fn favicon(tab: &browser_core::Tab, round: bool) -> gpui::AnyElement {
     let (glyph, host) = site_glyph(&tab.url);
+    let radius = if round { 8. } else { 4. };
     let tile = move || {
         div()
             .size(px(16.))
             .flex_none()
-            .rounded(px(4.))
+            .rounded(px(radius))
             .flex()
             .items_center()
             .justify_center()
@@ -2596,7 +3046,7 @@ fn favicon(tab: &browser_core::Tab) -> gpui::AnyElement {
     };
     let path = favicon_path(&site_glyph(&tab.url).1);
     if is_web(&tab.url) && path.exists() {
-        img(path).size(px(16.)).flex_none().with_fallback(tile).into_any_element()
+        img(path).size(px(16.)).flex_none().rounded(px(radius)).with_fallback(tile).into_any_element()
     } else {
         tile()
     }
@@ -2702,6 +3152,18 @@ mod tests {
         let area: f64 = holes.iter().map(|(_, h)| h.width * h.height).sum();
         assert_eq!(area, 100.0 * 100.0 - 50.0 * 40.0);
         assert_eq!(notches, vec![((150.0, 20.0), (142.0, 28.0)), ((150.0, 60.0), (142.0, 52.0))]);
+    }
+
+    #[test]
+    fn window_shows_its_most_recently_raised_tab() {
+        let order = ["a", "x", "b", "y"].map(String::from);
+        let group = |id: &str| id == "a" || id == "b";
+        assert!(!raised_last(&order, "a", group));
+        assert!(raised_last(&order, "b", group));
+        assert!(raised_last(&order, "x", |id| id == "x"));
+        // A tab not yet stacked only shows when nothing else in its window is.
+        assert!(!raised_last(&order, "c", |id| id == "c" || id == "a"));
+        assert!(raised_last(&order, "c", |id| id == "c"));
     }
 
     #[test]

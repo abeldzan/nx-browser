@@ -380,9 +380,12 @@ impl Model {
     }
 
     pub fn create_session(&mut self) -> anyhow::Result<()> {
-        let count = self.profile_sessions().len() + 1;
-        let session_id = self.insert_session(&self.active_profile_id.clone(), &format!("Session {count}"))?;
+        let taken = self.profile_sessions().into_iter().map(|session| session.name.clone()).collect::<Vec<_>>();
+        let name = (1..).map(|n| format!("Space {n}")).find(|name| !taken.contains(name)).unwrap_or_default();
+        let session_id = self.insert_session(&self.active_profile_id.clone(), &name)?;
         self.insert_tab(&session_id, "nxbrowser://home", "New Tab", true, 0, TabState::Suspended)?;
+        // switch_session only knows sessions already loaded.
+        self.reload()?;
         self.switch_session(&session_id)?;
         Ok(())
     }
@@ -402,6 +405,26 @@ impl Model {
         self.reload()?;
         self.queue_show_active();
         Ok(())
+    }
+
+    /// Closes a space and its tabs; the profile always keeps at least one.
+    pub fn delete_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        let siblings = self.profile_sessions().into_iter().map(|session| session.id.clone()).collect::<Vec<_>>();
+        if siblings.len() <= 1 || !siblings.iter().any(|id| id == session_id) {
+            return Ok(());
+        }
+        for tab in self.tabs.iter().filter(|tab| tab.session_id == session_id) {
+            self.effects.push(Effect::CloseTab { tab_id: tab.id.clone() });
+        }
+        self.storage.execute("DELETE FROM tabs WHERE session_id = ?1", params![session_id])?;
+        self.storage.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        if self.active_session_id == session_id {
+            let index = siblings.iter().position(|id| id == session_id).unwrap_or(0);
+            let next = siblings.iter().filter(|id| *id != session_id).nth(index.saturating_sub(1)).cloned().unwrap_or_default();
+            self.reload()?;
+            return self.switch_session(&next);
+        }
+        self.reload()
     }
 
     pub fn create_tab(&mut self, url: &str) -> anyhow::Result<String> {
@@ -1204,6 +1227,22 @@ mod tests {
         assert_eq!(loaded.settings.search_engine, "Google");
         assert!(!loaded.settings.save_history);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn closing_a_space_drops_its_tabs_and_keeps_the_last() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let first = model.active_session_id.clone();
+        model.create_session().unwrap();
+        let second = model.active_session_id.clone();
+        assert_ne!(first, second);
+        model.create_tab("https://example.com").unwrap();
+        assert_eq!(model.session_tabs().len(), 2);
+        model.delete_session(&second).unwrap();
+        assert_eq!(model.active_session_id, first);
+        assert!(model.tabs.iter().all(|tab| tab.session_id != second));
+        model.delete_session(&first).unwrap();
+        assert_eq!(model.profile_sessions().len(), 1);
     }
 
     #[test]

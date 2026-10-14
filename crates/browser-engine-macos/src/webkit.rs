@@ -14,12 +14,12 @@ use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUUID,
+    NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
@@ -90,7 +90,9 @@ define_class!(
             decision_handler: &block2::DynBlock<dyn Fn(WKNavigationResponsePolicy)>,
         ) {
             if navigation_response.isForMainFrame() && !navigation_response.canShowMIMEType() {
-                if let Some(url) = navigation_response.response().URL().and_then(|url| url.absoluteString()) {
+                // The generated `response()` assumes non-null, but WebKit can hand back nil; a panic here aborts the app.
+                let response: Option<Retained<NSURLResponse>> = msg_send![navigation_response, response];
+                if let Some(url) = response.and_then(|response| response.URL()).and_then(|url| url.absoluteString()) {
                     let _ = self.ivars().events.send(EngineEvent::Download {
                         tab_id: self.ivars().tab_id.clone(),
                         url: ns_string(&url),
@@ -629,6 +631,7 @@ impl WebEngine for MacEngine {
         install_hit_proxy(&chrome);
         if let Some(mtm) = MainThreadMarker::new() {
             install_edit_menu(mtm);
+            track_mouse_moves(&chrome, mtm);
         }
         self.chrome = Some(chrome);
         self.content = Some(content);
@@ -1172,6 +1175,16 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
     let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::LeftMouseDown, &block) };
     std::mem::forget(block);
     monitor
+}
+
+/// AppKit sends mouse-moved events only to the first responder, so once a page took focus GPUI saw no
+/// moves and its hover states (the window dock, buttons) went dead. A tracking area delivers them regardless.
+fn track_mouse_moves(chrome: &NSView, mtm: MainThreadMarker) {
+    let options = NSTrackingAreaOptions::MouseMoved | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect;
+    let area = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(chrome), None)
+    };
+    unsafe { chrome.addTrackingArea(&area) };
 }
 
 static CHROME_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
