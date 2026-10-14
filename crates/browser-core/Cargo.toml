@@ -1,0 +1,18 @@
+[package]
+name = "browser-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+browser-storage = { path = "../browser-storage" }
+rusqlite = "0.32"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+ureq = "2.12"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "nxbrowser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nxbrowser"
+path = "src/main.rs"
+
+[dependencies]
+browser-ui = { path = "../browser-ui" }

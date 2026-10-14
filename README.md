@@ -1,0 +1,36 @@
+# NxBrowser
+
+A macOS browser shell: GPUI for the chrome, WKWebView for pages. Each profile has its own persistent `WKWebsiteDataStore`, so cookies and website data stay separate. Wry is not used, because it does not expose per-profile WebKit data stores.
+
+Progress against `plan.md` is tracked in `IMPLEMENTATION.md`.
+
+## Run
+
+```bash
+cargo run -p nxbrowser
+```
+
+Run it from this directory so `extensions/examples/hello-world` is discovered.
+
+```bash
+cargo test -p browser-core -p browser-extensions
+cargo run -p nxbrowser -- --self-test
+```
+
+`--self-test` opens the window, checks that two profiles keep independent `localStorage`, evaluates JavaScript, checks that the web view resizes, prints startup and memory numbers, and exits.
+
+Requires macOS 14 or newer (persistent `WKWebsiteDataStore` identifiers) and the Xcode Metal toolchain, which GPUI uses to compile shaders. The window chrome uses [gpuikit](https://crates.io/crates/gpuikit). `rust-toolchain.toml` selects Rust 1.98.1, which that GPUI build needs.
+
+## Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| Cmd+L | Address bar |
+| Cmd+T | New tab |
+| Cmd+W | Close tab |
+| Cmd+R | Reload |
+| Cmd+[ / Cmd+] | Back / forward |
+| Cmd+F | Find in page |
+| Cmd+D | Bookmark |
+
+Pages are inspectable from Safari’s Develop menu. Links that ask for a new window open as a new tab in this process.

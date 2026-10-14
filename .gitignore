@@ -1,0 +1,4 @@
+/target
+**/*.sqlite
+**/*.sqlite-*
+.DS_Store

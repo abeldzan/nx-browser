@@ -1,0 +1,30 @@
+[package]
+name = "browser-engine-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+block2 = "0.6"
+browser-engine = { path = "../browser-engine" }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "block2",
+    "NSApplication",
+    "NSEvent",
+    "NSGraphics",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSResponder",
+    "NSSavePanel",
+    "NSView",
+    "NSWindow",
+    "objc2-quartz-core",
+] }
+objc2-core-foundation = "0.3"
+objc2-core-graphics = { version = "0.3", features = ["CGPath"] }
+objc2-foundation = "0.3"
+objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAShapeLayer", "CATransaction"] }
+objc2-web-kit = "0.3"
+uuid = { workspace = true }

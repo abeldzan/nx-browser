@@ -1,0 +1,19 @@
+[package]
+name = "browser-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+browser-core = { path = "../browser-core" }
+browser-engine = { path = "../browser-engine" }
+browser-engine-macos = { path = "../browser-engine-macos" }
+browser-extensions = { path = "../browser-extensions" }
+browser-storage = { path = "../browser-storage" }
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+gpuikit = { workspace = true }
+raw-window-handle = "0.6"
+serde_json = { workspace = true }
+uuid = { workspace = true }
