@@ -104,14 +104,19 @@ impl Storage {
             ",
         )?;
         // Columns added after the first release; older databases get them here.
-        for (column, decl) in [("icon", "TEXT NOT NULL DEFAULT ''"), ("color", "TEXT NOT NULL DEFAULT ''"), ("position", "INTEGER NOT NULL DEFAULT 0")] {
+        for (table, column, decl) in [
+            ("profiles", "icon", "TEXT NOT NULL DEFAULT ''"),
+            ("profiles", "color", "TEXT NOT NULL DEFAULT ''"),
+            ("profiles", "position", "INTEGER NOT NULL DEFAULT 0"),
+            ("tabs", "layout", "TEXT NOT NULL DEFAULT ''"),
+        ] {
             let has = self
                 .conn
-                .prepare("SELECT 1 FROM pragma_table_info('profiles') WHERE name = ?1")?
-                .exists(params![column])?;
+                .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+                .exists(params![table, column])?;
             if !has {
                 self.conn.execute_batch(&format!(
-                    "ALTER TABLE profiles ADD COLUMN {column} {decl}"
+                    "ALTER TABLE {table} ADD COLUMN {column} {decl}"
                 ))?;
             }
         }
@@ -157,7 +162,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, storage_path TEXT NOT NULL, data_store_id TEXT NOT NULL, created_at INTEGER NOT NULL);
-             INSERT INTO profiles VALUES ('a', 'Old', '/x', 'd', 1);",
+             INSERT INTO profiles VALUES ('a', 'Old', '/x', 'd', 1);
+             CREATE TABLE tabs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL, active INTEGER NOT NULL, position INTEGER NOT NULL, state TEXT NOT NULL);
+             INSERT INTO tabs VALUES ('t', 's', 'u', 'T', 1, 0, 'active');",
         )
         .unwrap();
         let storage = Storage { conn };
@@ -168,5 +175,7 @@ mod tests {
             .query_row("SELECT icon, color FROM profiles WHERE id = 'a'", [], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap();
         assert_eq!((icon.as_str(), color.as_str()), ("", ""));
+        let layout: String = storage.conn().query_row("SELECT layout FROM tabs WHERE id = 't'", [], |row| row.get(0)).unwrap();
+        assert_eq!(layout, "");
     }
 }

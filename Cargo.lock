@@ -784,6 +784,7 @@ dependencies = [
  "gpui-unofficial",
  "gpuikit",
  "raw-window-handle",
+ "serde",
  "serde_json",
  "uuid",
 ]

@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::rc::Rc;
 use std::ffi::{c_void, CStr};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,21 +12,21 @@ use anyhow::Context;
 use block2::RcBlock;
 use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, Shortcut, WebEngine};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, ProtocolObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
-    ns_string, NSDate, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
-    NSURLRequest, NSUUID,
+    ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
+    NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
     WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
-    WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKWebsiteDataStore, WKWindowFeatures,
 };
 use uuid::Uuid;
 
@@ -37,6 +41,8 @@ const HOME_HTML: &str = r#"<!doctype html>
 </main>
 </body>
 </html>"#;
+
+const OBSERVED_KEYS: [&str; 2] = ["URL", "title"];
 
 struct DelegateIvars {
     events: Sender<EngineEvent>,
@@ -204,6 +210,23 @@ define_class!(
         }
     }
 
+    impl NxWebDelegate {
+        /// KVO on the view's `URL` and `title`: in-page navigations (pushState, as on YouTube) never
+        /// reach the navigation delegate, so the address bar would lag behind them.
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        unsafe fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut c_void,
+        ) {
+            if let Some(web_view) = object.and_then(|object| object.downcast_ref::<WKWebView>()) {
+                self.emit_page(web_view, web_view.isLoading());
+            }
+        }
+    }
+
     unsafe impl WKScriptMessageHandler for NxWebDelegate {
         #[unsafe(method(userContentController:didReceiveScriptMessage:))]
         unsafe fn userContentController_didReceiveScriptMessage(
@@ -211,6 +234,12 @@ define_class!(
             _controller: &WKUserContentController,
             message: &WKScriptMessage,
         ) {
+            if ns_string(&message.name()) == "nxShortcut" {
+                if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key))) {
+                    let _ = self.ivars().events.send(EngineEvent::Shortcut(shortcut));
+                }
+                return;
+            }
             let body = message.body();
             let text = match body.downcast::<NSString>() {
                 Ok(string) => ns_string(&string),
@@ -272,10 +301,25 @@ pub struct MacEngine {
     dimmers: HashMap<String, Retained<NSView>>,
     _monitor: Option<Retained<AnyObject>>,
     _page_monitor: Option<Retained<AnyObject>>,
+    /// Where session cookies are snapshotted, as `<dir>/<data store id>.plist`; None when not restoring.
+    cookie_dir: Option<PathBuf>,
+    /// Stores with a snapshot still to restore before their first page loads.
+    cookie_restore: HashSet<String>,
+    /// Stores that had a tab this run; only their in-memory session cookies are current.
+    cookie_used: HashSet<String>,
+    /// Page loads held until a store's session cookies are back, per store.
+    held_loads: Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>,
+    /// Tabs whose next page must not start media on its own (restored at launch or woken from suspension).
+    hold_media: HashSet<String>,
 }
 
 impl MacEngine {
     pub fn new() -> Self {
+        if let Ok(home) = std::env::var("HOME") {
+            if let Err(error) = unify_data_root(&std::path::Path::new(&home).join("Library/WebKit")) {
+                eprintln!("could not unify WebKit data stores: {error}");
+            }
+        }
         let (events_tx, events_rx) = mpsc::channel();
         let permissions = Arc::new(Mutex::new(HashMap::new()));
         let monitor = install_shortcuts(events_tx.clone());
@@ -296,7 +340,78 @@ impl MacEngine {
             dimmers: HashMap::new(),
             _monitor: monitor,
             _page_monitor: page_monitor,
+            cookie_dir: None,
+            cookie_restore: HashSet::new(),
+            cookie_used: HashSet::new(),
+            held_loads: Rc::new(RefCell::new(HashMap::new())),
+            hold_media: HashSet::new(),
         }
+    }
+
+    /// The next page created for each of these tabs waits for a click before playing media,
+    /// so a video that was playing when the app quit comes back paused.
+    pub fn hold_media(&mut self, tab_ids: impl IntoIterator<Item = String>) {
+        self.hold_media.extend(tab_ids);
+    }
+
+    /// WebKit drops session cookies (no expiry) on quit, logging users out of sites that use them.
+    /// With `restore`, snapshots in `dir` are put back before a store's first page loads and kept
+    /// current by `save_session_cookies`; without it the snapshots are deleted.
+    pub fn set_session_cookie_dir(&mut self, dir: PathBuf, restore: bool) {
+        if !restore {
+            let _ = std::fs::remove_dir_all(&dir);
+            self.cookie_dir = None;
+            return;
+        }
+        self.cookie_restore = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "plist"))
+            .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+            .collect();
+        self.cookie_dir = Some(dir);
+    }
+
+    /// Snapshots the session cookies of every store used this run.
+    pub fn save_session_cookies(&mut self) {
+        let (Some(dir), Some(mtm)) = (self.cookie_dir.clone(), MainThreadMarker::new()) else {
+            return;
+        };
+        for id in &self.cookie_used {
+            // Saving mid-restore would overwrite the snapshot with the cookies not yet put back.
+            if self.held_loads.borrow().contains_key(id) {
+                continue;
+            }
+            let Ok(store) = data_store(id, mtm) else {
+                continue;
+            };
+            let path = dir.join(format!("{id}.plist"));
+            let block = RcBlock::new(move |cookies: NonNull<NSArray<NSHTTPCookie>>| {
+                write_session_cookies(&path, unsafe { cookies.as_ref() });
+            });
+            unsafe { store.httpCookieStore().getAllCookies(&block) };
+        }
+    }
+
+    fn begin_cookie_restore(&self, id: &str, store: &WKWebsiteDataStore) {
+        let Some(cookies) = self.cookie_dir.as_ref().and_then(|dir| read_session_cookies(&dir.join(format!("{id}.plist")))) else {
+            return;
+        };
+        if cookies.is_empty() {
+            return;
+        }
+        self.held_loads.borrow_mut().insert(id.to_string(), Vec::new());
+        let held = Rc::clone(&self.held_loads);
+        let id = id.to_string();
+        let done = RcBlock::new(move || {
+            let loads = held.borrow_mut().remove(&id).unwrap_or_default();
+            for (view, url) in loads {
+                load_url(&view, &url);
+            }
+        });
+        unsafe { store.httpCookieStore().setCookies_completionHandler(&cookies, Some(&done)) };
     }
 
     pub fn take_page_click(&mut self) -> Option<String> {
@@ -512,6 +627,9 @@ impl WebEngine for MacEngine {
             .contentView()
             .ok_or_else(|| anyhow::anyhow!("window has no content view"))?;
         install_hit_proxy(&chrome);
+        if let Some(mtm) = MainThreadMarker::new() {
+            install_edit_menu(mtm);
+        }
         self.chrome = Some(chrome);
         self.content = Some(content);
         self.apply_frame();
@@ -536,6 +654,8 @@ impl WebEngine for MacEngine {
         }
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("WebKit must be created on the main thread"))?;
         let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+        // Sites like YouTube Music sniff for the Safari suffix that bare WKWebView omits.
+        unsafe { configuration.setApplicationNameForUserAgent(Some(&NSString::from_str(&safari_ua_suffix()))) };
         let store = data_store(data_store_id, mtm)?;
         unsafe {
             configuration.setWebsiteDataStore(&store);
@@ -543,6 +663,9 @@ impl WebEngine for MacEngine {
             preferences.setJavaScriptCanOpenWindowsAutomatically(!self.settings.block_popups);
             preferences.setFraudulentWebsiteWarningEnabled(self.settings.fraud_warnings);
             configuration.defaultWebpagePreferences().setAllowsContentJavaScript(self.settings.javascript);
+            if self.hold_media.remove(tab_id) {
+                configuration.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::All);
+            }
         }
         let view = unsafe {
             WKWebView::initWithFrame_configuration(
@@ -567,6 +690,14 @@ impl WebEngine for MacEngine {
         unsafe {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             view.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            view.configuration().userContentController().addScriptMessageHandler_contentWorld_name(
+                ProtocolObject::from_ref(&*delegate),
+                &key_world(mtm),
+                ns_string!("nxShortcut"),
+            );
+            for key in OBSERVED_KEYS {
+                NSObject::addObserver_forKeyPath_options_context(&view, &delegate, &NSString::from_str(key), NSKeyValueObservingOptions::New, std::ptr::null_mut());
+            }
         }
         self.tabs.insert(
             tab_id.to_string(),
@@ -577,13 +708,24 @@ impl WebEngine for MacEngine {
             },
         );
         self.set_scripts(tab_id, scripts);
-        self.navigate(tab_id, url)?;
+        self.cookie_used.insert(data_store_id.to_string());
+        if self.cookie_restore.remove(data_store_id) {
+            self.begin_cookie_restore(data_store_id, &store);
+        }
+        let view = self.tabs.get(tab_id).unwrap().view.clone();
+        let held = self.held_loads.borrow_mut().get_mut(data_store_id).map(|loads| loads.push((view, url.to_string()))).is_some();
+        if !held {
+            self.navigate(tab_id, url)?;
+        }
         unsafe { self.tabs.get(tab_id).unwrap().view.setHidden(true) };
         Ok(())
     }
 
     fn close_tab(&mut self, tab_id: &str) {
         if let Some(live) = self.tabs.remove(tab_id) {
+            for key in OBSERVED_KEYS {
+                unsafe { NSObject::removeObserver_forKeyPath(&live.view, &live.delegate, &NSString::from_str(key)) };
+            }
             unsafe { live.view.removeFromSuperview() };
             self.stacked.clear();
         }
@@ -593,6 +735,7 @@ impl WebEngine for MacEngine {
     }
 
     fn suspend_tab(&mut self, tab_id: &str) {
+        self.hold_media.insert(tab_id.to_string());
         self.close_tab(tab_id);
     }
 
@@ -653,14 +796,7 @@ impl WebEngine for MacEngine {
         let Some(live) = self.tabs.get(tab_id) else {
             return Ok(());
         };
-        unsafe {
-            if url == "nxbrowser://home" || url.is_empty() {
-                live.view.loadHTMLString_baseURL(&NSString::from_str(HOME_HTML), None);
-            } else if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
-                let request = NSURLRequest::requestWithURL(&nsurl);
-                live.view.loadRequest(&request);
-            }
-        }
+        load_url(&live.view, url);
         Ok(())
     }
 
@@ -758,6 +894,7 @@ impl WebEngine for MacEngine {
         };
         let controller = unsafe { live.view.configuration().userContentController() };
         unsafe { controller.removeAllUserScripts() };
+        add_key_script(&controller, mtm);
         for script in scripts {
             if script.source.is_empty() {
                 continue;
@@ -806,6 +943,10 @@ impl WebEngine for MacEngine {
         unsafe {
             WKWebsiteDataStore::removeDataStoreForIdentifier_completionHandler(&uuid, &block, mtm);
         }
+        self.cookie_used.remove(data_store_id);
+        if let Some(dir) = &self.cookie_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{data_store_id}.plist")));
+        }
     }
 
     fn events(&self) -> &Receiver<EngineEvent> {
@@ -850,6 +991,107 @@ fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
     }
 }
 
+fn safari_ua_suffix() -> String {
+    let version = NSBundle::bundleWithPath(ns_string!("/Applications/Safari.app"))
+        .and_then(|bundle| bundle.objectForInfoDictionaryKey(ns_string!("CFBundleShortVersionString")))
+        .and_then(|value| value.downcast::<NSString>().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "26.0".to_string());
+    format!("Version/{version} Safari/605.1.15")
+}
+
+fn load_url(view: &WKWebView, url: &str) {
+    unsafe {
+        if url == "nxbrowser://home" || url.is_empty() {
+            view.loadHTMLString_baseURL(&NSString::from_str(HOME_HTML), None);
+        } else if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
+            let request = NSURLRequest::requestWithURL(&nsurl);
+            view.loadRequest(&request);
+        }
+    }
+}
+
+/// Writes the session-only cookies as a binary plist of their property dictionaries, readable only by the user.
+fn write_session_cookies(path: &Path, cookies: &NSArray<NSHTTPCookie>) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let props = cookies.iter().filter(|cookie| cookie.isSessionOnly()).filter_map(|cookie| cookie.properties()).collect::<Vec<_>>();
+    if props.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let array = NSArray::from_retained_slice(&props);
+    let Ok(data) = (unsafe { NSPropertyListSerialization::dataWithPropertyList_format_options_error(&array, NSPropertyListFormat::BinaryFormat_v1_0, 0) }) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let temp = path.with_extension("tmp");
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(&data.to_vec()));
+    if written.is_ok() {
+        let _ = std::fs::rename(&temp, path);
+    }
+}
+
+fn read_session_cookies(path: &Path) -> Option<Retained<NSArray<NSHTTPCookie>>> {
+    let data = NSData::with_bytes(&std::fs::read(path).ok()?);
+    let plist = unsafe { NSPropertyListSerialization::propertyListWithData_options_format_error(&data, NSPropertyListMutabilityOptions::Immutable, std::ptr::null_mut()) }.ok()?;
+    let list = plist.downcast::<NSArray>().ok()?;
+    let cookies = list
+        .iter()
+        .filter_map(|item| item.downcast::<NSDictionary>().ok())
+        .filter_map(|props| unsafe { NSHTTPCookie::cookieWithProperties(&*(Retained::as_ptr(&props) as *const NSDictionary<NSString, AnyObject>)) })
+        .collect::<Vec<_>>();
+    Some(NSArray::from_retained_slice(&cookies))
+}
+
+/// WebKit keys profile data by bundle id (`dev.nxbrowser.app`) when bundled and by process name
+/// (`nxbrowser`) under `cargo run`, so logins made in one vanished in the other. Merges the
+/// unbundled root into the bundled one and leaves a symlink so both launch modes share it.
+fn unify_data_root(webkit: &std::path::Path) -> std::io::Result<()> {
+    use std::fs;
+    let canonical = webkit.join("dev.nxbrowser.app/WebsiteDataStore");
+    let legacy = webkit.join("nxbrowser/WebsiteDataStore");
+    match fs::symlink_metadata(&legacy) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(_) => {
+            fs::create_dir_all(&canonical)?;
+            fs::create_dir_all(webkit.join("nxbrowser"))?;
+            return std::os::unix::fs::symlink(&canonical, &legacy);
+        }
+    }
+    fs::create_dir_all(&canonical)?;
+    let cookies = |dir: &std::path::Path| fs::metadata(dir.join("Cookies/Cookies.binarycookies")).and_then(|m| m.modified()).ok();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    // The losing copy of a store is kept here, never deleted.
+    let old = webkit.join(format!("nxbrowser/WebsiteDataStore.old-{stamp}"));
+    for entry in fs::read_dir(&legacy)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let target = canonical.join(&name);
+        if target.exists() {
+            fs::create_dir_all(&old)?;
+            if cookies(&target) >= cookies(&entry.path()) {
+                fs::rename(entry.path(), old.join(&name))?;
+                continue;
+            }
+            fs::rename(&target, old.join(&name))?;
+        }
+        fs::rename(entry.path(), &target)?;
+    }
+    fs::remove_dir(&legacy)?;
+    std::os::unix::fs::symlink(&canonical, &legacy)
+}
+
 fn data_store(id: &str, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebsiteDataStore>> {
     let uuid = parse_uuid(id)?;
     Ok(unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) })
@@ -867,19 +1109,9 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
         if flags.contains(NSEventModifierFlags::Command) && !flags.contains(NSEventModifierFlags::Control) {
             if let Some(chars) = event_ref.charactersIgnoringModifiers() {
                 let key = ns_string(&chars).to_ascii_lowercase();
-                let shortcut = match key.as_str() {
-                    "t" => Some(Shortcut::NewTab),
-                    "w" => Some(Shortcut::CloseTab),
-                    "l" => Some(Shortcut::FocusUrl),
-                    "r" => Some(Shortcut::Reload),
-                    "f" => Some(Shortcut::Find),
-                    "d" => Some(Shortcut::Bookmark),
-                    "[" => Some(Shortcut::Back),
-                    "]" => Some(Shortcut::Forward),
-                    "," => Some(Shortcut::Settings),
-                    _ => None,
-                };
-                if let Some(shortcut) = shortcut {
+                // A focused page gets these first; the key script reports them back if it ignores them.
+                let page_first = PAGE_FIRST_KEYS.contains(&key.as_str()) && page_has_focus(event_ref);
+                if let Some(shortcut) = shortcut_for(&key).filter(|_| !page_first) {
                     let _ = events.send(EngineEvent::Shortcut(shortcut));
                     return std::ptr::null_mut();
                 }
@@ -942,13 +1174,17 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
     monitor
 }
 
+static CHROME_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
+
 fn install_hit_proxy(chrome: &NSView) {
     static PROXY: OnceLock<&'static AnyClass> = OnceLock::new();
     let class = PROXY.get_or_init(|| {
+        let original = *CHROME_CLASS.get_or_init(|| chrome.class());
         let name = CStr::from_bytes_with_nul(b"NxPageHitProxy\0").unwrap();
-        let mut builder = ClassBuilder::new(name, chrome.class()).expect("NxPageHitProxy");
+        let mut builder = ClassBuilder::new(name, original).expect("NxPageHitProxy");
         unsafe {
             builder.add_method(sel!(hitTest:), hit_test as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(performKeyEquivalent:), key_equivalent as extern "C-unwind" fn(_, _, _) -> _);
         }
         builder.register()
     });
@@ -967,6 +1203,178 @@ extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *m
     result
 }
 
+/// AppKit offers Cmd-key combos to every view, so GPUI took Cmd+Z/C/V/D… even while a page had focus.
+/// While a page is focused they go to the page (and the Edit menu) instead.
+extern "C-unwind" fn key_equivalent(this: &AnyObject, _cmd: Sel, event: &NSEvent) -> Bool {
+    if page_has_focus(event) {
+        return Bool::NO;
+    }
+    let original = *CHROME_CLASS.get().expect("chrome class");
+    unsafe { msg_send![super(this, original), performKeyEquivalent: event] }
+}
+
+/// Whether the event's window has a web page (or a view inside one) as first responder.
+fn page_has_focus(event: &NSEvent) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(responder) = event.window(mtm).and_then(|window| window.firstResponder()) else {
+        return false;
+    };
+    let mut view = responder.downcast::<NSView>().ok();
+    while let Some(current) = view {
+        if current.isKindOfClass(WKWebView::class()) {
+            return true;
+        }
+        view = unsafe { current.superview() };
+    }
+    false
+}
+
+/// App shortcuts. Ones a page may claim are offered to the page first while it has focus
+/// (as Chrome does): Excalidraw uses Cmd+D to duplicate, docs editors take Cmd+F.
+fn shortcut_for(key: &str) -> Option<Shortcut> {
+    match key {
+        "t" => Some(Shortcut::NewTab),
+        "w" => Some(Shortcut::CloseTab),
+        "l" => Some(Shortcut::FocusUrl),
+        "r" => Some(Shortcut::Reload),
+        "f" => Some(Shortcut::Find),
+        "d" => Some(Shortcut::Bookmark),
+        "[" => Some(Shortcut::Back),
+        "]" => Some(Shortcut::Forward),
+        "," => Some(Shortcut::Settings),
+        _ => None,
+    }
+}
+
+const PAGE_FIRST_KEYS: [&str; 5] = ["d", "f", "r", "[", "]"];
+
+/// Runs in its own world; reports page-first shortcuts the page did not `preventDefault`.
+const KEY_FALLBACK_JS: &str = r#"addEventListener('keydown', (e) => {
+  const key = (e.key || '').toLowerCase();
+  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']'].includes(key)) return;
+  setTimeout(() => { if (!e.defaultPrevented) webkit.messageHandlers.nxShortcut.postMessage(key); }, 0);
+}, true);"#;
+
+fn key_world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {
+    unsafe { WKContentWorld::worldWithName(ns_string!("nxbrowser-keys"), mtm) }
+}
+
+fn add_key_script(controller: &WKUserContentController, mtm: MainThreadMarker) {
+    let script = unsafe {
+        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+            WKUserScript::alloc(mtm),
+            &NSString::from_str(KEY_FALLBACK_JS),
+            WKUserScriptInjectionTime::AtDocumentStart,
+            true,
+            &key_world(mtm),
+        )
+    };
+    unsafe { controller.addUserScript(&script) };
+}
+
+/// GPUI sets no menu bar, and WebKit's copy/paste/undo/select-all only run as Edit menu actions,
+/// so pages never got them. Items have no target: they go to whatever has focus.
+fn install_edit_menu(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+    let main = app.mainMenu().unwrap_or_else(|| {
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
+        let app_item = NSMenuItem::new(mtm);
+        let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("NxBrowser"));
+        app_menu.addItem(&menu_item(mtm, "Quit NxBrowser", sel!(terminate:), "q", false));
+        app_item.setSubmenu(Some(&app_menu));
+        menu.addItem(&app_item);
+        app.setMainMenu(Some(&menu));
+        menu
+    });
+    if main.itemWithTitle(ns_string!("Edit")).is_some() {
+        return;
+    }
+    let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    edit.addItem(&menu_item(mtm, "Undo", sel!(undo:), "z", false));
+    edit.addItem(&menu_item(mtm, "Redo", sel!(redo:), "z", true));
+    edit.addItem(&NSMenuItem::separatorItem(mtm));
+    edit.addItem(&menu_item(mtm, "Cut", sel!(cut:), "x", false));
+    edit.addItem(&menu_item(mtm, "Copy", sel!(copy:), "c", false));
+    edit.addItem(&menu_item(mtm, "Paste", sel!(paste:), "v", false));
+    edit.addItem(&menu_item(mtm, "Select All", sel!(selectAll:), "a", false));
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(ns_string!("Edit"));
+    item.setSubmenu(Some(&edit));
+    main.addItem(&item);
+}
+
+fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str, shift: bool) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(NSMenuItem::alloc(mtm), &NSString::from_str(title), Some(action), &NSString::from_str(key))
+    };
+    if shift {
+        item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Shift);
+    }
+    item
+}
+
 fn ns_string(value: &NSString) -> String {
     objc2::rc::autoreleasepool(|pool| unsafe { value.to_str(pool).to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unify_data_root;
+    use std::fs;
+
+    #[test]
+    fn unbundled_stores_merge_into_bundled_root() {
+        let root = std::env::temp_dir().join(format!("nx-webkit-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("nxbrowser/WebsiteDataStore");
+        let canonical = root.join("dev.nxbrowser.app/WebsiteDataStore");
+        let write = |dir: &std::path::Path, store: &str, body: &str| {
+            fs::create_dir_all(dir.join(store).join("Cookies")).unwrap();
+            fs::write(dir.join(store).join("Cookies/Cookies.binarycookies"), body).unwrap();
+        };
+        write(&canonical, "shared", "bundled-older");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&legacy, "shared", "unbundled-newer");
+        write(&legacy, "only-legacy", "legacy");
+
+        unify_data_root(&root).unwrap();
+        unify_data_root(&root).unwrap();
+
+        let read = |store: &str| fs::read_to_string(canonical.join(store).join("Cookies/Cookies.binarycookies")).unwrap();
+        assert_eq!(read("shared"), "unbundled-newer");
+        assert_eq!(read("only-legacy"), "legacy");
+        assert!(fs::symlink_metadata(&legacy).unwrap().file_type().is_symlink());
+        assert_eq!(read_via(&legacy, "shared"), "unbundled-newer");
+        let kept = fs::read_dir(root.join("nxbrowser")).unwrap().filter_map(Result::ok).any(|e| e.file_name().to_string_lossy().starts_with("WebsiteDataStore.old-"));
+        assert!(kept, "replaced store must be kept, not deleted");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_cookies_round_trip_and_persistent_ones_are_skipped() {
+        use objc2_foundation::{NSDictionary, NSHTTPCookie, NSString, NSURL};
+        let url = NSURL::URLWithString(&NSString::from_str("https://example.com/")).unwrap();
+        let cookies = |header: &str| {
+            let fields = NSDictionary::from_slices(&[&*NSString::from_str("Set-Cookie")], &[&*NSString::from_str(header)]);
+            NSHTTPCookie::cookiesWithResponseHeaderFields_forURL(&fields, &url)
+        };
+        let path = std::env::temp_dir().join(format!("nx-cookies-{}/store.plist", uuid::Uuid::new_v4()));
+        super::write_session_cookies(&path, &cookies("sid=abc; Path=/; Secure; HttpOnly"));
+        let back = super::read_session_cookies(&path).unwrap();
+        assert_eq!(back.len(), 1);
+        let cookie = back.objectAtIndex(0);
+        assert_eq!((cookie.name().to_string(), cookie.value().to_string()), ("sid".into(), "abc".into()));
+        assert!(cookie.isSessionOnly() && cookie.isSecure() && cookie.isHTTPOnly());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // Only persistent cookies left: WebKit keeps those itself, so the snapshot goes away.
+        super::write_session_cookies(&path, &cookies("keep=1; Path=/; Max-Age=3600"));
+        assert!(!path.exists());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn read_via(dir: &std::path::Path, store: &str) -> String {
+        fs::read_to_string(dir.join(store).join("Cookies/Cookies.binarycookies")).unwrap()
+    }
 }

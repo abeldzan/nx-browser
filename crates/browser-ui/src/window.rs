@@ -19,6 +19,7 @@ use gpui::{
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
+use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
@@ -26,6 +27,7 @@ use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
 use gpuikit::traits::control_sized::ControlSized;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -61,6 +63,8 @@ pub struct BrowserWindow {
     pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
+    /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
+    address_editing: bool,
     find_open: bool,
     panel: Option<SidebarPage>,
     chrome: HashMap<String, TabChrome>,
@@ -81,6 +85,7 @@ pub struct BrowserWindow {
     started: Instant,
     metrics: SharedString,
     self_test: Option<SelfTest>,
+    cookies_saved: Instant,
 }
 
 struct SelfTest {
@@ -126,7 +131,11 @@ impl BrowserWindow {
                     this.address_focused = true;
                     this.engine.focus_chrome();
                 }
-                InputStateEvent::Blur => this.address_focused = false,
+                InputStateEvent::Blur => {
+                    this.address_focused = false;
+                    this.address_editing = false;
+                    this.refresh_url(cx);
+                }
                 _ => {}
             }),
             cx.subscribe(&find_input, |this, input, event, cx| match event {
@@ -201,6 +210,7 @@ impl BrowserWindow {
             download_progress: HashMap::new(),
             address_focused: false,
             focus_address: false,
+            address_editing: false,
             find_open: false,
             panel: None,
             chrome: HashMap::new(),
@@ -229,8 +239,17 @@ impl BrowserWindow {
                 sum: None,
                 started: Instant::now(),
             }),
+            cookies_saved: Instant::now(),
         };
         view.apply_settings();
+        if view.self_test.is_none() {
+            let (restore, tab_ids) = {
+                let model = view.model.lock().expect("model");
+                (model.settings.restore_session, model.tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>())
+            };
+            view.engine.set_session_cookie_dir(app_support_dir().join("session-cookies"), restore);
+            view.engine.hold_media(tab_ids);
+        }
         view.reload_extensions();
         view.sync_permissions();
         let url = view
@@ -273,8 +292,17 @@ impl BrowserWindow {
             )
             .into();
         }
+        // Catches logins done without a page load (XHR); finished loads save right away.
+        if self.cookies_saved.elapsed() > Duration::from_secs(10) {
+            self.save_cookies();
+        }
         self.run_self_test();
         cx.notify();
+    }
+
+    fn save_cookies(&mut self) {
+        self.cookies_saved = Instant::now();
+        self.engine.save_session_cookies();
     }
 
     fn drain(&mut self, cx: &mut Context<Self>) {
@@ -295,8 +323,18 @@ impl BrowserWindow {
             self.on_event(event, cx);
         }
         let suspend = self.model.lock().expect("model").tabs_due_for_suspension();
+        let tabs = self.model.lock().expect("model").session_tabs().into_iter().cloned().collect::<Vec<_>>();
+        let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         for tab_id in suspend {
-            let _ = self.model.lock().expect("model").mark_suspended(&tab_id);
+            // Every window on the stage is showing its page; suspending one makes it reload in place.
+            let entry = self.chrome.get(&tab_id);
+            let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized));
+            let mut model = self.model.lock().expect("model");
+            if hidden {
+                let _ = model.mark_suspended(&tab_id);
+            } else {
+                model.keep_alive(&tab_id);
+            }
         }
         let effects = self.model.lock().expect("model").take_effects();
         self.apply(effects);
@@ -316,6 +354,7 @@ impl BrowserWindow {
                     self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
                 }
                 if !loading {
+                    self.save_cookies();
                     self.status = if title.is_empty() { "Loaded".into() } else { title.into() };
                     let (_, host) = site_glyph(&url);
                     if self.self_test.is_none() && is_web(&url) && !favicon_path(&host).exists() {
@@ -418,7 +457,8 @@ impl BrowserWindow {
                 Effect::EnsureTab { tab_id, data_store_id, url } => {
                     let _ = self.engine.ensure_tab(&tab_id, &data_store_id, &url, &scripts);
                 }
-                Effect::CloseTab { tab_id } | Effect::SuspendTab { tab_id } => self.engine.close_tab(&tab_id),
+                Effect::CloseTab { tab_id } => self.engine.close_tab(&tab_id),
+                Effect::SuspendTab { tab_id } => self.engine.suspend_tab(&tab_id),
                 Effect::ShowTab { tab_id } => {
                     if self.self_test.is_some() {
                         self.engine.show_tab(tab_id.as_deref());
@@ -561,6 +601,7 @@ impl BrowserWindow {
             normalize_url(raw, model.settings.search_template(), model.settings.https_only)
         };
         self.address_focused = false;
+        self.address_editing = false;
         self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         self.with_model(|model| {
             let _ = model.navigate_active(&url);
@@ -785,6 +826,7 @@ impl BrowserWindow {
             return;
         }
         self.focus_address = false;
+        self.address_editing = true;
         if let Some(id) = self.active_tab_id() {
             self.chrome.entry(id).or_default().minimized = false;
         }
@@ -850,10 +892,13 @@ impl Render for BrowserWindow {
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
         let extensions = self.model.lock().expect("model").extensions.clone();
         let colors = paint(cx);
-        let live_ids = tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
+        let live_ids = self.model.lock().expect("model").tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         self.chrome.retain(|id, _| live_ids.iter().any(|live| live == id));
+        self.order.retain(|id| live_ids.iter().any(|live| live == id));
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         self.prepare_frames(&tabs);
+        self.save_layouts(&tabs);
         if self.self_test.is_none() {
             for tab in &tabs {
                 let entry = self.chrome.get(&tab.id);
@@ -989,11 +1034,44 @@ impl BrowserWindow {
         if sw < 80.0 || sh < 80.0 {
             return;
         }
+        // Windows not seen this run come back from their saved layout, stacked in saved z-order.
+        let mut seeded = Vec::new();
+        for tab in tabs {
+            if self.chrome.contains_key(&tab.id) {
+                continue;
+            }
+            let Ok(saved) = serde_json::from_str::<SavedLayout>(&tab.layout) else {
+                continue;
+            };
+            let mut chrome = saved.chrome;
+            let (ow, oh) = saved.stage;
+            if chrome.snap.is_some() {
+                chrome.frame = chrome.frame.map(|frame| rescale_snapped(frame, ow, oh, sw, sh));
+            }
+            if chrome.frame.is_some_and(|frame| mostly_off(frame, sw, sh)) {
+                chrome.frame = None;
+            }
+            self.chrome.insert(tab.id.clone(), chrome);
+            seeded.push((saved.z, tab.id.clone()));
+        }
+        seeded.sort();
+        for (_, id) in seeded {
+            if !self.order.contains(&id) {
+                self.order.push(id);
+            }
+        }
         let key = (sw.round() as i32, sh.round() as i32);
         if self.layout_stage != Some(key) {
-            self.layout_stage = Some(key);
+            let old = self.layout_stage.replace(key);
             if self.gesture.is_none() {
                 for entry in self.chrome.values_mut() {
+                    if let Some(snap) = entry.snap {
+                        // Snapped windows keep their share of the stage, including splits the user dragged.
+                        entry.frame = Some(match (old, entry.frame) {
+                            (Some((ow, oh)), Some(frame)) => rescale_snapped(frame, ow as f32, oh as f32, sw, sh),
+                            _ => snap.frame(sw, sh),
+                        });
+                    }
                     if entry.frame.is_some_and(|frame| mostly_off(frame, sw, sh)) {
                         entry.frame = None;
                     }
@@ -1024,8 +1102,32 @@ impl BrowserWindow {
                 h: cell_h.max(120.0),
             });
         }
-        let live = tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        self.order.retain(|id| live.iter().any(|tab| tab == id));
+    }
+
+    /// Writes changed window layouts to the tab rows so they survive restarts.
+    fn save_layouts(&mut self, tabs: &[browser_core::Tab]) {
+        if self.gesture.is_some() || self.self_test.is_some() {
+            return;
+        }
+        let Some((sw, sh)) = self.layout_stage else {
+            return;
+        };
+        let changed = tabs
+            .iter()
+            .filter_map(|tab| {
+                let chrome = self.chrome.get(&tab.id)?.clone();
+                let z = self.order.iter().position(|id| id == &tab.id).unwrap_or(0);
+                let json = serde_json::to_string(&SavedLayout { chrome, z, stage: (sw as f32, sh as f32) }).ok()?;
+                (json != tab.layout).then(|| (tab.id.clone(), json))
+            })
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            self.with_model(|model| {
+                for (id, json) in &changed {
+                    let _ = model.set_tab_layout(id, json);
+                }
+            });
+        }
     }
 
     fn note_stage(&mut self, bounds: gpui::Bounds<Pixels>, cx: &mut Context<Self>) -> bool {
@@ -1053,22 +1155,44 @@ impl BrowserWindow {
             if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
                 return;
             }
-            entity.update(cx, |view, cx| {
-                view.gesture = None;
-                cx.notify();
-            });
+            entity.update(cx, |view, cx| view.finish_gesture(cx));
         });
     }
 
     fn apply_gesture(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(gesture) = self.gesture.clone() else {
+        let Some(mut gesture) = self.gesture.clone() else {
             return;
         };
         let Some(bounds) = self.stage_bounds else {
             return;
         };
+        let sw = f64::from(bounds.size.width) as f32;
+        let sh = f64::from(bounds.size.height) as f32;
         let dx = f64::from(position.x) as f32 - gesture.origin_x;
         let dy = f64::from(position.y) as f32 - gesture.origin_y;
+        if let Some(restore) = gesture.restore {
+            // A click on a snapped title bar must not unsnap it; only a real drag does.
+            if dx.abs() + dy.abs() < RESTORE_DRAG {
+                return;
+            }
+            // Pop back to the floating size, keeping the grab point at the same spot along the title bar.
+            let grab_x = gesture.origin_x - f64::from(bounds.origin.x) as f32;
+            let along = ((grab_x - gesture.start.x) / gesture.start.w).clamp(0.0, 1.0);
+            gesture.start = Frame { x: grab_x - along * restore.w, y: gesture.start.y, w: restore.w, h: restore.h };
+            gesture.restore = None;
+            if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
+                entry.snap = None;
+                entry.restore = None;
+            }
+        }
+        let others = self
+            .chrome
+            .iter()
+            // Partners move with the border, so they must not attract it back to where they were.
+            .filter(|(id, entry)| **id != gesture.tab_id && !entry.minimized && !entry.maximized)
+            .filter(|(id, _)| !gesture.partners.iter().any(|(partner, _)| partner == *id))
+            .filter_map(|(_, entry)| entry.frame)
+            .collect::<Vec<_>>();
         let mut frame = gesture.start;
         match gesture.kind {
             GestureKind::Move => {
@@ -1092,18 +1216,64 @@ impl BrowserWindow {
                 }
             }
         }
-        let sw = f64::from(bounds.size.width) as f32;
-        let sh = f64::from(bounds.size.height) as f32;
-        if matches!(gesture.kind, GestureKind::Resize(_)) {
-            frame.w = frame.w.max(220.0_f32.min(gesture.start.w));
-            frame.h = frame.h.max(120.0_f32.min(gesture.start.h));
+        match gesture.kind {
+            GestureKind::Move => {
+                frame = magnet(frame, Edges { left: true, right: true, top: true, bottom: true }, &others, sw, sh);
+                let x = f64::from(position.x - bounds.origin.x) as f32;
+                let y = f64::from(position.y - bounds.origin.y) as f32;
+                gesture.snap = snap_zone(x, y, sw, sh);
+            }
+            GestureKind::Resize(edges) => {
+                frame = magnet(frame, edges, &others, sw, sh);
+                frame.w = frame.w.max(MIN_W.min(gesture.start.w));
+                frame.h = frame.h.max(MIN_H.min(gesture.start.h));
+            }
         }
         frame = keep_on_stage(frame, sw, sh);
+        if let GestureKind::Resize(edges) = gesture.kind {
+            let starts = gesture.partners.iter().map(|(_, start)| *start).collect::<Vec<_>>();
+            let (linked, followers) = link_resize(gesture.start, frame, edges, &starts);
+            frame = linked;
+            for ((id, _), follower) in gesture.partners.iter().zip(followers) {
+                if let (Some(follower), Some(entry)) = (follower, self.chrome.get_mut(id)) {
+                    entry.frame = Some(follower);
+                }
+            }
+        }
         if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
             entry.maximized = false;
             entry.frame = Some(frame);
         }
+        self.gesture = Some(gesture);
         // Native views follow in the canvas paint, in the same frame as the GPUI chrome.
+        cx.notify();
+    }
+
+    fn finish_gesture(&mut self, cx: &mut Context<Self>) {
+        let Some(gesture) = self.gesture.take() else {
+            return;
+        };
+        if let (Some(snap), Some(stage)) = (gesture.snap, self.stage_bounds) {
+            let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
+            // The size the window had when the drag began is what dragging it out of the snap brings back.
+            if snap == Snap::Maximize {
+                for chrome in self.chrome.values_mut() {
+                    chrome.maximized = false;
+                }
+            }
+            if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
+                if snap == Snap::Maximize {
+                    entry.maximized = true;
+                    entry.snap = None;
+                    entry.restore = None;
+                    entry.frame = Some(gesture.start);
+                } else {
+                    entry.snap = Some(snap);
+                    entry.restore = Some(gesture.start);
+                    entry.frame = Some(snap.frame(sw, sh));
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -1123,10 +1293,22 @@ impl BrowserWindow {
         let stage_h = f64::from(stage.size.height);
         let ids = self.order.clone();
         let mut stack = Vec::new();
+        let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
         for id in ids {
             let Some(entry) = self.chrome.get(&id).cloned() else {
                 continue;
             };
+            if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == id) {
+                // The preview hides pages behind it but has no page of its own.
+                let frame = snap.frame(stage_w as f32, stage_h as f32);
+                let shell = LogicalRect {
+                    x: origin_x + f64::from(frame.x),
+                    y: origin_y + f64::from(frame.y),
+                    width: f64::from(frame.w),
+                    height: f64::from(frame.h),
+                };
+                stack.push((String::new(), shell, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }));
+            }
             if entry.minimized {
                 self.engine.place_tab(&id, None);
                 continue;
@@ -1155,7 +1337,7 @@ impl BrowserWindow {
             };
             stack.push((id, shell, rect));
         }
-        let ids = stack.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>();
+        let ids = stack.iter().map(|(id, _, _)| id.clone()).filter(|id| !id.is_empty()).collect::<Vec<_>>();
         self.engine.stack_tabs(&ids);
         let stage = LogicalRect { x: origin_x, y: origin_y, width: stage_w, height: stage_h };
         let (mut holes, mut notches) = visible_pages(&stack, &stage);
@@ -1182,16 +1364,17 @@ impl BrowserWindow {
         let Some(start) = self.visual_frame(id) else {
             return;
         };
-        if let Some(entry) = self.chrome.get_mut(id) {
-            entry.maximized = false;
-            entry.frame = Some(start);
-        }
+        // A maximized window keeps its floating frame; a snapped one keeps it in `restore`.
+        let restore = self.chrome.get(id).and_then(|entry| if entry.maximized { entry.frame } else { entry.restore });
         self.gesture = Some(Gesture {
             tab_id: id.to_string(),
             kind: GestureKind::Move,
             origin_x: f64::from(position.x) as f32,
             origin_y: f64::from(position.y) as f32,
             start,
+            restore,
+            snap: None,
+            partners: Vec::new(),
         });
         self.engine.focus_chrome();
         cx.notify();
@@ -1202,16 +1385,30 @@ impl BrowserWindow {
         let Some(start) = self.visual_frame(id) else {
             return;
         };
+        let snapped = self.chrome.get(id).is_some_and(|entry| entry.snap.is_some());
         if let Some(entry) = self.chrome.get_mut(id) {
             entry.maximized = false;
             entry.frame = Some(start);
         }
+        // Snapped neighbours share borders with a snapped window, so they resize along with it.
+        let partners = if snapped {
+            self.chrome
+                .iter()
+                .filter(|(other, entry)| *other != id && entry.snap.is_some() && !entry.minimized && !entry.maximized)
+                .filter_map(|(other, entry)| Some((other.clone(), entry.frame?)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.gesture = Some(Gesture {
             tab_id: id.to_string(),
             kind: GestureKind::Resize(edges),
             origin_x: f64::from(position.x) as f32,
             origin_y: f64::from(position.y) as f32,
             start,
+            restore: None,
+            snap: None,
+            partners,
         });
         self.engine.focus_chrome();
         cx.notify();
@@ -1249,12 +1446,34 @@ impl BrowserWindow {
             );
         let mut ordered = shown;
         ordered.sort_by_key(|tab| self.order.iter().position(|id| id == &tab.id).unwrap_or(0));
+        let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
         for tab in ordered {
+            if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
+                stage = stage.child(self.snap_preview(*snap, cx));
+            }
             if let Some(window) = self.floating_window(tab, cx) {
                 stage = stage.child(window);
             }
         }
         stage
+    }
+
+    fn snap_preview(&self, snap: Snap, cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let Some(stage) = self.stage_bounds else {
+            return div();
+        };
+        let frame = snap.frame(f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
+        div()
+            .absolute()
+            .left(px(frame.x))
+            .top(px(frame.y))
+            .w(px(frame.w))
+            .h(px(frame.h))
+            .rounded(px(WINDOW_RADIUS as f32))
+            .border_2()
+            .border_color(paint.accent.opacity(0.7))
+            .bg(paint.accent.opacity(0.16))
     }
 
     fn edges_under_pointer(&self, id: &str, position: gpui::Point<Pixels>) -> Option<Edges> {
@@ -1402,7 +1621,7 @@ impl BrowserWindow {
                 .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx))
                 .child(
                     div().flex_1().h_full().px(px(28.)).flex().justify_center().items_center().child(
-                        div().w(px(240.)).max_w_full().child(address),
+                        div().w_full().max_w(px(560.)).child(address),
                     ),
                 )
                 .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx)),
@@ -1424,37 +1643,45 @@ impl BrowserWindow {
 
     fn address_slot(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        if tab.active {
-            return div().w_full().child(
-                text_field(&self.address, cx)
+        let editing = tab.active && (self.address_editing || self.address_focused);
+        let pill = div()
+            .h(px(28.))
+            .w_full()
+            .px(px(10.))
+            .rounded(px(8.))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .bg(paint.secondary)
+            .border_1()
+            .text_size(px(12.));
+        if editing {
+            return pill.border_color(paint.accent.opacity(0.6)).child(
+                input(&self.address, cx)
                     .placeholder("Search or enter an address")
-                    .full_width(true),
+                    .cursor_color(paint.accent)
+                    .flex_1()
+                    .h_full()
+                    .text_size(px(12.))
+                    .text_color(paint.fg),
             );
         }
         let id = tab.id.clone();
-        let label = if tab.url.is_empty() || tab.url == "nxbrowser://home" {
-            "New tab".to_string()
+        let (label, color) = if tab.url.is_empty() || tab.url == "nxbrowser://home" {
+            ("Search or enter an address".to_string(), paint.muted)
         } else {
-            tab.url.clone()
+            (display_url(&tab.url), if tab.active { paint.fg } else { paint.muted })
         };
         div().w_full().child(
-            div()
-                .id(SharedString::from(format!("address-{id}")))
-                .h(px(28.))
-                .w_full()
-                .px(px(10.))
-                .rounded(px(8.))
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .cursor_pointer()
-                .bg(paint.secondary)
-                .text_color(paint.muted)
-                .text_size(px(12.))
-                .child(label)
+            pill.id(SharedString::from(format!("address-{id}")))
+                .border_color(gpui::transparent_black())
+                .cursor_text()
+                .text_color(color)
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.focus_window(&id, cx);
                     this.focus_address = true;
+                    cx.notify();
                 })),
         )
     }
@@ -1890,7 +2117,7 @@ impl BrowserWindow {
 
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Frame {
     x: f32,
     y: f32,
@@ -1898,11 +2125,15 @@ struct Frame {
     h: f32,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct TabChrome {
     minimized: bool,
     maximized: bool,
     frame: Option<Frame>,
+    /// Snapped to half or a quarter of the stage; `frame` follows the stage size.
+    snap: Option<Snap>,
+    /// Floating frame to bring back when a snapped window is dragged out.
+    restore: Option<Frame>,
 }
 
 #[derive(Clone)]
@@ -1912,6 +2143,207 @@ struct Gesture {
     origin_x: f32,
     origin_y: f32,
     start: Frame,
+    /// Floating frame to pop back to once a snapped or maximized window is really dragged.
+    restore: Option<Frame>,
+    /// Snap target under the pointer, shown as a preview and applied on release.
+    snap: Option<Snap>,
+    /// Other snapped windows and their frames when a resize began; the adjacent ones follow the shared border.
+    partners: Vec<(String, Frame)>,
+}
+
+/// The address as shown when not editing: no scheme, no trailing slash on a bare host.
+fn display_url(url: &str) -> String {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    match rest.strip_suffix('/') {
+        Some(host) if !host.contains('/') => host.to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// What a tab row's `layout` column holds.
+#[derive(Serialize, Deserialize)]
+struct SavedLayout {
+    chrome: TabChrome,
+    /// Index in the window stacking order; higher is in front.
+    z: usize,
+    /// Stage size the frames were laid out for, so snapped frames can be rescaled.
+    stage: (f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+enum Snap {
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Maximize,
+}
+
+impl Snap {
+    /// Stage-local frame for this snap, laid out with the same inset as a maximized window.
+    fn frame(self, sw: f32, sh: f32) -> Frame {
+        let full_w = (sw - SNAP_INSET * 2.0).max(1.0);
+        let full_h = (sh - SNAP_INSET * 2.0).max(1.0);
+        let half_w = ((full_w - SNAP_INSET) / 2.0).max(1.0);
+        let half_h = ((full_h - SNAP_INSET) / 2.0).max(1.0);
+        let right = SNAP_INSET * 2.0 + half_w;
+        let bottom = SNAP_INSET * 2.0 + half_h;
+        let (x, y, w, h) = match self {
+            Snap::Maximize => (SNAP_INSET, SNAP_INSET, full_w, full_h),
+            Snap::Left => (SNAP_INSET, SNAP_INSET, half_w, full_h),
+            Snap::Right => (right, SNAP_INSET, half_w, full_h),
+            Snap::TopLeft => (SNAP_INSET, SNAP_INSET, half_w, half_h),
+            Snap::TopRight => (right, SNAP_INSET, half_w, half_h),
+            Snap::BottomLeft => (SNAP_INSET, bottom, half_w, half_h),
+            Snap::BottomRight => (right, bottom, half_w, half_h),
+        };
+        Frame { x, y, w, h }
+    }
+}
+
+/// Pointer distance from a stage edge that arms a snap.
+const SNAP_EDGE: f32 = 14.0;
+/// On a side edge, this close to the top or bottom snaps to a quarter.
+const SNAP_CORNER: f32 = 72.0;
+const SNAP_INSET: f32 = 8.0;
+/// Window edges within this distance stick to the stage or a neighbour.
+const MAGNET: f32 = 12.0;
+const RESTORE_DRAG: f32 = 6.0;
+/// Smallest size a resize shrinks a window to.
+const MIN_W: f32 = 220.0;
+const MIN_H: f32 = 120.0;
+
+/// Moves the borders `frame` shares with snapped neighbours along with it, keeping the inset gap between them.
+/// Adjacency is judged on the frames as they were when the resize began; returns the dragged frame,
+/// held back so no neighbour shrinks below the minimum, and each neighbour's new frame if it follows.
+fn link_resize(start: Frame, frame: Frame, edges: Edges, partners: &[Frame]) -> (Frame, Vec<Option<Frame>>) {
+    let touches = |a: f32, b: f32| (b - a - SNAP_INSET).abs() <= 2.0;
+    let beside_y = |o: &Frame| o.y < start.y + start.h && start.y < o.y + o.h;
+    let beside_x = |o: &Frame| o.x < start.x + start.w && start.x < o.x + o.w;
+    let left = |o: &Frame| edges.left && beside_y(o) && touches(o.x + o.w, start.x);
+    let right = |o: &Frame| edges.right && beside_y(o) && touches(start.x + start.w, o.x);
+    let top = |o: &Frame| edges.top && beside_x(o) && touches(o.y + o.h, start.y);
+    let bottom = |o: &Frame| edges.bottom && beside_x(o) && touches(start.y + start.h, o.y);
+    let mut frame = frame;
+    for o in partners {
+        if left(o) {
+            let x = frame.x.max(o.x + MIN_W + SNAP_INSET);
+            frame.w -= x - frame.x;
+            frame.x = x;
+        }
+        if right(o) {
+            frame.w = frame.w.min(o.x + o.w - MIN_W - SNAP_INSET - frame.x);
+        }
+        if top(o) {
+            let y = frame.y.max(o.y + MIN_H + SNAP_INSET);
+            frame.h -= y - frame.y;
+            frame.y = y;
+        }
+        if bottom(o) {
+            frame.h = frame.h.min(o.y + o.h - MIN_H - SNAP_INSET - frame.y);
+        }
+    }
+    let followers = partners
+        .iter()
+        .map(|o| {
+            let mut f = *o;
+            if left(o) {
+                f.w = frame.x - SNAP_INSET - o.x;
+            }
+            if right(o) {
+                f.x = frame.x + frame.w + SNAP_INSET;
+                f.w = o.x + o.w - f.x;
+            }
+            if top(o) {
+                f.h = frame.y - SNAP_INSET - o.y;
+            }
+            if bottom(o) {
+                f.y = frame.y + frame.h + SNAP_INSET;
+                f.h = o.y + o.h - f.y;
+            }
+            (left(o) || right(o) || top(o) || bottom(o)).then_some(f)
+        })
+        .collect();
+    (frame, followers)
+}
+
+/// Fits a snapped frame to a resized stage. Borders on the stage inset stay there; inner borders keep
+/// their proportional place, measured at the middle of the gap so neighbours stay one inset apart.
+fn rescale_snapped(frame: Frame, ow: f32, oh: f32, sw: f32, sh: f32) -> Frame {
+    let lead = |v: f32, old: f32, new: f32| {
+        if v <= SNAP_INSET + 0.5 { SNAP_INSET } else { (v - SNAP_INSET / 2.0) * new / old + SNAP_INSET / 2.0 }
+    };
+    let trail = |v: f32, old: f32, new: f32| {
+        if v >= old - SNAP_INSET - 0.5 { new - SNAP_INSET } else { (v + SNAP_INSET / 2.0) * new / old - SNAP_INSET / 2.0 }
+    };
+    let (x, y) = (lead(frame.x, ow, sw), lead(frame.y, oh, sh));
+    let (r, b) = (trail(frame.x + frame.w, ow, sw), trail(frame.y + frame.h, oh, sh));
+    Frame { x, y, w: (r - x).max(1.0), h: (b - y).max(1.0) }
+}
+
+/// Snap target for a dragged window with the pointer at stage-local (x, y). Past the stage counts as on the edge.
+fn snap_zone(x: f32, y: f32, sw: f32, sh: f32) -> Option<Snap> {
+    let left = x <= SNAP_EDGE;
+    let right = x >= sw - SNAP_EDGE;
+    let near_top = y <= SNAP_CORNER;
+    let near_bottom = y >= sh - SNAP_CORNER;
+    match (left, right) {
+        (true, _) if near_top => Some(Snap::TopLeft),
+        (true, _) if near_bottom => Some(Snap::BottomLeft),
+        (true, _) => Some(Snap::Left),
+        (_, true) if near_top => Some(Snap::TopRight),
+        (_, true) if near_bottom => Some(Snap::BottomRight),
+        (_, true) => Some(Snap::Right),
+        _ if y <= SNAP_EDGE => Some(Snap::Maximize),
+        _ => None,
+    }
+}
+
+/// Pulls the given edges of `frame` onto nearby stage insets or neighbouring windows' edges.
+/// Moving all four edges shifts the frame; moving some resizes it.
+fn magnet(frame: Frame, edges: Edges, others: &[Frame], sw: f32, sh: f32) -> Frame {
+    // Neighbours only attract along an axis where they sit beside the frame.
+    let beside_y = |o: &&Frame| o.y < frame.y + frame.h + MAGNET && frame.y < o.y + o.h + MAGNET;
+    let beside_x = |o: &&Frame| o.x < frame.x + frame.w + MAGNET && frame.x < o.x + o.w + MAGNET;
+    // Leading edges sit next to a neighbour's trailing edge, or line up with its leading edge, and vice versa.
+    let lead_x = [SNAP_INSET].into_iter().chain(others.iter().filter(beside_y).flat_map(|o| [o.x + o.w + SNAP_INSET, o.x]));
+    let trail_x = [sw - SNAP_INSET].into_iter().chain(others.iter().filter(beside_y).flat_map(|o| [o.x - SNAP_INSET, o.x + o.w]));
+    let lead_y = [SNAP_INSET].into_iter().chain(others.iter().filter(beside_x).flat_map(|o| [o.y + o.h + SNAP_INSET, o.y]));
+    let trail_y = [sh - SNAP_INSET].into_iter().chain(others.iter().filter(beside_x).flat_map(|o| [o.y - SNAP_INSET, o.y + o.h]));
+    let pull = |edge: f32, targets: &mut dyn Iterator<Item = f32>| {
+        targets.map(|t| t - edge).filter(|d| d.abs() <= MAGNET).min_by(|a, b| a.abs().total_cmp(&b.abs()))
+    };
+    let closest = |a: Option<f32>, b: Option<f32>| match (a, b) {
+        (Some(a), Some(b)) => Some(if a.abs() <= b.abs() { a } else { b }),
+        (a, b) => a.or(b),
+    };
+    let left = pull(frame.x, &mut lead_x.into_iter());
+    let right = pull(frame.x + frame.w, &mut trail_x.into_iter());
+    let top = pull(frame.y, &mut lead_y.into_iter());
+    let bottom = pull(frame.y + frame.h, &mut trail_y.into_iter());
+    let mut out = frame;
+    if edges.left && edges.right {
+        out.x += closest(left, right).unwrap_or(0.0);
+    } else if edges.left {
+        let d = left.unwrap_or(0.0);
+        out.x += d;
+        out.w -= d;
+    } else if edges.right {
+        out.w += right.unwrap_or(0.0);
+    }
+    if edges.top && edges.bottom {
+        out.y += closest(top, bottom).unwrap_or(0.0);
+    } else if edges.top {
+        let d = top.unwrap_or(0.0);
+        out.y += d;
+        out.h -= d;
+    } else if edges.bottom {
+        out.h += bottom.unwrap_or(0.0);
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1920,7 +2352,7 @@ enum GestureKind {
     Resize(Edges),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Edges {
     left: bool,
     right: bool,
@@ -2278,6 +2710,87 @@ mod tests {
         assert_eq!(grip_edges(2., 2., 400., 300.), Some(Edges::top_left()));
         assert_eq!(grip_edges(398., 2., 400., 300.), Some(Edges::top_right()));
         assert_eq!(grip_edges(80., 20., 400., 300.), None);
+    }
+
+    #[test]
+    fn pointer_at_edges_picks_snap() {
+        assert_eq!(snap_zone(500., 300., 1000., 700.), None);
+        assert_eq!(snap_zone(-20., 300., 1000., 700.), Some(Snap::Left));
+        assert_eq!(snap_zone(995., 300., 1000., 700.), Some(Snap::Right));
+        assert_eq!(snap_zone(500., 2., 1000., 700.), Some(Snap::Maximize));
+        assert_eq!(snap_zone(500., 698., 1000., 700.), None);
+        assert_eq!(snap_zone(2., 10., 1000., 700.), Some(Snap::TopLeft));
+        assert_eq!(snap_zone(999., 690., 1000., 700.), Some(Snap::BottomRight));
+    }
+
+    #[test]
+    fn snapped_halves_tile_the_stage() {
+        let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
+        assert_eq!((l.x, l.y, l.w, l.h), (8., 8., 488., 684.));
+        assert_eq!((r.x, r.w), (504., 488.));
+        assert_eq!(r.x + r.w, 1000. - 8.);
+        let q = Snap::BottomRight.frame(1000., 700.);
+        assert_eq!((q.x, q.y, q.w, q.h), (504., 354., 488., 338.));
+    }
+
+    #[test]
+    fn display_url_drops_scheme_and_bare_trailing_slash() {
+        assert_eq!(display_url("https://music.youtube.com/"), "music.youtube.com");
+        assert_eq!(display_url("https://www.youtube.com/watch?v=x"), "youtube.com/watch?v=x");
+        assert_eq!(display_url("http://example.com/a/"), "example.com/a/");
+    }
+
+    #[test]
+    fn shared_border_resizes_both_snapped_windows() {
+        let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
+        let mut dragged = l;
+        dragged.w += 100.;
+        let (frame, followers) = link_resize(l, dragged, Edges::right(), &[r]);
+        assert_eq!(frame.w, 588.);
+        let f = followers[0].unwrap();
+        assert_eq!((f.x, f.w, f.x + f.w), (604., 388., 992.));
+        // The neighbour never shrinks below the minimum width.
+        dragged.w = 900.;
+        let (frame, followers) = link_resize(l, dragged, Edges::right(), &[r]);
+        assert_eq!(followers[0].unwrap().w, MIN_W);
+        assert_eq!(frame.x + frame.w + SNAP_INSET, followers[0].unwrap().x);
+        // A quarter below shares the bottom border only; the far border of a half is not shared.
+        let (tl, bl) = (Snap::TopLeft.frame(1000., 700.), Snap::BottomLeft.frame(1000., 700.));
+        let (_, followers) = link_resize(tl, Frame { h: tl.h + 50., ..tl }, Edges::bottom(), &[bl, r]);
+        assert_eq!(followers[0].map(|f| (f.y, f.h)), Some((bl.y + 50., bl.h - 50.)));
+        assert!(followers[1].is_none());
+    }
+
+    #[test]
+    fn stage_resize_keeps_snapped_splits() {
+        for snap in [Snap::Left, Snap::Right, Snap::TopRight, Snap::BottomLeft] {
+            let f = rescale_snapped(snap.frame(1000., 700.), 1000., 700., 1400., 900.);
+            let want = snap.frame(1400., 900.);
+            assert!((f.x - want.x).abs() < 0.01 && (f.w - want.w).abs() < 0.01 && (f.y - want.y).abs() < 0.01 && (f.h - want.h).abs() < 0.01, "{snap:?}");
+        }
+        // A dragged split at 60% stays at 60%, one inset gap apart.
+        let l = Frame { x: 8., y: 8., w: 592., h: 684. };
+        let r = Frame { x: 608., y: 8., w: 384., h: 684. };
+        let (l, r) = (rescale_snapped(l, 1000., 700., 2000., 700.), rescale_snapped(r, 1000., 700., 2000., 700.));
+        assert_eq!((l.x + l.w, r.x, r.x + r.w), (1204., 1212., 1992.));
+    }
+
+    #[test]
+    fn edges_stick_to_stage_and_neighbours() {
+        let all = Edges { left: true, right: true, top: true, bottom: true };
+        // Near the left inset: pulled onto it, size kept.
+        let f = magnet(Frame { x: 15., y: 200., w: 300., h: 200. }, all, &[], 1000., 700.);
+        assert_eq!((f.x, f.y, f.w, f.h), (8., 200., 300., 200.));
+        // Next to a neighbour: sits one inset away from its right edge.
+        let other = Frame { x: 100., y: 100., w: 300., h: 300. };
+        let f = magnet(Frame { x: 412., y: 150., w: 200., h: 200. }, all, &[other], 1000., 700.);
+        assert_eq!(f.x, 408.);
+        // A neighbour far below does not attract sideways.
+        let low = Frame { x: 100., y: 600., w: 300., h: 50. };
+        assert_eq!(magnet(Frame { x: 412., y: 100., w: 200., h: 200. }, all, &[low], 1000., 700.).x, 412.);
+        // Resizing the right edge only moves that edge.
+        let f = magnet(Frame { x: 300., y: 200., w: 685., h: 200. }, Edges::right(), &[], 1000., 700.);
+        assert_eq!((f.x, f.w), (300., 692.));
     }
 
     #[test]

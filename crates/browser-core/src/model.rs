@@ -37,6 +37,8 @@ pub struct Tab {
     pub active: bool,
     pub position: i32,
     pub state: TabState,
+    /// Window frame/snap/z-order saved by the UI as JSON; empty means default placement.
+    pub layout: String,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +346,14 @@ impl Model {
         Ok(data_store_id)
     }
 
+    pub fn set_tab_layout(&mut self, id: &str, layout: &str) -> anyhow::Result<()> {
+        self.storage.execute("UPDATE tabs SET layout = ?1 WHERE id = ?2", params![layout, id])?;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.layout = layout.to_string();
+        }
+        Ok(())
+    }
+
     pub fn switch_profile(&mut self, id: &str) -> anyhow::Result<()> {
         let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
             return Ok(());
@@ -469,6 +479,8 @@ impl Model {
     }
 
     pub fn note_navigation(&mut self, tab_id: &str, url: &str, title: &str) -> anyhow::Result<()> {
+        // Title updates and in-page URL events re-report the current URL; they refresh the entry instead of adding one.
+        let same_url = self.tabs.iter().any(|tab| tab.id == tab_id && tab.url == url);
         self.storage.execute(
             "UPDATE tabs SET url = ?1, title = ?2 WHERE id = ?3",
             params![url, title, tab_id],
@@ -480,7 +492,12 @@ impl Model {
                 .find(|session| session.id == tab.session_id)
                 .map(|session| session.profile_id.clone());
             if let Some(profile_id) = profile_id {
-                if self.settings.save_history && (url.starts_with("http://") || url.starts_with("https://")) {
+                if same_url {
+                    self.storage.execute(
+                        "UPDATE history SET title = ?1 WHERE id = (SELECT MAX(id) FROM history WHERE profile_id = ?2 AND url = ?3)",
+                        params![title, profile_id, url],
+                    )?;
+                } else if self.settings.save_history && (url.starts_with("http://") || url.starts_with("https://")) {
                     self.storage.execute(
                         "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, ?3, ?4)",
                         params![profile_id, url, title, now_secs()],
@@ -517,6 +534,16 @@ impl Model {
             })
             .collect::<Vec<_>>();
         suspend_candidates(&live, now, self.settings.suspend_after_secs, self.settings.max_live_tabs)
+    }
+
+    /// Restarts a background tab's suspension timer, for tabs still showing on screen.
+    pub fn keep_alive(&mut self, tab_id: &str) {
+        let now = now_secs();
+        for (id, since) in &mut self.background_since {
+            if id == tab_id {
+                *since = now;
+            }
+        }
     }
 
     pub fn mark_suspended(&mut self, tab_id: &str) -> anyhow::Result<()> {
@@ -1111,7 +1138,7 @@ fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
 
 fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
     let mut stmt = storage.conn().prepare(
-        "SELECT id, session_id, url, title, active, position, state FROM tabs ORDER BY position",
+        "SELECT id, session_id, url, title, active, position, state, layout FROM tabs ORDER BY position",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Tab {
@@ -1122,6 +1149,7 @@ fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
             active: row.get::<_, i32>(4)? != 0,
             position: row.get(5)?,
             state: TabState::parse(&row.get::<_, String>(6)?),
+            layout: row.get(7)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

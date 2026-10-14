@@ -21,6 +21,17 @@ cargo run -p nxbrowser -- --self-test
 
 Requires macOS 14 or newer (persistent `WKWebsiteDataStore` identifiers) and the Xcode Metal toolchain, which GPUI uses to compile shaders. The window chrome uses [gpuikit](https://crates.io/crates/gpuikit). `rust-toolchain.toml` selects Rust 1.98.1, which that GPUI build needs.
 
+## Bundle
+
+```bash
+scripts/bundle-macos.sh
+open target/NxBrowser.app
+```
+
+This builds an ad-hoc signed `NxBrowser.app` with the bundle ID `dev.nxbrowser.app`. Inside the bundle, macOS can offer its own Password AutoFill from the Passwords app on login forms. This is best effort, and some sites don't get it.
+
+Passkeys do not work. WebAuthn in WKWebView needs Apple's `com.apple.developer.web-browser.public-key-credential` entitlement, and Apple only grants it to paid developer accounts.
+
 ## Shortcuts
 
 | Shortcut | Action |
