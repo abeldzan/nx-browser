@@ -4,7 +4,6 @@ pub enum SidebarPage {
     History,
     Bookmarks,
     Extensions,
-    Downloads,
 }
 
 impl SidebarPage {
@@ -14,12 +13,11 @@ impl SidebarPage {
             Self::History => "History",
             Self::Bookmarks => "Bookmarks",
             Self::Extensions => "Extensions",
-            Self::Downloads => "Downloads",
         }
     }
 
-    pub fn all() -> [Self; 5] {
-        [Self::Profiles, Self::History, Self::Bookmarks, Self::Extensions, Self::Downloads]
+    pub fn all() -> [Self; 4] {
+        [Self::Profiles, Self::History, Self::Bookmarks, Self::Extensions]
     }
 
     pub fn from_id(id: &str) -> Self {
@@ -27,7 +25,6 @@ impl SidebarPage {
             "history" => Self::History,
             "bookmarks" => Self::Bookmarks,
             "extensions" => Self::Extensions,
-            "downloads" => Self::Downloads,
             _ => Self::Profiles,
         }
     }

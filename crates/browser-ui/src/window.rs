@@ -1,27 +1,29 @@
 use crate::profiles::profile_label;
+use crate::settings::SettingsSection;
 use crate::sidebar::SidebarPage;
+use crate::tabs::tab_label;
 use crate::SharedModel;
 use browser_core::{
-    app_support_dir, downloads_dir, normalize_url, snapshot, spawn_download, DownloadUpdate, Effect,
+    app_support_dir, downloads_dir, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
     ExtensionRecord, Model,
 };
-use browser_engine::{EngineEvent, LogicalRect, ScriptInjection, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, Shortcut, WebEngine};
 use browser_engine_macos::{choose_open_path, choose_save_path, MacEngine};
 use browser_extensions::{load_extension_dirs, BackgroundRuntime, HostFn};
 use browser_storage::Storage;
 use gpui::{
-    canvas, div, prelude::*, px, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
+    canvas, div, img, prelude::*, px, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
     Subscription, Window,
 };
-use gpuikit::elements::button::button;
+use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
 use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
 use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::theme::{ActiveTheme, Themeable};
+use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
 use gpuikit::traits::control_sized::ControlSized;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
@@ -32,11 +34,31 @@ use uuid::Uuid;
 
 pub struct BrowserWindow {
     pub(crate) model: SharedModel,
-    engine: MacEngine,
+    pub(crate) engine: MacEngine,
     runtime: BackgroundRuntime,
     address: Entity<InputState>,
     find_input: Entity<InputState>,
     rename_input: Entity<InputState>,
+    pub(crate) home_input: Entity<InputState>,
+    pub(crate) ua_input: Entity<InputState>,
+    pub(crate) name_input: Entity<InputState>,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_section: SettingsSection,
+    /// Confirmation shown in the settings footer after an action.
+    pub(crate) settings_note: Option<SharedString>,
+    pub(crate) settings_profile: Option<String>,
+    pub(crate) delete_prompt: Option<String>,
+    /// Bounds of open modal cards this frame; web pages are cut out beneath them.
+    /// Open overlays this frame (bounds, corner radius); web pages are cut out beneath them.
+    pub(crate) overlay_rects: Vec<(LogicalRect, f64)>,
+    /// Right-click menu on a rail profile: (profile id, index, click position).
+    pub(crate) downloads_open: bool,
+    /// Icon and color picked in the new-profile modal while it is open.
+    pub(crate) new_profile: Option<(String, String)>,
+    pub(crate) new_profile_input: Entity<InputState>,
+    /// Live (received, total) bytes per download id, fed by the download threads.
+    pub(crate) download_progress: HashMap<String, (u64, Option<u64>)>,
+    pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
     find_open: bool,
@@ -48,7 +70,7 @@ pub struct BrowserWindow {
     layout_stage: Option<(i32, i32)>,
     order: Vec<String>,
     subscriptions: Vec<Subscription>,
-    status: SharedString,
+    pub(crate) status: SharedString,
     renaming: bool,
     confirm_delete: bool,
     permission: Option<(String, String)>,
@@ -76,6 +98,13 @@ impl BrowserWindow {
         let storage = Storage::open(&app_support_dir().join("nxbrowser.sqlite"))
             .expect("open browser database");
         let mut model = Model::open(storage).expect("open browser model");
+        if !model.settings.restore_session {
+            // Start fresh: closing the last tab leaves one home tab, then open the new tab page in it.
+            for id in model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>() {
+                let _ = model.close_tab(&id);
+            }
+            let _ = model.navigate_active(&model.settings.new_tab_url());
+        }
         model.request_show_active();
         let model = Arc::new(Mutex::new(model));
         let runtime = BackgroundRuntime::new(host(Arc::clone(&model)));
@@ -83,6 +112,10 @@ impl BrowserWindow {
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let rename_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -117,6 +150,33 @@ impl BrowserWindow {
                     this.renaming = false;
                 }
             }),
+            cx.subscribe(&home_input, |this, input, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit | InputStateEvent::Blur => {
+                    let value = input.read(cx).content().trim().to_string();
+                    this.set_pref(cx, |s| s.home_page = value);
+                }
+                _ => {}
+            }),
+            cx.subscribe(&ua_input, |this, input, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit | InputStateEvent::Blur => {
+                    let value = input.read(cx).content().trim().to_string();
+                    this.set_pref(cx, |s| s.user_agent = value);
+                }
+                _ => {}
+            }),
+            cx.subscribe(&new_profile_input, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit => this.create_new_profile(cx),
+                // Keeps the badge preview in step with the typed name.
+                _ => cx.notify(),
+            }),
+            cx.subscribe(&name_input, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit => this.save_profile_name(cx),
+                _ => {}
+            }),
         ];
         let mut view = Self {
             model,
@@ -125,6 +185,20 @@ impl BrowserWindow {
             address,
             find_input,
             rename_input,
+            home_input,
+            ua_input,
+            name_input,
+            settings_open: false,
+            settings_section: SettingsSection::Profiles,
+            settings_note: None,
+            settings_profile: None,
+            delete_prompt: None,
+            overlay_rects: Vec::new(),
+            rail_menu: None,
+            downloads_open: false,
+            new_profile: None,
+            new_profile_input,
+            download_progress: HashMap::new(),
             address_focused: false,
             focus_address: false,
             find_open: false,
@@ -156,6 +230,7 @@ impl BrowserWindow {
                 started: Instant::now(),
             }),
         };
+        view.apply_settings();
         view.reload_extensions();
         view.sync_permissions();
         let url = view
@@ -164,7 +239,7 @@ impl BrowserWindow {
             .ok()
             .and_then(|model| model.active_tab().map(|tab| tab.url.clone()))
             .unwrap_or_else(|| "nxbrowser://home".into());
-        view.address.update(cx, |input, cx| input.set_content_silent(url, cx));
+        view.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
@@ -206,8 +281,11 @@ impl BrowserWindow {
         let effects = self.model.lock().expect("model").take_effects();
         self.apply(effects);
         while let Ok(update) = self.downloads_rx.try_recv() {
-            let _ = self.model.lock().expect("model").update_download(&update.id, &update.status, &update.path);
-            self.status = format!("Download {}", update.status).into();
+            self.download_progress.insert(update.id.clone(), (update.received, update.total));
+            if update.status != "running" {
+                let _ = self.model.lock().expect("model").update_download(&update.id, &update.status, &update.path);
+                self.status = format!("Download {}", update.status).into();
+            }
         }
         let mut events = Vec::new();
         while let Ok(event) = self.engine.events().try_recv() {
@@ -235,10 +313,14 @@ impl BrowserWindow {
                 }
                 let active = self.model.lock().expect("model").active_tab().map(|tab| tab.id.clone());
                 if active.as_deref() == Some(tab_id.as_str()) && !self.address_focused && !url.is_empty() {
-                    self.address.update(cx, |input, cx| input.set_content_silent(url, cx));
+                    self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
                 }
                 if !loading {
                     self.status = if title.is_empty() { "Loaded".into() } else { title.into() };
+                    let (_, host) = site_glyph(&url);
+                    if self.self_test.is_none() && is_web(&url) && !favicon_path(&host).exists() {
+                        self.engine.eval(&tab_id, "favicon", FAVICON_JS);
+                    }
                 }
             }
             EngineEvent::Failed { message, .. } => self.status = message.into(),
@@ -254,6 +336,14 @@ impl BrowserWindow {
                 });
             }
             EngineEvent::Alert { message } => self.status = message.into(),
+            EngineEvent::Eval { token, value, .. } if token == "favicon" => {
+                // shortcut: icons are cached per host forever; refetch on age if sites change icons.
+                if let Some((page, icon)) = value.split_once('\n') {
+                    if is_web(page) && is_web(icon) {
+                        spawn_favicon(icon.to_string(), favicon_path(&site_glyph(page).1));
+                    }
+                }
+            }
             EngineEvent::Eval { token, value, .. } => {
                 if let Some(test) = &mut self.self_test {
                     match token.as_str() {
@@ -270,7 +360,7 @@ impl BrowserWindow {
 
     fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
         match shortcut {
-            Shortcut::NewTab => self.with_model(|model| { let _ = model.create_tab("nxbrowser://home"); }),
+            Shortcut::NewTab => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
             Shortcut::CloseTab => {
                 let id = self.model.lock().expect("model").active_tab().map(|tab| tab.id.clone());
                 if let Some(id) = id {
@@ -286,6 +376,7 @@ impl BrowserWindow {
             Shortcut::Forward => self.forward(),
             Shortcut::Find => self.find_open = true,
             Shortcut::Bookmark => self.bookmark(),
+            Shortcut::Settings => self.toggle_settings(cx),
         }
         self.refresh_url(cx);
     }
@@ -309,7 +400,7 @@ impl BrowserWindow {
         }
     }
 
-    fn with_model<T>(&mut self, f: impl FnOnce(&mut Model) -> T) -> T {
+    pub(crate) fn with_model<T>(&mut self, f: impl FnOnce(&mut Model) -> T) -> T {
         let (value, effects) = {
             let mut model = self.model.lock().expect("model");
             let value = f(&mut model);
@@ -423,23 +514,52 @@ impl BrowserWindow {
         }
     }
 
-    fn sync_permissions(&mut self) {
+    pub(crate) fn apply_settings(&mut self) {
+        let settings = self.model.lock().expect("model").settings.clone();
+        self.engine.set_settings(EngineSettings {
+            javascript: settings.javascript,
+            block_popups: settings.block_popups,
+            fraud_warnings: settings.fraud_warnings,
+            https_only: settings.https_only,
+            inspectable: settings.inspector,
+            user_agent: settings.user_agent,
+            page_zoom: settings.page_zoom,
+        });
+    }
+
+    fn apply_theme(&self, window: &Window, cx: &mut Context<Self>) {
+        let theme = self.model.lock().expect("model").settings.theme.clone();
+        let dark = match theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => matches!(window.appearance(), gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark),
+        };
+        if (cx.theme().variant == ThemeVariant::Dark) != dark {
+            let next = if dark { Theme::default() } else { Theme::gruvbox_light() };
+            cx.set_global(GlobalTheme(Arc::new(next)));
+        }
+    }
+
+    pub(crate) fn sync_permissions(&mut self) {
         if let Ok(entries) = self.model.lock().expect("model").permissions_map() {
             self.engine.set_permissions(entries);
         }
     }
 
-    fn refresh_url(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_url(&mut self, cx: &mut Context<Self>) {
         if self.address_focused {
             return;
         }
         if let Some(url) = self.model.lock().ok().and_then(|model| model.active_tab().map(|tab| tab.url.clone())) {
-            self.address.update(cx, |input, cx| input.set_content_silent(url, cx));
+            self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         }
     }
 
     fn commit_navigation(&mut self, raw: &str, cx: &mut Context<Self>) {
-        let url = normalize_url(raw);
+        let url = {
+            let model = self.model.lock().expect("model");
+            normalize_url(raw, model.settings.search_template(), model.settings.https_only)
+        };
         self.address_focused = false;
         self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         self.with_model(|model| {
@@ -478,13 +598,28 @@ impl BrowserWindow {
     fn start_download(&mut self, url: &str) {
         let id = Uuid::new_v4().to_string();
         let name = url.split('/').next_back().filter(|part| !part.is_empty()).unwrap_or("download");
-        let path = downloads_dir().join(name);
+        let (dir, ask) = {
+            let settings = &self.model.lock().expect("model").settings;
+            (settings.download_dir.clone(), settings.ask_download_path)
+        };
+        let path = if ask {
+            let Some(path) = choose_save_path(name) else {
+                return;
+            };
+            path
+        } else if dir.is_empty() {
+            downloads_dir().join(name)
+        } else {
+            std::path::PathBuf::from(dir).join(name)
+        };
         let _ = self.model.lock().expect("model").add_download(&id, url, &path.display().to_string());
+        self.download_progress.insert(id.clone(), (0, None));
         spawn_download(id, url.to_string(), path, self.downloads_tx.clone());
         self.status = "Download started".into();
+        self.downloads_open = true;
     }
 
-    fn export_profile(&mut self) {
+    pub(crate) fn export_profile(&mut self) {
         let bundle = self.model.lock().expect("model").export_active();
         let Ok(bundle) = bundle else {
             self.status = "Export failed".into();
@@ -499,7 +634,7 @@ impl BrowserWindow {
         }
     }
 
-    fn import_profile(&mut self) {
+    pub(crate) fn import_profile(&mut self) {
         let Some(path) = choose_open_path() else {
             return;
         };
@@ -668,18 +803,18 @@ impl BrowserWindow {
 }
 
 #[derive(Clone, Copy)]
-struct Paint {
-    bg: gpui::Hsla,
-    fg: gpui::Hsla,
-    muted: gpui::Hsla,
-    surface: gpui::Hsla,
-    secondary: gpui::Hsla,
-    border: gpui::Hsla,
-    accent: gpui::Hsla,
-    accent_bg: gpui::Hsla,
+pub(crate) struct Paint {
+    pub(crate) bg: gpui::Hsla,
+    pub(crate) fg: gpui::Hsla,
+    pub(crate) muted: gpui::Hsla,
+    pub(crate) surface: gpui::Hsla,
+    pub(crate) secondary: gpui::Hsla,
+    pub(crate) border: gpui::Hsla,
+    pub(crate) accent: gpui::Hsla,
+    pub(crate) accent_bg: gpui::Hsla,
 }
 
-fn paint(cx: &gpui::App) -> Paint {
+pub(crate) fn paint(cx: &gpui::App) -> Paint {
     let theme = cx.theme();
     Paint {
         bg: theme.bg(),
@@ -702,6 +837,8 @@ impl Focusable for BrowserWindow {
 impl Render for BrowserWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach(window);
+        self.overlay_rects.clear();
+        self.apply_theme(window, cx);
         self.request_address_focus(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
@@ -711,7 +848,6 @@ impl Render for BrowserWindow {
         let sessions = self.model.lock().expect("model").profile_sessions().into_iter().cloned().collect::<Vec<_>>();
         let history = self.model.lock().expect("model").history().unwrap_or_default();
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
-        let downloads = self.model.lock().expect("model").downloads().unwrap_or_default();
         let extensions = self.model.lock().expect("model").extensions.clone();
         let colors = paint(cx);
         let live_ids = tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
@@ -728,13 +864,20 @@ impl Render for BrowserWindow {
                 }
             }
         }
-        h_stack()
+        v_stack()
+            .relative()
             .size_full()
             .bg(colors.bg)
             .text_color(colors.fg)
             .text_size(px(13.))
-            .child(self.rail(&profiles, &active_profile, cx))
+            .child(self.titlebar(&tabs, cx))
             .child(
+                h_stack()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .child(self.rail(&profiles, &active_profile, cx))
+                    .child(
                 v_stack()
                     .relative()
                     .flex_1()
@@ -749,13 +892,17 @@ impl Render for BrowserWindow {
                             &sessions,
                             &history,
                             &bookmarks,
-                            &downloads,
                             &extensions,
                             cx,
                         ))
-                    })
-                    .child(self.dock(&tabs, cx).absolute().bottom(px(0.)).left(px(0.)).right(px(0.))),
+                    }),
+            ),
             )
+            .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
+            .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
+            .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
+            .when(self.downloads_open, |root| root.child(self.downloads_popover(cx)))
+            .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
 }
 
@@ -773,28 +920,35 @@ impl BrowserWindow {
     ) -> gpui::Div {
         let paint = paint(cx);
         let mut profile_list = v_stack().w_full().items_center().gap(px(6.)).py(px(4.));
-        for profile in profiles {
+        for (index, profile) in profiles.iter().enumerate() {
             let id = profile.id.clone();
             let active = profile.id == active_profile;
-            let initial = rail_mark(&profile.name);
-            profile_list = profile_list.child(
-                div()
-                    .id(SharedString::from(format!("rail-{id}")))
-                    .size(px(32.))
-                    .rounded(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .bg(if active { paint.accent } else { paint.secondary })
-                    .text_color(if active { paint.bg } else { paint.fg })
-                    .child(initial)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let dragged = RailDrag(profile.clone());
+            let badge = profile_badge(profile, active, 32., paint)
+                .id(SharedString::from(format!("rail-{id}")))
+                .cursor_pointer()
+                .on_click(cx.listener({
+                    let id = id.clone();
+                    move |this, _: &ClickEvent, _, cx| {
                         this.with_model(|model| { let _ = model.switch_profile(&id); });
                         this.refresh_url(cx);
                         this.confirm_delete = false;
-                    })),
+                    }
+                }))
+                .on_drag(dragged, move |drag, _, _, cx| cx.new(|_| RailDragPreview(drag.0.clone(), paint)))
+                .drag_over::<RailDrag>(move |style, _, _, _| style.border_color(paint.accent))
+                .on_drop(cx.listener(move |this, drag: &RailDrag, _, cx| {
+                    this.with_model(|model| { let _ = model.move_profile(&drag.0.id, index); });
+                    cx.notify();
+                }));
+            let badge = badge.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.rail_menu = Some((id.clone(), index, event.position));
+                    cx.notify();
+                }),
             );
+            profile_list = profile_list.child(badge);
         }
         v_stack()
             .w(px(56.))
@@ -811,36 +965,19 @@ impl BrowserWindow {
                 ),
             )
             .child(icon_button("new-profile-rail", Icons::plus()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                let count = this.model.lock().map(|model| model.profiles.len()).unwrap_or(1) + 1;
-                this.with_model(|model| { let _ = model.create_profile(&format!("Profile {count}")); });
-                this.refresh_url(cx);
+                this.open_new_profile(cx);
             })))
-            .child(icon_button("download-page", Icons::download()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                let url = this.address.read(cx).content().to_string();
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    this.start_download(&url);
-                    this.panel = Some(SidebarPage::Downloads);
-                } else {
-                    this.status = "Only http and https links can be downloaded".into();
-                }
+            .child(icon_button("downloads-list", Icons::download()).small().selected(self.downloads_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                // Opens only: a click outside the popover (this one included) already closes it.
+                this.downloads_open = true;
                 cx.notify();
             })))
-            .child(self.rail_icon("downloads-list", Icons::archive(), SidebarPage::Downloads, cx))
+            .child(icon_button("open-settings", Icons::gear()).small().selected(self.settings_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.toggle_settings(cx);
+            })))
             .child(icon_button("more-actions", Icons::dots_vertical()).small().selected(self.panel == Some(SidebarPage::Profiles)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.toggle_panel(SidebarPage::Profiles, cx);
             })))
-    }
-
-    fn rail_icon(
-        &self,
-        id: &'static str,
-        icon: gpui::Svg,
-        page: SidebarPage,
-        cx: &mut Context<Self>,
-    ) -> gpuikit::elements::icon_button::IconButton {
-        icon_button(id, icon).small().selected(self.panel == Some(page)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.toggle_panel(page, cx);
-        }))
     }
 
     fn prepare_frames(&mut self, tabs: &[browser_core::Tab]) {
@@ -892,8 +1029,6 @@ impl BrowserWindow {
     }
 
     fn note_stage(&mut self, bounds: gpui::Bounds<Pixels>, cx: &mut Context<Self>) -> bool {
-        let mut bounds = bounds;
-        bounds.size.height = px((f64::from(bounds.size.height) - DOCK_H).max(1.0) as f32);
         let changed = self.stage_bounds.map(|old| (f64::from(old.size.width) - f64::from(bounds.size.width)).abs() > 1.0 || (f64::from(old.size.height) - f64::from(bounds.size.height)).abs() > 1.0).unwrap_or(true);
         self.stage_bounds = Some(bounds);
         if changed {
@@ -976,6 +1111,8 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
+        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some();
+        self.engine.set_modal(modal);
         let Some(stage) = self.stage_bounds else {
             return;
         };
@@ -1021,13 +1158,25 @@ impl BrowserWindow {
         let ids = stack.iter().map(|(id, _, _)| id.clone()).collect::<Vec<_>>();
         self.engine.stack_tabs(&ids);
         let stage = LogicalRect { x: origin_x, y: origin_y, width: stage_w, height: stage_h };
-        self.engine.set_page_holes(&visible_pages(&stack, &stage));
+        let (mut holes, mut notches) = visible_pages(&stack, &stage);
+        // Pages show through holes in the chrome, so cut modal cards and menus out of them.
+        for (rect, radius) in &self.overlay_rects {
+            cut_overlay(&mut holes, &mut notches, rect, *radius);
+        }
+        self.engine.set_page_holes(&holes, &notches);
     }
 
     fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         if self.suppress_window_drag {
             self.suppress_window_drag = false;
             return;
+        }
+        // The title bar covers the top edge, so a press there has to resize instead of drag.
+        if let Some(edges) = self.edges_under_pointer(id, position) {
+            if edges.top {
+                self.begin_resize(id, edges, position, cx);
+                return;
+            }
         }
         self.focus_window(id, cx);
         let Some(start) = self.visual_frame(id) else {
@@ -1108,6 +1257,14 @@ impl BrowserWindow {
         stage
     }
 
+    fn edges_under_pointer(&self, id: &str, position: gpui::Point<Pixels>) -> Option<Edges> {
+        let frame = self.visual_frame(id)?;
+        let stage = self.stage_bounds?;
+        let x = (f64::from(position.x) - f64::from(stage.origin.x)) as f32 - frame.x;
+        let y = (f64::from(position.y) - f64::from(stage.origin.y)) as f32 - frame.y;
+        grip_edges(x, y, frame.w, frame.h)
+    }
+
     fn visual_frame(&self, id: &str) -> Option<Frame> {
         let entry = self.chrome.get(id)?;
         if entry.maximized {
@@ -1162,7 +1319,7 @@ impl BrowserWindow {
         let mut body = div().relative().size_full().child(
             v_stack()
                 .size_full()
-                .rounded(px(10.))
+                .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
                 .border_color(if active { paint.accent } else { paint.border })
                 .shadow_md()
@@ -1199,13 +1356,15 @@ impl BrowserWindow {
         let mut grip = div()
             .id(SharedString::from(name))
             .absolute()
+            .occlude()
             .cursor(resize_cursor(edges))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
                 this.begin_resize(&id, edges, event.position, cx);
             }));
         let corner = (edges.left || edges.right) && (edges.top || edges.bottom);
-        let band = px(6.);
-        let corner_size = px(12.);
+        let band = px(GRIP);
+        let corner_size = px(GRIP_CORNER);
         if corner {
             grip = grip.size(corner_size);
             grip = if edges.left { grip.left(px(0.)) } else { grip.right(px(0.)) };
@@ -1374,41 +1533,40 @@ impl BrowserWindow {
         button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| action(this, cx)))
     }
 
-    fn dock(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
+    fn titlebar(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        let mut icons = h_stack().items_center().gap(px(6.));
+        let mut strip = h_stack().min_w(px(0.)).flex_shrink(1.).overflow_hidden().items_center().gap(px(4.));
         for tab in tabs {
-            icons = icons.child(self.dock_icon(tab, cx));
+            strip = strip.child(self.title_tab(tab, cx));
         }
-        icons = icons
-            .child(div().w(px(1.)).h(px(16.)).bg(paint.border))
-            .child(self.tool_button("new-tab".to_string(), Icons::plus(), false, cx, |this, cx| {
-                this.with_model(|model| { let _ = model.create_tab("nxbrowser://home"); });
-                this.refresh_url(cx);
-            }));
         h_stack()
-            .h(px(46.))
+            .h(px(TITLEBAR_H))
             .w_full()
-            .px(px(10.))
+            .flex_none()
             .items_center()
-            .child(div().w(px(112.)))
-            .child(div().flex_1().flex().justify_center().child(
-                h_stack()
-                    .items_center()
-                    .px(px(6.))
-                    .py(px(4.))
-                    .gap(px(6.))
-                    .rounded(px(12.))
-                    .bg(paint.surface)
-                    .border_1()
-                    .border_color(paint.border)
-                    .shadow_sm()
-                    .child(icons),
-            ))
+            .gap(px(4.))
+            .pl(px(80.))
+            .pr(px(8.))
+            .bg(paint.surface)
+            .border_b_1()
+            .border_color(paint.border)
+            .child(strip)
+            .child(self.tool_button("new-tab".to_string(), Icons::plus(), false, cx, |this, cx| {
+                this.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); });
+                this.refresh_url(cx);
+            }))
+            .child(
+                div().flex_1().h_full().on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
+                    if event.click_count == 2 {
+                        window.titlebar_double_click();
+                    } else {
+                        window.start_window_move();
+                    }
+                }),
+            )
             .child(
                 h_stack()
-                    .w(px(112.))
-                    .justify_end()
+                    .flex_none()
                     .items_center()
                     .gap(px(2.))
                     .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
@@ -1418,39 +1576,35 @@ impl BrowserWindow {
             )
     }
 
-    fn dock_icon(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
+    fn title_tab(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let id = tab.id.clone();
-        let (glyph, host) = site_glyph(&tab.url);
-        let color = site_color(&host);
-        let side = if tab.active { px(28.) } else { px(24.) };
-        v_stack()
+        let close_id = tab.id.clone();
+        let minimized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.minimized);
+        h_stack()
+            .id(SharedString::from(format!("tab-{id}")))
+            .h(px(28.))
+            .min_w(px(36.))
+            .max_w(px(200.))
+            .flex_shrink(1.)
+            .pl(px(8.))
+            .pr(px(2.))
+            .gap(px(6.))
             .items_center()
-            .gap(px(2.))
-            .child(
-                div()
-                    .id(SharedString::from(format!("dock-{id}")))
-                    .size(side)
-                    .rounded(px(7.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .bg(color)
-                    .text_color(gpui::rgb(0xFFFFFF))
-                    .text_size(px(12.))
-                    .child(glyph)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.chrome.entry(id.clone()).or_default().minimized = false;
-                        this.focus_window(&id, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .size(px(3.))
-                    .rounded(px(2.))
-                    .bg(if tab.active { paint.fg } else { gpui::hsla(0., 0., 0., 0.) }),
-            )
+            .rounded(px(7.))
+            .cursor_pointer()
+            .when(tab.active, |tab| tab.bg(paint.secondary))
+            .when(minimized, |tab| tab.opacity(0.55))
+            .child(favicon(tab))
+            .child(div().flex_1().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url)))
+            .child(self.tool_button(format!("tab-close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
+                this.with_model(|model| { let _ = model.close_tab(&close_id); });
+                this.refresh_url(cx);
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.chrome.entry(id.clone()).or_default().minimized = false;
+                this.focus_window(&id, cx);
+            }))
     }
 
     fn panel_icon(
@@ -1482,7 +1636,6 @@ impl BrowserWindow {
         sessions: &[browser_core::Session],
         history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
-        downloads: &[browser_core::DownloadRecord],
         extensions: &[browser_core::ExtensionRecord],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1507,7 +1660,6 @@ impl BrowserWindow {
                         sessions,
                         history,
                         bookmarks,
-                        downloads,
                         extensions,
                         cx,
                     )),
@@ -1531,16 +1683,16 @@ impl BrowserWindow {
                         .full_width(true),
                 ),
             )
-            .child(button("find-next", "Next").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            .child(action_button("find-next", "Next", Kind::Secondary, true, cx, |this, cx| {
                 let query = this.find_input.read(cx).content().to_string();
                 if let Some(id) = this.active_tab_id() {
                     this.engine.find(&id, &query);
                 }
-            })))
-            .child(button("find-close", "Close").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            }))
+            .child(action_button("find-close", "Close", Kind::Secondary, true, cx, |this, cx| {
                 this.find_open = false;
                 cx.notify();
-            })))
+            }))
     }
 
     fn library_page(
@@ -1551,7 +1703,6 @@ impl BrowserWindow {
         sessions: &[browser_core::Session],
         history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
-        downloads: &[browser_core::DownloadRecord],
         extensions: &[browser_core::ExtensionRecord],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -1560,7 +1711,6 @@ impl BrowserWindow {
             SidebarPage::History => self.link_list("No history yet", history.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
             SidebarPage::Bookmarks => self.link_list("No bookmarks yet", bookmarks.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
             SidebarPage::Extensions => self.extension_page(extensions, cx),
-            SidebarPage::Downloads => self.download_page(downloads, cx),
         }
     }
 
@@ -1596,12 +1746,10 @@ impl BrowserWindow {
             );
         }
         column = column
-            .child(button("new-profile", "New profile").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                let count = this.model.lock().map(|model| model.profiles.len()).unwrap_or(1) + 1;
-                this.with_model(|model| { let _ = model.create_profile(&format!("Profile {count}")); });
-                this.refresh_url(cx);
-            })))
-            .child(button("rename-profile", if self.renaming { "Save name" } else { "Rename" }).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            .child(action_button("new-profile", "New profile…", Kind::Secondary, true, cx, |this, cx| {
+                this.open_new_profile(cx);
+            }))
+            .child(action_button("rename-profile", if self.renaming { "Save name" } else { "Rename" }, Kind::Secondary, true, cx, |this, cx| {
                 if this.renaming {
                     let name = this.rename_input.read(cx).content().to_string();
                     let id = this.model.lock().expect("model").active_profile_id.clone();
@@ -1613,7 +1761,7 @@ impl BrowserWindow {
                     this.renaming = true;
                 }
                 cx.notify();
-            })));
+            }));
         if self.renaming {
             column = column.child(
                 text_field(&self.rename_input, cx)
@@ -1621,47 +1769,31 @@ impl BrowserWindow {
                     .full_width(true),
             );
         }
-        let delete_label = if self.confirm_delete { "Confirm delete" } else { "Delete profile" };
-        let mut delete = button("delete-profile", delete_label).small();
-        if self.confirm_delete {
-            delete = delete.destructive();
-        }
-        column = column.child(delete.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-            if !this.confirm_delete {
-                this.confirm_delete = true;
-                cx.notify();
-                return;
-            }
-            let id = this.model.lock().expect("model").active_profile_id.clone();
-            let store = this.with_model(|model| model.delete_profile(&id).ok().flatten());
-            if let Some(store) = store {
-                this.engine.remove_data_store(&store);
-            }
-            this.confirm_delete = false;
-            this.refresh_url(cx);
-        })));
+        let only_one = profiles.len() <= 1;
+        column = column.child(action_button("delete-profile", "Delete profile…", Kind::Danger, !only_one, cx, |this, cx| {
+            this.delete_prompt = this.model.lock().ok().map(|model| model.active_profile_id.clone());
+            cx.notify();
+        }));
         column = column.child(self.section_label("Sessions", paint));
         for session in sessions {
             let id = session.id.clone();
             column = column.child(
-                button(format!("session-{id}"), session.name.clone())
-                    .small()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.with_model(|model| { let _ = model.switch_session(&id); });
-                        this.refresh_url(cx);
-                    })),
+                action_button(SharedString::from(format!("session-{id}")), session.name.clone(), Kind::Secondary, true, cx, move |this, cx| {
+                    this.with_model(|model| { let _ = model.switch_session(&id); });
+                    this.refresh_url(cx);
+                }),
             );
         }
         column
-            .child(button("new-session", "New session").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            .child(action_button("new-session", "New session", Kind::Secondary, true, cx, |this, cx| {
                 this.with_model(|model| { let _ = model.create_session(); });
                 this.refresh_url(cx);
-            })))
-            .child(button("export-profile", "Export profile").small().on_click(cx.listener(|this, _: &ClickEvent, _, _| this.export_profile())))
-            .child(button("import-profile", "Import profile").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            }))
+            .child(action_button("export-profile", "Export profile", Kind::Secondary, true, cx, |this, _| this.export_profile()))
+            .child(action_button("import-profile", "Import profile", Kind::Secondary, true, cx, |this, cx| {
                 this.import_profile();
                 this.refresh_url(cx);
-            })))
+            }))
             .child(self.permission_row(cx))
     }
 
@@ -1704,39 +1836,24 @@ impl BrowserWindow {
             let id = extension.id.clone();
             let enabled = extension.enabled;
             column = column.child(
-                button(
-                    format!("extension-{id}"),
+                action_button(
+                    SharedString::from(format!("extension-{id}")),
                     format!("{}  {}", if enabled { "On" } else { "Off" }, extension.name),
-                )
-                .small()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    let _ = this.model.lock().expect("model").set_extension_enabled(&id, !enabled);
-                    this.reload_extensions();
-                    cx.notify();
-                })),
+                    Kind::Secondary,
+                    true,
+                    cx,
+                    move |this, cx| {
+                        let _ = this.model.lock().expect("model").set_extension_enabled(&id, !enabled);
+                        this.reload_extensions();
+                        cx.notify();
+                    },
+                ),
             );
         }
-        column.child(button("reload-extensions", "Reload extensions").small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+        column.child(action_button("reload-extensions", "Reload extensions", Kind::Secondary, true, cx, |this, cx| {
             this.reload_extensions();
             cx.notify();
-        })))
-    }
-
-    fn download_page(&self, downloads: &[browser_core::DownloadRecord], cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        if downloads.is_empty() {
-            return div().py(px(8.)).text_color(paint.muted).child("No downloads yet");
-        }
-        let mut column = v_stack().gap(px(6.)).w_full();
-        for entry in downloads {
-            column = column.child(
-                v_stack()
-                    .gap(px(2.))
-                    .child(entry.url.clone())
-                    .child(div().text_size(px(11.)).text_color(paint.muted).child(entry.status.clone())),
-            );
-        }
-        column
+        }))
     }
 
     fn permission_row(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -1748,23 +1865,18 @@ impl BrowserWindow {
             .gap(px(6.))
             .child(self.section_label("Permission", paint))
             .child(format!("{kind} for {origin}"))
-            .child(button("allow-permission", "Allow").small().on_click({
-                let origin = origin.clone();
-                let kind = kind.clone();
-                cx.listener(move |this, _: &ClickEvent, _, _| {
+            .child(action_button("allow-permission", "Allow", Kind::Primary, true, cx, {
+                let (origin, kind) = (origin.clone(), kind.clone());
+                move |this, _| {
                     let _ = this.model.lock().expect("model").set_permission(&origin, &kind, "allow");
                     this.sync_permissions();
                     this.status = "Allowed for the next request".into();
-                })
+                }
             }))
-            .child(button("deny-permission", "Deny").small().on_click({
-                let origin = origin.clone();
-                let kind = kind.clone();
-                cx.listener(move |this, _: &ClickEvent, _, _| {
-                    let _ = this.model.lock().expect("model").set_permission(&origin, &kind, "deny");
-                    this.sync_permissions();
-                    this.permission = None;
-                })
+            .child(action_button("deny-permission", "Deny", Kind::Secondary, true, cx, move |this, _| {
+                let _ = this.model.lock().expect("model").set_permission(&origin, &kind, "deny");
+                this.sync_permissions();
+                this.permission = None;
             }))
     }
 
@@ -1843,24 +1955,64 @@ impl Edges {
     }
 }
 
+const GRIP: f32 = 6.0;
+const GRIP_CORNER: f32 = 12.0;
+
+/// Which resize grip contains a point in window-local coordinates, if any.
+fn grip_edges(x: f32, y: f32, w: f32, h: f32) -> Option<Edges> {
+    if x < 0.0 || y < 0.0 || x > w || y > h {
+        return None;
+    }
+    let left = x < GRIP_CORNER;
+    let right = x > w - GRIP_CORNER;
+    let top = y < GRIP_CORNER;
+    let bottom = y > h - GRIP_CORNER;
+    if (left || right) && (top || bottom) {
+        return Some(Edges { left, right, top, bottom });
+    }
+    if x < GRIP {
+        return Some(Edges::left());
+    }
+    if x > w - GRIP {
+        return Some(Edges::right());
+    }
+    if y < GRIP {
+        return Some(Edges::top());
+    }
+    if y > h - GRIP {
+        return Some(Edges::bottom());
+    }
+    None
+}
+
 fn resize_cursor(edges: Edges) -> CursorStyle {
     match (edges.left, edges.right, edges.top, edges.bottom) {
-        (true, _, true, _) | (_, true, _, true) => CursorStyle::ResizeUpRightDownLeft,
-        (_, true, true, _) | (true, _, _, true) => CursorStyle::ResizeUpLeftDownRight,
+        // ↖↘ for the top-left and bottom-right corners; ↗↙ for the other pair.
+        (true, _, true, _) | (_, true, _, true) => CursorStyle::ResizeUpLeftDownRight,
+        (_, true, true, _) | (true, _, _, true) => CursorStyle::ResizeUpRightDownLeft,
         (true, _, _, _) | (_, true, _, _) => CursorStyle::ResizeLeftRight,
         _ => CursorStyle::ResizeUpDown,
     }
 }
 
-const DOCK_H: f64 = 58.0;
+const TITLEBAR_H: f32 = 38.0;
+const WINDOW_RADIUS: f64 = 10.0;
+/// Page URL and its icon URL, newline separated.
+const FAVICON_JS: &str = r#"(() => { const l = document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]'); return location.href + "\n" + (l ? l.href : location.origin + "/favicon.ico"); })()"#;
 const TITLE_H: f64 = 36.0;
 const PAGE_INSET: f64 = 6.0;
 const FIND_H: f64 = 36.0;
 
 /// Visible parts of each page, as disjoint rects: a page is hidden wherever a window in front of it sits.
 /// `stack` is back to front: (tab id, window shell, page rect). Pages never show outside `stage`.
-fn visible_pages(stack: &[(String, LogicalRect, LogicalRect)], stage: &LogicalRect) -> Vec<(String, LogicalRect)> {
+/// Also returns the slivers outside each front window's rounded corners where a back page shows,
+/// as (outer corner, arc centre) points.
+fn visible_pages(
+    stack: &[(String, LogicalRect, LogicalRect)],
+    stage: &LogicalRect,
+) -> (Vec<(String, LogicalRect)>, Vec<((f64, f64), (f64, f64))>) {
     let mut holes = Vec::new();
+    let mut notches = Vec::new();
     for (index, (id, _, page)) in stack.iter().enumerate() {
         let x = page.x.max(stage.x);
         let y = page.y.max(stage.y);
@@ -1869,13 +2021,70 @@ fn visible_pages(stack: &[(String, LogicalRect, LogicalRect)], stage: &LogicalRe
         if width <= 0.0 || height <= 0.0 {
             continue;
         }
-        let mut parts = vec![LogicalRect { x, y, width, height }];
-        for (_, shell, _) in &stack[index + 1..] {
+        let page = LogicalRect { x, y, width, height };
+        let above = &stack[index + 1..];
+        for (front, (_, shell, _)) in above.iter().enumerate() {
+            let (x2, y2) = (shell.x + shell.width, shell.y + shell.height);
+            let r = WINDOW_RADIUS;
+            for (corner, center) in [
+                ((shell.x, shell.y), (shell.x + r, shell.y + r)),
+                ((x2, shell.y), (x2 - r, shell.y + r)),
+                ((shell.x, y2), (shell.x + r, y2 - r)),
+                ((x2, y2), (x2 - r, y2 - r)),
+            ] {
+                let square = LogicalRect {
+                    x: corner.0.min(center.0),
+                    y: corner.1.min(center.1),
+                    width: r,
+                    height: r,
+                };
+                let covered = above.iter().enumerate().any(|(other, (_, shell, _))| other != front && overlaps(&square, shell));
+                if contains(&page, &square) && !covered {
+                    notches.push((corner, center));
+                }
+            }
+        }
+        let mut parts = vec![page];
+        for (_, shell, _) in above {
             parts = parts.iter().flat_map(|part| subtract(part, shell)).collect();
         }
         holes.extend(parts.into_iter().map(|part| (id.clone(), part)));
     }
-    holes
+    (holes, notches)
+}
+
+/// Removes `rect` from the page holes, giving back its rounded corners where a page lies beneath them.
+fn cut_overlay(holes: &mut Vec<(String, LogicalRect)>, notches: &mut Vec<((f64, f64), (f64, f64))>, rect: &LogicalRect, radius: f64) {
+    let (x2, y2) = (rect.x + rect.width, rect.y + rect.height);
+    let corners = [
+        ((rect.x, rect.y), (1.0, 1.0)),
+        ((x2, rect.y), (-1.0, 1.0)),
+        ((rect.x, y2), (1.0, -1.0)),
+        ((x2, y2), (-1.0, -1.0)),
+    ];
+    let over_page = |(x, y): (f64, f64)| holes.iter().any(|(_, hole)| x > hole.x && y > hole.y && x < hole.x + hole.width && y < hole.y + hole.height);
+    let rounded: Vec<_> = corners
+        .iter()
+        .filter(|&&(corner, (dx, dy))| over_page((corner.0 + dx * 0.5, corner.1 + dy * 0.5)))
+        .map(|&(corner, (dx, dy))| (corner, (corner.0 + dx * radius, corner.1 + dy * radius)))
+        .collect();
+    *holes = std::mem::take(holes)
+        .into_iter()
+        .flat_map(|(id, hole)| subtract(&hole, rect).into_iter().map(move |part| (id.clone(), part)))
+        .collect();
+    notches.retain(|&((x, y), _)| !(x > rect.x && y > rect.y && x < x2 && y < y2));
+    notches.extend(rounded);
+}
+
+fn overlaps(a: &LogicalRect, b: &LogicalRect) -> bool {
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+fn contains(outer: &LogicalRect, inner: &LogicalRect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
 }
 
 /// `a` minus `b`, as up to four disjoint rects.
@@ -1936,6 +2145,40 @@ fn site_glyph(url: &str) -> (String, String) {
     (glyph, host.to_string())
 }
 
+/// The site's icon once cached, otherwise a coloured initial.
+fn favicon(tab: &browser_core::Tab) -> gpui::AnyElement {
+    let (glyph, host) = site_glyph(&tab.url);
+    let tile = move || {
+        div()
+            .size(px(16.))
+            .flex_none()
+            .rounded(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(site_color(&host))
+            .text_color(gpui::rgb(0xFFFFFF))
+            .text_size(px(10.))
+            .child(glyph.clone())
+            .into_any_element()
+    };
+    let path = favicon_path(&site_glyph(&tab.url).1);
+    if is_web(&tab.url) && path.exists() {
+        img(path).size(px(16.)).flex_none().with_fallback(tile).into_any_element()
+    } else {
+        tile()
+    }
+}
+
+fn favicon_path(host: &str) -> std::path::PathBuf {
+    let name: String = host.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    app_support_dir().join("favicons").join(format!("icon-{name}"))
+}
+
+fn is_web(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
 fn site_color(host: &str) -> gpui::Hsla {
     let mut hash = 0u32;
     for byte in host.bytes() {
@@ -1944,7 +2187,37 @@ fn site_color(host: &str) -> gpui::Hsla {
     gpui::hsla((hash % 360) as f32 / 360.0, 0.62, 0.38, 1.)
 }
 
-fn rail_mark(name: &str) -> String {
+/// Drag payload for reordering profiles in the rail.
+struct RailDrag(browser_core::Profile);
+
+struct RailDragPreview(browser_core::Profile, Paint);
+
+impl Render for RailDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        profile_badge(&self.0, false, 32., self.1).opacity(0.85)
+    }
+}
+
+/// Profile icon (emoji or initial) on its color; a ring marks the active profile.
+pub(crate) fn profile_badge(profile: &browser_core::Profile, active: bool, size: f32, paint: Paint) -> gpui::Div {
+    let custom = !profile.color.is_empty();
+    let label = if profile.icon.is_empty() { rail_mark(&profile.name) } else { profile.icon.clone() };
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded(px(size / 4.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(size * 0.45))
+        .bg(if custom { parse_hex(&profile.color) } else if active { paint.accent } else { paint.secondary })
+        .text_color(if custom { gpui::white() } else if active { paint.bg } else { paint.fg })
+        .border_2()
+        .border_color(if active && custom { paint.fg } else { gpui::transparent_black() })
+        .child(label)
+}
+
+pub(crate) fn rail_mark(name: &str) -> String {
     let trimmed = name.trim();
     let word = trimmed.strip_prefix("Profile ").unwrap_or(trimmed);
     word.chars().next().unwrap_or('P').to_uppercase().to_string()
@@ -1974,15 +2247,48 @@ mod tests {
     #[test]
     fn back_page_is_clipped_by_front_window() {
         let stack = vec![
-            ("back".to_string(), r(0., 0., 100., 100.), r(0., 10., 100., 90.)),
+            ("back".to_string(), r(0., 0., 100., 120.), r(0., 10., 100., 110.)),
             ("front".to_string(), r(60., 0., 100., 100.), r(60., 10., 100., 90.)),
         ];
-        let holes = visible_pages(&stack, &r(0., 0., 1000., 1000.));
-        assert_eq!(visible_pages(&stack, &r(20., 0., 1000., 50.))[0].1, r(20., 10., 40., 40.));
+        let (holes, notches) = visible_pages(&stack, &r(0., 0., 1000., 1000.));
+        assert_eq!(visible_pages(&stack, &r(20., 0., 1000., 50.)).0[0].1, r(20., 10., 40., 40.));
+        // Front window's bottom-left corner sits on the back page; its top corners are above it.
+        assert_eq!(notches, vec![((60., 100.), (70., 90.))]);
         let back: Vec<_> = holes.iter().filter(|(id, _)| id == "back").map(|(_, rect)| rect.clone()).collect();
-        assert_eq!(back, vec![r(0., 10., 60., 90.)]);
+        assert_eq!(back, vec![r(0., 100., 100., 20.), r(0., 10., 60., 90.)]);
         assert!(holes.contains(&("front".to_string(), r(60., 10., 100., 90.))));
         let area: f64 = subtract(&r(0., 0., 10., 10.), &r(3., 3., 4., 4.)).iter().map(|p| p.width * p.height).sum();
         assert_eq!(area, 84.);
+    }
+
+    #[test]
+    fn overlay_cut_rounds_only_corners_over_a_page() {
+        // Page covers the right half; the card straddles its left edge.
+        let mut holes = vec![("t".to_string(), r(100.0, 0.0, 100.0, 100.0))];
+        let mut notches = Vec::new();
+        cut_overlay(&mut holes, &mut notches, &r(50.0, 20.0, 100.0, 40.0), 8.0);
+        let area: f64 = holes.iter().map(|(_, h)| h.width * h.height).sum();
+        assert_eq!(area, 100.0 * 100.0 - 50.0 * 40.0);
+        assert_eq!(notches, vec![((150.0, 20.0), (142.0, 28.0)), ((150.0, 60.0), (142.0, 52.0))]);
+    }
+
+    #[test]
+    fn top_edge_is_a_resize_grip() {
+        assert_eq!(grip_edges(80., 2., 400., 300.), Some(Edges::top()));
+        assert_eq!(grip_edges(2., 2., 400., 300.), Some(Edges::top_left()));
+        assert_eq!(grip_edges(398., 2., 400., 300.), Some(Edges::top_right()));
+        assert_eq!(grip_edges(80., 20., 400., 300.), None);
+    }
+
+    #[test]
+    fn resize_cursors_match_the_edge() {
+        assert_eq!(resize_cursor(Edges::left()), CursorStyle::ResizeLeftRight);
+        assert_eq!(resize_cursor(Edges::right()), CursorStyle::ResizeLeftRight);
+        assert_eq!(resize_cursor(Edges::top()), CursorStyle::ResizeUpDown);
+        assert_eq!(resize_cursor(Edges::bottom()), CursorStyle::ResizeUpDown);
+        assert_eq!(resize_cursor(Edges::top_left()), CursorStyle::ResizeUpLeftDownRight);
+        assert_eq!(resize_cursor(Edges::bottom_right()), CursorStyle::ResizeUpLeftDownRight);
+        assert_eq!(resize_cursor(Edges::top_right()), CursorStyle::ResizeUpRightDownLeft);
+        assert_eq!(resize_cursor(Edges::bottom_left()), CursorStyle::ResizeUpRightDownLeft);
     }
 }

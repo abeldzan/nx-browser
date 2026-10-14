@@ -53,6 +53,32 @@ pub enum EngineEvent {
     Shortcut(Shortcut),
 }
 
+/// Browser settings the engine applies to web views.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineSettings {
+    pub javascript: bool,
+    pub block_popups: bool,
+    pub fraud_warnings: bool,
+    pub https_only: bool,
+    pub inspectable: bool,
+    pub user_agent: String,
+    pub page_zoom: f64,
+}
+
+impl Default for EngineSettings {
+    fn default() -> Self {
+        Self {
+            javascript: true,
+            block_popups: true,
+            fraud_warnings: true,
+            https_only: false,
+            inspectable: true,
+            user_agent: String::new(),
+            page_zoom: 1.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Shortcut {
     NewTab,
@@ -63,6 +89,7 @@ pub enum Shortcut {
     Forward,
     Find,
     Bookmark,
+    Settings,
 }
 
 pub trait WebEngine {

@@ -1,5 +1,5 @@
 use crate::lifecycle::{suspend_candidates, LiveTab, TabState};
-use crate::now_secs;
+use crate::{now_secs, Settings};
 use anyhow::Context;
 use browser_storage::Storage;
 use rusqlite::params;
@@ -14,6 +14,10 @@ pub struct Profile {
     pub storage_path: PathBuf,
     pub data_store_id: String,
     pub created_at: i64,
+    /// Emoji shown in place of the initial letter; empty means the letter.
+    pub icon: String,
+    /// `#rrggbb`; empty means the theme accent.
+    pub color: String,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +116,10 @@ pub struct ProfileBundle {
 pub struct BundleProfile {
     pub name: String,
     pub data_store_id: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub color: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,8 +164,7 @@ pub struct Model {
     pub extensions: Vec<ExtensionRecord>,
     pub active_profile_id: String,
     pub active_session_id: String,
-    pub suspend_after_secs: i64,
-    pub max_live_tabs: usize,
+    pub settings: Settings,
     background_since: Vec<(String, i64)>,
     effects: Vec<Effect>,
 }
@@ -172,8 +179,7 @@ impl Model {
             extensions: Vec::new(),
             active_profile_id: String::new(),
             active_session_id: String::new(),
-            suspend_after_secs: 120,
-            max_live_tabs: 6,
+            settings: Settings::default(),
             background_since: Vec::new(),
             effects: Vec::new(),
         };
@@ -181,13 +187,15 @@ impl Model {
         if model.profiles.is_empty() {
             model.create_profile("Personal")?;
         }
-        if let Some(value) = model.storage.setting("suspend_after_secs")? {
-            model.suspend_after_secs = value.parse().unwrap_or(120);
-        }
-        if let Some(value) = model.storage.setting("max_live_tabs")? {
-            model.max_live_tabs = value.parse().unwrap_or(6);
+        if let Some(value) = model.storage.setting("prefs")? {
+            model.settings = serde_json::from_str(&value).unwrap_or_default();
         }
         Ok(model)
+    }
+
+    pub fn update_settings(&mut self, f: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
+        f(&mut self.settings);
+        self.storage.set_setting("prefs", &serde_json::to_string(&self.settings)?)
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -234,6 +242,8 @@ impl Model {
             storage_path,
             data_store_id,
             created_at: now_secs(),
+            icon: String::new(),
+            color: String::new(),
         };
         self.insert_profile(&profile)?;
         let session_id = self.insert_session(&profile.id, "Session 1")?;
@@ -252,6 +262,41 @@ impl Model {
             params![name, id],
         )?;
         self.reload()?;
+        Ok(())
+    }
+
+    pub fn set_profile_appearance(&mut self, id: &str, icon: &str, color: &str) -> anyhow::Result<()> {
+        self.storage.execute(
+            "UPDATE profiles SET icon = ?1, color = ?2 WHERE id = ?3",
+            params![icon, color, id],
+        )?;
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Moves a profile to `index` in the rail order.
+    pub fn move_profile(&mut self, id: &str, index: usize) -> anyhow::Result<()> {
+        let mut ids: Vec<String> = self.profiles.iter().map(|profile| profile.id.clone()).collect();
+        let Some(from) = ids.iter().position(|existing| existing == id) else {
+            return Ok(());
+        };
+        let moved = ids.remove(from);
+        ids.insert(index.min(ids.len()), moved);
+        for (position, id) in ids.iter().enumerate() {
+            self.storage.execute("UPDATE profiles SET position = ?1 WHERE id = ?2", params![position as i64, id])?;
+        }
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Clears the active profile's history and/or download list.
+    pub fn clear_data(&self, history: bool, downloads: bool) -> anyhow::Result<()> {
+        if history {
+            self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![self.active_profile_id])?;
+        }
+        if downloads {
+            self.storage.execute("DELETE FROM downloads WHERE profile_id = ?1", params![self.active_profile_id])?;
+        }
         Ok(())
     }
 
@@ -435,7 +480,7 @@ impl Model {
                 .find(|session| session.id == tab.session_id)
                 .map(|session| session.profile_id.clone());
             if let Some(profile_id) = profile_id {
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if self.settings.save_history && (url.starts_with("http://") || url.starts_with("https://")) {
                     self.storage.execute(
                         "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, ?3, ?4)",
                         params![profile_id, url, title, now_secs()],
@@ -471,7 +516,7 @@ impl Model {
                     .map(|(_, since)| *since),
             })
             .collect::<Vec<_>>();
-        suspend_candidates(&live, now, self.suspend_after_secs, self.max_live_tabs)
+        suspend_candidates(&live, now, self.settings.suspend_after_secs, self.settings.max_live_tabs)
     }
 
     pub fn mark_suspended(&mut self, tab_id: &str) -> anyhow::Result<()> {
@@ -561,6 +606,15 @@ impl Model {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Removes finished and failed downloads from the active profile's list; running ones stay.
+    pub fn clear_finished_downloads(&self) -> anyhow::Result<()> {
+        self.storage.execute(
+            "DELETE FROM downloads WHERE profile_id = ?1 AND status != 'running'",
+            params![self.active_profile_id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_download(&self, id: &str, url: &str, path: &str) -> anyhow::Result<()> {
         self.storage.execute(
             "INSERT INTO downloads (id, profile_id, url, path, status, created_at) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
@@ -595,6 +649,14 @@ impl Model {
             "INSERT INTO permissions (profile_id, origin, permission, decision) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(profile_id, origin, permission) DO UPDATE SET decision = excluded.decision",
             params![self.active_profile_id, origin, permission, decision],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_permission(&self, origin: &str, permission: &str) -> anyhow::Result<()> {
+        self.storage.execute(
+            "DELETE FROM permissions WHERE profile_id = ?1 AND origin = ?2 AND permission = ?3",
+            params![self.active_profile_id, origin, permission],
         )?;
         Ok(())
     }
@@ -793,6 +855,8 @@ impl Model {
             profile: BundleProfile {
                 name: profile.name.clone(),
                 data_store_id: profile.data_store_id.clone(),
+                icon: profile.icon.clone(),
+                color: profile.color.clone(),
             },
             tabs,
             bookmarks,
@@ -805,8 +869,8 @@ impl Model {
     pub fn import_bundle(&mut self, bundle: ProfileBundle) -> anyhow::Result<String> {
         let id = self.create_profile(&bundle.profile.name)?;
         self.storage.execute(
-            "UPDATE profiles SET data_store_id = ?1 WHERE id = ?2",
-            params![bundle.profile.data_store_id, id],
+            "UPDATE profiles SET data_store_id = ?1, icon = ?2, color = ?3 WHERE id = ?4",
+            params![bundle.profile.data_store_id, bundle.profile.icon, bundle.profile.color, id],
         )?;
         let session_id = self.active_session_id.clone();
         self.storage.execute("DELETE FROM tabs WHERE session_id = ?1", params![session_id])?;
@@ -906,13 +970,16 @@ impl Model {
 
     fn insert_profile(&self, profile: &Profile) -> anyhow::Result<()> {
         self.storage.execute(
-            "INSERT INTO profiles (id, name, storage_path, data_store_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO profiles (id, name, storage_path, data_store_id, created_at, icon, color, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COALESCE(MAX(position), -1) + 1 FROM profiles))",
             params![
                 profile.id,
                 profile.name,
                 profile.storage_path.display().to_string(),
                 profile.data_store_id,
-                profile.created_at
+                profile.created_at,
+                profile.icon,
+                profile.color
             ],
         )?;
         Ok(())
@@ -1011,7 +1078,7 @@ fn ok_value(value: serde_json::Value) -> serde_json::Value {
 
 fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
     let mut stmt = storage.conn().prepare(
-        "SELECT id, name, storage_path, data_store_id, created_at FROM profiles ORDER BY created_at",
+        "SELECT id, name, storage_path, data_store_id, created_at, icon, color FROM profiles ORDER BY position, created_at",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Profile {
@@ -1020,6 +1087,8 @@ fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
             storage_path: PathBuf::from(row.get::<_, String>(2)?),
             data_store_id: row.get(3)?,
             created_at: row.get(4)?,
+            icon: row.get(5)?,
+            color: row.get(6)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1088,6 +1157,39 @@ mod tests {
         loaded.switch_profile(&profile_id).unwrap();
         assert_eq!(loaded.active_tab().unwrap().url, url);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn appearance_and_settings_persist() {
+        let path = std::env::temp_dir().join(format!("nxbrowser-test-{}.sqlite", Uuid::new_v4()));
+        let mut model = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let id = model.active_profile_id.clone();
+        model.set_profile_appearance(&id, "🦊", "#e5484d").unwrap();
+        model.update_settings(|s| { s.save_history = false; s.search_engine = "Google".into(); }).unwrap();
+        let tab = model.active_tab().unwrap().id.clone();
+        model.note_navigation(&tab, "https://example.com/", "Example").unwrap();
+        assert!(model.history().unwrap().is_empty());
+        drop(model);
+        let loaded = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let profile = loaded.profiles.iter().find(|p| p.id == id).unwrap();
+        assert_eq!((profile.icon.as_str(), profile.color.as_str()), ("🦊", "#e5484d"));
+        assert_eq!(loaded.settings.search_engine, "Google");
+        assert!(!loaded.settings.save_history);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profiles_reorder() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.create_profile("B").unwrap();
+        model.create_profile("C").unwrap();
+        let names = |m: &Model| m.profiles.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&model), ["Personal", "B", "C"]);
+        let c = model.profiles[2].id.clone();
+        model.move_profile(&c, 0).unwrap();
+        assert_eq!(names(&model), ["C", "Personal", "B"]);
+        model.move_profile(&c, 99).unwrap();
+        assert_eq!(names(&model), ["Personal", "B", "C"]);
     }
 
     #[test]

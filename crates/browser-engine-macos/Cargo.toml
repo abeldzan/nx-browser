@@ -23,7 +23,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "objc2-quartz-core",
 ] }
 objc2-core-foundation = "0.3"
-objc2-core-graphics = { version = "0.3", features = ["CGPath"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColor", "CGPath"] }
 objc2-foundation = "0.3"
 objc2-quartz-core = { version = "0.3", features = ["CALayer", "CAShapeLayer", "CATransaction"] }
 objc2-web-kit = "0.3"

@@ -1,11 +1,14 @@
+mod downloads;
 mod profiles;
+mod settings;
 mod sidebar;
 mod tabs;
 mod toolbar;
+mod ui;
 mod window;
 
 use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
 use std::sync::{Arc, Mutex};
 use window::BrowserWindow;
@@ -24,8 +27,11 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("NxBrowser".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(13.))),
                 }),
+                // Tabs live in the titlebar; empty titlebar space moves the window itself.
+                app_owns_titlebar_drag: true,
                 window_min_size: Some(size(px(860.), px(560.))),
                 ..Default::default()
             },

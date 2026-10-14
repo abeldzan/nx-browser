@@ -103,6 +103,18 @@ impl Storage {
             );
             ",
         )?;
+        // Columns added after the first release; older databases get them here.
+        for (column, decl) in [("icon", "TEXT NOT NULL DEFAULT ''"), ("color", "TEXT NOT NULL DEFAULT ''"), ("position", "INTEGER NOT NULL DEFAULT 0")] {
+            let has = self
+                .conn
+                .prepare("SELECT 1 FROM pragma_table_info('profiles') WHERE name = ?1")?
+                .exists(params![column])?;
+            if !has {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE profiles ADD COLUMN {column} {decl}"
+                ))?;
+            }
+        }
         Ok(())
     }
 
@@ -133,5 +145,28 @@ impl Storage {
 
     pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<usize> {
         Ok(self.conn.execute(sql, params).context("sqlite execute")?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_profiles_table_gains_new_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE profiles (id TEXT PRIMARY KEY, name TEXT NOT NULL, storage_path TEXT NOT NULL, data_store_id TEXT NOT NULL, created_at INTEGER NOT NULL);
+             INSERT INTO profiles VALUES ('a', 'Old', '/x', 'd', 1);",
+        )
+        .unwrap();
+        let storage = Storage { conn };
+        storage.migrate().unwrap();
+        storage.migrate().unwrap();
+        let (icon, color): (String, String) = storage
+            .conn()
+            .query_row("SELECT icon, color FROM profiles WHERE id = 'a'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!((icon.as_str(), color.as_str()), ("", ""));
     }
 }

@@ -26,6 +26,19 @@ pub fn choose_open_path() -> Option<PathBuf> {
     Some(PathBuf::from(ns_string(&path)))
 }
 
+pub fn choose_folder_path() -> Option<PathBuf> {
+    let mtm = MainThreadMarker::new()?;
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseDirectories(true);
+    panel.setCanChooseFiles(false);
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    let url = panel.URL()?;
+    let path = url.path()?;
+    Some(PathBuf::from(ns_string(&path)))
+}
+
 fn ns_string(value: &NSString) -> String {
     objc2::rc::autoreleasepool(|pool| unsafe { value.to_str(pool).to_string() })
 }

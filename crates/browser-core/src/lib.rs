@@ -2,9 +2,10 @@ mod download;
 mod lifecycle;
 mod metrics;
 mod model;
+mod settings;
 mod url;
 
-pub use download::{spawn_download, DownloadUpdate};
+pub use download::{spawn_download, spawn_favicon, DownloadUpdate};
 pub use lifecycle::{suspend_candidates, LifeEvent, TabState};
 pub use metrics::{sample_cpu_seconds, snapshot, MetricsSnapshot};
 pub use model::{
@@ -12,6 +13,7 @@ pub use model::{
     BundleTab, DownloadRecord, Effect, ExtensionRecord, HistoryEntry, Model, Profile, ProfileBundle,
     Session, Tab,
 };
+pub use settings::{Settings, SEARCH_ENGINES};
 pub use url::normalize_url;
 
 pub fn now_secs() -> i64 {

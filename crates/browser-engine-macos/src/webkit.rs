@@ -1,19 +1,20 @@
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, LogicalRect, ScriptInjection, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, Shortcut, WebEngine};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
-use objc2_core_graphics::CGMutablePath;
+use objc2_app_kit::{NSAutoresizingMaskOptions, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
+use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
-    ns_string, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string, NSDate, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSURL,
     NSURLRequest, NSUUID,
 };
 use objc2_web_kit::{
@@ -41,6 +42,7 @@ struct DelegateIvars {
     events: Sender<EngineEvent>,
     tab_id: String,
     permissions: Arc<Mutex<HashMap<String, String>>>,
+    https_only: Arc<AtomicBool>,
 }
 
 define_class!(
@@ -56,10 +58,21 @@ define_class!(
         #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
         unsafe fn webView_decidePolicyForNavigationAction_decisionHandler(
             &self,
-            _web_view: &WKWebView,
-            _navigation_action: &WKNavigationAction,
+            web_view: &WKWebView,
+            navigation_action: &WKNavigationAction,
             decision_handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
         ) {
+            if self.ivars().https_only.load(Ordering::Relaxed) {
+                let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
+                let url = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
+                if let (true, Some(rest)) = (main_frame, url.as_deref().and_then(|url| url.strip_prefix("http://"))) {
+                    decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                    if let Some(secure) = NSURL::URLWithString(&NSString::from_str(&format!("https://{rest}"))) {
+                        web_view.loadRequest(&NSURLRequest::requestWithURL(&secure));
+                    }
+                    return;
+                }
+            }
             decision_handler.call((WKNavigationActionPolicy::Allow,));
         }
 
@@ -252,8 +265,11 @@ pub struct MacEngine {
     chrome: Option<Retained<NSView>>,
     bounds: LogicalRect,
     stacked: Vec<String>,
-    placed_holes: Option<(Vec<(String, LogicalRect)>, NSSize)>,
+    placed_holes: Option<(Vec<(String, LogicalRect)>, Vec<Notch>, NSSize)>,
     permissions: Arc<Mutex<HashMap<String, String>>>,
+    settings: EngineSettings,
+    https_only: Arc<AtomicBool>,
+    dimmers: HashMap<String, Retained<NSView>>,
     _monitor: Option<Retained<AnyObject>>,
     _page_monitor: Option<Retained<AnyObject>>,
 }
@@ -275,6 +291,9 @@ impl MacEngine {
             stacked: Vec::new(),
             placed_holes: None,
             permissions,
+            settings: EngineSettings::default(),
+            https_only: Arc::new(AtomicBool::new(false)),
+            dimmers: HashMap::new(),
             _monitor: monitor,
             _page_monitor: page_monitor,
         }
@@ -307,6 +326,62 @@ impl MacEngine {
         }
     }
 
+    /// Zoom, user agent and inspector apply to open tabs; the rest to tabs created afterwards.
+    pub fn set_settings(&mut self, settings: EngineSettings) {
+        self.https_only.store(settings.https_only, Ordering::Relaxed);
+        for live in self.tabs.values() {
+            apply_view_settings(&live.view, &settings);
+        }
+        self.settings = settings;
+    }
+
+    /// While a chrome modal is open, pages stay visible but dimmed and stop taking clicks.
+    pub fn set_modal(&mut self, on: bool) {
+        MODAL.store(on, Ordering::Relaxed);
+        // Dim layers live inside each page view: sibling views do not reliably draw over WebKit's layers.
+        self.dimmers.retain(|id, dimmer| {
+            let keep = on && self.tabs.contains_key(id);
+            if !keep {
+                dimmer.removeFromSuperview();
+            }
+            keep
+        });
+        let Some(mtm) = MainThreadMarker::new().filter(|_| on) else {
+            return;
+        };
+        for (id, live) in &self.tabs {
+            if self.dimmers.contains_key(id) {
+                continue;
+            }
+            let dimmer = NSView::initWithFrame(NSView::alloc(mtm), live.view.bounds());
+            dimmer.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+            dimmer.setWantsLayer(true);
+            if let Some(layer) = dimmer.layer() {
+                layer.setBackgroundColor(Some(&CGColor::new_generic_gray(0.0, 0.45)));
+            }
+            live.view.addSubview(&dimmer);
+            self.dimmers.insert(id.clone(), dimmer);
+        }
+    }
+
+    /// Removes cookies, caches and site storage from one profile's data store.
+    pub fn clear_site_data(&mut self, data_store_id: &str) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Ok(store) = data_store(data_store_id, mtm) else {
+            return;
+        };
+        let block = RcBlock::new(|| {});
+        unsafe {
+            store.removeDataOfTypes_modifiedSince_completionHandler(
+                &WKWebsiteDataStore::allWebsiteDataTypes(mtm),
+                &NSDate::distantPast(),
+                &block,
+            );
+        }
+    }
+
     pub fn set_permissions(&mut self, entries: Vec<(String, String, String)>) {
         if let Ok(mut map) = self.permissions.lock() {
             map.clear();
@@ -316,7 +391,8 @@ impl MacEngine {
         }
     }
 
-    pub fn set_page_holes(&mut self, holes: &[(String, LogicalRect)]) {
+    /// `notches` are (outer corner, arc centre) points of rounded-corner slivers that also show the page.
+    pub fn set_page_holes(&mut self, holes: &[(String, LogicalRect)], notches: &[Notch]) {
         let Some(chrome) = &self.chrome else {
             return;
         };
@@ -324,10 +400,20 @@ impl MacEngine {
             return;
         };
         let size = unsafe { content.bounds() }.size;
-        if self.placed_holes.as_ref().is_some_and(|(old, old_size)| old.as_slice() == holes && *old_size == size) {
+        if self
+            .placed_holes
+            .as_ref()
+            .is_some_and(|(old, old_notches, old_size)| old.as_slice() == holes && old_notches.as_slice() == notches && *old_size == size)
+        {
             return;
         }
-        self.placed_holes = Some((holes.to_vec(), size));
+        let Some(host) = (unsafe {
+            chrome.setWantsLayer(true);
+            chrome.layer()
+        }) else {
+            return;
+        };
+        self.placed_holes = Some((holes.to_vec(), notches.to_vec(), size));
         let height = size.height;
         let mut placed = Vec::with_capacity(holes.len());
         for (tab_id, hole) in holes {
@@ -344,10 +430,6 @@ impl MacEngine {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         unsafe {
-            chrome.setWantsLayer(true);
-            let Some(host) = chrome.layer() else {
-                return;
-            };
             let shape = CAShapeLayer::new();
             let path = CGMutablePath::new();
             let bounds = chrome.bounds();
@@ -366,6 +448,20 @@ impl MacEngine {
                     };
                     CGMutablePath::add_rect(Some(&path), std::ptr::null(), rect);
                 }
+            }
+            let flip = chrome.isFlipped() != host.isGeometryFlipped();
+            let point = |(x, y): (f64, f64)| {
+                let local = chrome.convertPoint_fromView(NSPoint::new(x, height - y), Some(content));
+                (local.x, if flip { bounds.size.height - local.y } else { local.y })
+            };
+            for &(corner, center) in notches {
+                let (ox, oy) = point(corner);
+                let (cx, cy) = point(center);
+                let radius = (ox - cx).abs();
+                CGMutablePath::move_to_point(Some(&path), std::ptr::null(), ox, cy);
+                CGMutablePath::add_arc_to_point(Some(&path), std::ptr::null(), ox, oy, cx, oy, radius);
+                CGMutablePath::add_line_to_point(Some(&path), std::ptr::null(), ox, oy);
+                CGMutablePath::close_subpath(Some(&path));
             }
             shape.setPath(Some(&path));
             shape.setFillRule(unsafe { kCAFillRuleEvenOdd });
@@ -441,7 +537,13 @@ impl WebEngine for MacEngine {
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("WebKit must be created on the main thread"))?;
         let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
         let store = data_store(data_store_id, mtm)?;
-        unsafe { configuration.setWebsiteDataStore(&store) };
+        unsafe {
+            configuration.setWebsiteDataStore(&store);
+            let preferences = configuration.preferences();
+            preferences.setJavaScriptCanOpenWindowsAutomatically(!self.settings.block_popups);
+            preferences.setFraudulentWebsiteWarningEnabled(self.settings.fraud_warnings);
+            configuration.defaultWebpagePreferences().setAllowsContentJavaScript(self.settings.javascript);
+        }
         let view = unsafe {
             WKWebView::initWithFrame_configuration(
                 WKWebView::alloc(mtm),
@@ -452,13 +554,14 @@ impl WebEngine for MacEngine {
                 &configuration,
             )
         };
-        unsafe { view.setInspectable(true) };
+        apply_view_settings(&view, &self.settings);
         let delegate = NxWebDelegate::new(
             mtm,
             DelegateIvars {
                 events: self.events_tx.clone(),
                 tab_id: tab_id.to_string(),
                 permissions: self.permissions.clone(),
+                https_only: self.https_only.clone(),
             },
         );
         unsafe {
@@ -738,6 +841,15 @@ impl MacEngine {
     }
 }
 
+fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
+    let agent = (!settings.user_agent.trim().is_empty()).then(|| NSString::from_str(settings.user_agent.trim()));
+    unsafe {
+        view.setInspectable(settings.inspectable);
+        view.setCustomUserAgent(agent.as_deref());
+        view.setPageZoom(settings.page_zoom);
+    }
+}
+
 fn data_store(id: &str, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebsiteDataStore>> {
     let uuid = parse_uuid(id)?;
     Ok(unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) })
@@ -764,6 +876,7 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
                     "d" => Some(Shortcut::Bookmark),
                     "[" => Some(Shortcut::Back),
                     "]" => Some(Shortcut::Forward),
+                    "," => Some(Shortcut::Settings),
                     _ => None,
                 };
                 if let Some(shortcut) = shortcut {
@@ -781,6 +894,8 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
     monitor
 }
 
+type Notch = ((f64, f64), (f64, f64));
+
 struct PageHole {
     tab_id: String,
     rect: NSRect,
@@ -788,6 +903,7 @@ struct PageHole {
 
 static HOLES: Mutex<Vec<PageHole>> = Mutex::new(Vec::new());
 static PAGE_CLICK: Mutex<Option<String>> = Mutex::new(None);
+static MODAL: AtomicBool = AtomicBool::new(false);
 
 fn hole_contains(rect: NSRect, point: NSPoint) -> bool {
     point.x >= rect.origin.x
@@ -809,6 +925,9 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
             return event.as_ptr();
         };
         let point = unsafe { content.convertPoint_fromView(event_ref.locationInWindow(), None) };
+        if MODAL.load(Ordering::Relaxed) {
+            return event.as_ptr();
+        }
         if let Ok(holes) = HOLES.lock() {
             if let Some(hit) = holes.iter().rev().find(|hole| hole_contains(hole.rect, point)) {
                 if let Ok(mut click) = PAGE_CLICK.lock() {
@@ -839,7 +958,7 @@ fn install_hit_proxy(chrome: &NSView) {
 }
 
 extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *mut AnyObject {
-    if let Ok(holes) = HOLES.lock() {
+    if let (false, Ok(holes)) = (MODAL.load(Ordering::Relaxed), HOLES.lock()) {
         if holes.iter().any(|hole| hole_contains(hole.rect, point)) {
             return std::ptr::null_mut();
         }
