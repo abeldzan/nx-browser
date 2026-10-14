@@ -31,6 +31,8 @@ pub enum EngineEvent {
     },
     OpenInNewTab {
         url: String,
+        /// The tab whose page asked for it; the new tab joins that tab's window.
+        from: Option<String>,
     },
     Alert {
         message: String,

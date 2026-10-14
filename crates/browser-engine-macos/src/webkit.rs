@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
@@ -44,6 +44,27 @@ const HOME_HTML: &str = r#"<!doctype html>
 </html>"#;
 
 const OBSERVED_KEYS: [&str; 2] = ["URL", "title"];
+
+define_class!(
+    /// WebKit's page view, with the right-click menu's "… in New Window" items saying "… in New Tab":
+    /// they open in the page's own window (see `OpenInNewTab::from`).
+    #[unsafe(super(WKWebView, NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    struct NxWebView;
+
+    impl NxWebView {
+        #[unsafe(method(willOpenMenu:withEvent:))]
+        fn will_open_menu(&self, menu: &NSMenu, event: &NSEvent) {
+            for item in menu.itemArray().iter() {
+                let title = item.title().to_string();
+                if title.contains("New Window") {
+                    item.setTitle(&NSString::from_str(&title.replace("New Window", "New Tab")));
+                }
+            }
+            let _: () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
+        }
+    }
+);
 
 struct DelegateIvars {
     events: Sender<EngineEvent>,
@@ -77,7 +98,7 @@ define_class!(
             let target = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
             if let (true, true, Some(url)) = (main_frame, from_extension, target.filter(|url| url.starts_with("https://") || url.starts_with("http://"))) {
                 decision_handler.call((WKNavigationActionPolicy::Cancel,));
-                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url });
+                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url, from: None });
                 return;
             }
             if self.ivars().https_only.load(Ordering::Relaxed) {
@@ -168,7 +189,7 @@ define_class!(
         ) -> Option<Retained<WKWebView>> {
             if navigation_action.targetFrame().is_none() {
                 if let Some(url) = navigation_action.request().URL().and_then(|url| url.absoluteString()) {
-                    let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url: ns_string(&url) });
+                    let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url: ns_string(&url), from: Some(self.ivars().tab_id.clone()) });
                 }
             }
             None
@@ -682,16 +703,12 @@ impl WebEngine for MacEngine {
                 configuration.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::All);
             }
         }
-        let view = unsafe {
-            WKWebView::initWithFrame_configuration(
-                WKWebView::alloc(mtm),
-                objc2_core_foundation::CGRect {
-                    origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
-                    size: objc2_core_foundation::CGSize { width: 100.0, height: 100.0 },
-                },
-                &configuration,
-            )
+        let frame = objc2_core_foundation::CGRect {
+            origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
+            size: objc2_core_foundation::CGSize { width: 100.0, height: 100.0 },
         };
+        let view: Retained<NxWebView> = unsafe { msg_send![NxWebView::alloc(mtm), initWithFrame: frame, configuration: &*configuration] };
+        let view = Retained::into_super(view);
         apply_view_settings(&view, &self.settings);
         let delegate = self.page_delegate(tab_id, mtm);
         unsafe {

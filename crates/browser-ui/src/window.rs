@@ -79,6 +79,8 @@ pub struct BrowserWindow {
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
     address_editing: bool,
+    /// A page was clicked while the address was being edited; end the edit on the next render.
+    blur_address: bool,
     find_open: bool,
     panel: Option<SidebarPage>,
     chrome: HashMap<String, TabChrome>,
@@ -106,8 +108,6 @@ pub struct BrowserWindow {
     dock_hovered: bool,
     dock_from: f32,
     dock_at: Instant,
-    /// Windows whose tab strip just appeared, by group id, so it can slide open.
-    strip_since: HashMap<String, Instant>,
 }
 
 struct SelfTest {
@@ -251,6 +251,7 @@ impl BrowserWindow {
             address_focused: false,
             focus_address: false,
             address_editing: false,
+            blur_address: false,
             find_open: false,
             panel: None,
             chrome: HashMap::new(),
@@ -285,7 +286,6 @@ impl BrowserWindow {
             dock_hovered: false,
             dock_from: 0.0,
             dock_at: Instant::now(),
-            strip_since: HashMap::new(),
         };
         view.apply_settings();
         if view.self_test.is_none() {
@@ -333,6 +333,11 @@ impl BrowserWindow {
             self.ext_active = active;
         }
         if let Some(id) = self.engine.take_page_click() {
+            // Page clicks never reach GPUI, so the address input would stay focused and expanded.
+            if self.address_editing || self.address_focused {
+                self.blur_address = true;
+                cx.notify();
+            }
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
             if !already {
@@ -426,12 +431,15 @@ impl BrowserWindow {
                 self.permission = Some((origin.clone(), kind.clone()));
                 self.status = format!("Permission request: {kind} for {origin}").into();
             }
-            EngineEvent::OpenInNewTab { url } => {
+            EngineEvent::OpenInNewTab { url, from } => {
                 // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
                 let panel = self.ext_meta.keys().find(|id| self.panel_url(id).as_deref() == Some(url.as_str())).cloned();
-                match panel {
-                    Some(id) => self.open_extension_panel(&id, &url, cx),
-                    None => self.with_model(|model| {
+                // A side panel's links get a regular window, not a tab squeezed into the panel.
+                let from = from.filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_none()));
+                match (panel, from) {
+                    (Some(id), _) => self.open_extension_panel(&id, &url, cx),
+                    (None, Some(from)) => self.new_tab_in(&from, Some(&url), cx),
+                    (None, None) => self.with_model(|model| {
                         let _ = model.create_tab(&url);
                     }),
                 }
@@ -470,7 +478,7 @@ impl BrowserWindow {
     fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
         match shortcut {
             Shortcut::NewTab => match self.active_tab_id() {
-                Some(id) => self.new_tab_in(&id, cx),
+                Some(id) => self.new_tab_in(&id, None, cx),
                 None => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
             },
             Shortcut::CloseTab => {
@@ -994,7 +1002,22 @@ impl BrowserWindow {
     }
 
 
+    /// Collapses the expanded address field back to its tab pill, dropping any unsubmitted edit.
+    fn end_address_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.address_editing && !self.address_focused {
+            return;
+        }
+        window.blur();
+        self.address_focused = false;
+        self.address_editing = false;
+        self.refresh_url(cx);
+        cx.notify();
+    }
+
     fn request_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.blur_address) && !self.focus_address {
+            self.end_address_edit(window, cx);
+        }
         if !self.focus_address {
             return;
         }
@@ -1074,7 +1097,6 @@ impl Render for BrowserWindow {
         self.prepare_frames(&tabs);
         self.sync_groups();
         self.save_layouts(&tabs);
-        self.strip_since.retain(|_, since| since.elapsed() < STRIP_ANIM);
         if self.animating() {
             window.request_animation_frame();
         }
@@ -1512,7 +1534,6 @@ impl BrowserWindow {
                 continue;
             };
             let find = if active.as_deref() == Some(id.as_str()) && self.find_open { FIND_H } else { 0.0 };
-            let find = find + self.strip_h(&id);
             let rect = LogicalRect {
                 x: origin_x + f64::from(frame.x) + PAGE_INSET,
                 y: origin_y + f64::from(frame.y) + TITLE_H + find,
@@ -1739,8 +1760,7 @@ impl BrowserWindow {
                 .shadow_md()
                 .bg(paint.secondary)
                 .overflow_hidden()
-                .child(self.window_titlebar(tab, cx))
-                .when(members.len() > 1, |column| column.child(self.window_tabs(&tab.id, members, cx)))
+                .child(self.window_titlebar(tab, members, cx))
                 .when(active && self.find_open, |column| column.child(self.find_bar(cx)))
                 .child(div().flex_1().min_h(px(0.))),
         );
@@ -1794,7 +1814,8 @@ impl BrowserWindow {
         grip
     }
 
-    fn window_titlebar(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
+    /// Safari compact style: one row of nav, tabs and tools, where the shown tab is the address field.
+    fn window_titlebar(&self, tab: &browser_core::Tab, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         if let Some(ext) = self.chrome.get(&tab.id).and_then(|chrome| chrome.panel.clone()) {
             return self.panel_titlebar(&tab.id, &ext, cx);
         }
@@ -1802,7 +1823,6 @@ impl BrowserWindow {
         let id = tab.id.clone();
         let nav = self.nav_controls(&tab.id, cx);
         let tools = self.window_tools(&tab.id, cx);
-        let address = self.hit_guard(format!("addr-guard-{}", tab.id), self.address_slot(tab, cx), cx);
         div().child(
             h_stack()
                 .id(SharedString::from(format!("title-{id}")))
@@ -1817,14 +1837,97 @@ impl BrowserWindow {
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     this.begin_move(&id, event.position, cx);
                 }))
-                .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx))
-                .child(
-                    div().flex_1().h_full().px(px(28.)).flex().justify_center().items_center().child(
-                        div().w_full().max_w(px(560.)).child(address),
-                    ),
-                )
-                .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx)),
+                // Buttons keep their size; the tabs shrink, and the empty space either side drags the window.
+                .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx).flex_none())
+                .child(div().flex_1().min_w(px(8.)).h_full())
+                .child(self.compact_tabs(&tab.id, members, cx))
+                .child(div().flex_1().min_w(px(8.)).h_full())
+                .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx).flex_none()),
         )
+    }
+
+    /// Small centred tab pills; clicking the shown tab widens it into the address field.
+    fn compact_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let mut row = h_stack().min_w(px(0.)).h_full().items_center().gap(px(2.)).text_size(px(12.));
+        for tab in members {
+            let shown = tab.id == front;
+            if shown && tab.active && (self.address_editing || self.address_focused) {
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("ctab-{}", tab.id)))
+                        .w(px(520.))
+                        .min_w(px(120.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.suppress_window_drag = true))
+                        .child(self.address_slot(tab, cx)),
+                );
+                continue;
+            }
+            let id = tab.id.clone();
+            let close_id = tab.id.clone();
+            let hover_group = SharedString::from(format!("ctab-{id}"));
+            row = row.child(
+                h_stack()
+                    .id(SharedString::from(format!("ctab-{id}")))
+                    .group(hover_group.clone())
+                    .relative()
+                    // Shrinks to just the icon when the window is narrow.
+                    .min_w(px(28.))
+                    .max_w(px(160.))
+                    .h(px(28.))
+                    .px(px(8.))
+                    .gap(px(6.))
+                    .items_center()
+                    .rounded(px(8.))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .when(shown, |pill| pill.bg(paint.secondary).text_color(paint.fg))
+                    .when(!shown, |pill| pill.text_color(paint.muted).hover(|style| style.bg(paint.secondary.opacity(0.6)).text_color(paint.fg)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.suppress_window_drag = true))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        // Safari compact: a click selects a tab, a click on the selected one edits its address.
+                        let edit = this.is_front(&id) && this.active_tab_id().as_deref() == Some(id.as_str());
+                        this.focus_window(&id, cx);
+                        if edit {
+                            this.focus_address = true;
+                        }
+                    }))
+                    // The close button takes the favicon's place on hover, as in Safari.
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().group_hover(hover_group.clone(), |style| style.opacity(0.)).child(favicon(tab, false)))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("ctab-close-{close_id}")))
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .opacity(0.)
+                                    .group_hover(hover_group, |style| style.opacity(1.))
+                                    .hover(|style| style.bg(paint.border))
+                                    .child(Icons::cross_2().size(px(10.)).text_color(paint.fg))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.with_model(|model| { let _ = model.close_tab(&close_id); });
+                                        this.refresh_url(cx);
+                                    })),
+                            ),
+                    )
+                    .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
+            );
+        }
+        row
     }
 
     /// `[icon] Name ──── [×]`: a side panel needs no address bar or navigation.
@@ -1886,7 +1989,10 @@ impl BrowserWindow {
             .border_1()
             .text_size(px(12.));
         if editing {
-            return pill.border_color(paint.accent.opacity(0.6)).child(
+            return pill
+                .border_color(paint.accent.opacity(0.6))
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| this.end_address_edit(window, cx)))
+                .child(
                 input(&self.address, cx)
                     .placeholder("Search or enter an address")
                     .cursor_color(paint.accent)
@@ -1953,7 +2059,7 @@ impl BrowserWindow {
                 this.bookmark();
             }))
             .child(self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
-                this.new_tab_in(&new_tab_id, cx);
+                this.new_tab_in(&new_tab_id, None, cx);
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
             .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, cx| {
@@ -2108,7 +2214,6 @@ impl BrowserWindow {
 
     /// Blob hanging from the title bar; hovering grows it into a shelf of this space's windows.
     fn dock(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
         let p = self.dock_progress();
         let active = self.active_tab_id().map(|id| self.group_id(&id));
         let mut groups: Vec<(String, Vec<&browser_core::Tab>)> = Vec::new();
@@ -2119,22 +2224,21 @@ impl BrowserWindow {
                 None => groups.push((group, vec![tab])),
             }
         }
-        let hover_bg = paint.fg.opacity(0.06);
+        // Dynamic Island: always black, light marks on top, in either theme.
+        let island = gpui::black();
+        let ink = gpui::white();
         let tile = |id: SharedString, width: f32| {
-            v_stack()
+            div()
                 .id(id)
                 .relative()
                 .flex_none()
                 .w(px(width))
-                .py(px(6.))
-                .px(px(6.))
-                .gap(px(5.))
+                .h(px(DOCK_TILE_H))
+                .flex()
                 .items_center()
-                .rounded(px(12.))
+                .justify_center()
+                .rounded_full()
                 .cursor_pointer()
-        };
-        let caption = |text: String, color: gpui::Hsla| {
-            div().w_full().text_size(px(11.)).text_color(color).text_center().truncate().child(text)
         };
         let mut shelf = h_stack().flex_none().items_center().gap(px(DOCK_GAP));
         let mut count = 0;
@@ -2148,27 +2252,26 @@ impl BrowserWindow {
             let current = active.as_deref() == Some(group.as_str());
             shelf = shelf.child(
                 tile(SharedString::from(format!("dock-{group}")), DOCK_ITEM_W)
-                    .when(current, |item| item.bg(paint.fg.opacity(0.09)))
-                    .when(!current, |item| item.hover(|style| style.bg(hover_bg)))
+                    .when(current, |item| item.bg(ink.opacity(0.16)))
+                    .when(!current, |item| item.hover(|style| style.bg(ink.opacity(0.08))))
                     .when(minimized, |item| item.opacity(0.45))
-                    .child(div().h(px(24.)).flex().items_center().child(favicon_stack(members, paint.surface)))
-                    .child(caption(tab_label(&front.title, &front.url), if current { paint.fg } else { paint.muted }))
+                    .child(favicon_stack(members, island))
                     .when(members.len() > 1, |item| {
                         item.child(
                             div()
                                 .absolute()
-                                .top(px(4.))
-                                .right(px(6.))
-                                .min_w(px(16.))
-                                .h(px(16.))
-                                .px(px(4.))
+                                .top(px(0.))
+                                .right(px(0.))
+                                .min_w(px(14.))
+                                .h(px(14.))
+                                .px(px(3.))
                                 .rounded_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(paint.fg.opacity(0.16))
-                                .text_size(px(10.))
-                                .text_color(paint.fg)
+                                .bg(ink.opacity(0.22))
+                                .text_size(px(9.))
+                                .text_color(ink)
                                 .child(members.len().to_string()),
                         )
                     })
@@ -2176,34 +2279,24 @@ impl BrowserWindow {
             );
         }
         let shelf = shelf
-            .child(div().flex_none().w(px(1.)).h(px(36.)).bg(paint.border))
+            .child(div().flex_none().w(px(1.)).h(px(18.)).bg(ink.opacity(0.18)))
             .child(
                 tile("dock-new".into(), DOCK_NEW_W)
-                    .hover(|style| style.bg(hover_bg))
-                    .child(
-                        div()
-                            .size(px(24.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .border_1()
-                            .border_color(paint.border)
-                            .child(Icons::plus().size(px(12.)).text_color(paint.muted)),
-                    )
-                    .child(caption("New".into(), paint.muted))
+                    .hover(|style| style.bg(ink.opacity(0.08)))
+                    .child(Icons::plus().size(px(14.)).text_color(ink.opacity(0.7)))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); });
                         this.focus_address = true;
                         this.refresh_url(cx);
                     })),
             );
-        // Every child has a fixed width, so the card opens to exactly fit its content.
-        let shelf_w = DOCK_PAD * 2.0 + 2.0 + count as f32 * (DOCK_ITEM_W + DOCK_GAP) + 1.0 + DOCK_GAP + DOCK_NEW_W;
+        // Every child has a fixed width, so the island opens to exactly fit its content.
+        let shelf_w = DOCK_PAD * 2.0 + count as f32 * (DOCK_ITEM_W + DOCK_GAP) + 1.0 + DOCK_GAP + DOCK_NEW_W;
         let lerp = |a: f32, b: f32| a + (b - a) * p;
         let height = lerp(DOCK_REST_H, DOCK_OPEN_H);
-        // A pill at rest; opening rounds off to a card corner rather than staying a stadium.
-        let radius = (height / 2.0).min(lerp(DOCK_REST_H / 2.0, 18.));
+        // A capsule at every size, like the island. No shadow: it would darken the chrome around it
+        // but not the pages, which show through holes in the chrome.
+        let radius = height / 2.0;
         div()
             .absolute()
             .top(px(TITLEBAR_H))
@@ -2215,7 +2308,7 @@ impl BrowserWindow {
                 // Padding widens the hover target well past the resting pill.
                 div()
                     .id("dock")
-                    .pt(px(lerp(2., 8.)))
+                    .pt(px(lerp(2., 6.)))
                     .px(px(28.))
                     .pb(px(12.))
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| this.set_dock(*hovered, cx)))
@@ -2226,19 +2319,16 @@ impl BrowserWindow {
                             .h(px(height))
                             .overflow_hidden()
                             .rounded(px(radius))
-                            .bg(mix(paint.fg.opacity(0.45), paint.surface, p))
-                            .border_1()
-                            .border_color(paint.border.opacity(p))
-                            .when(p > 0.01, |blob| blob.shadow_lg())
+                            .bg(island)
                             .child(measure_overlay(f64::from(radius), cx))
                             .child(
-                                // Laid out at full height and slid down into view, so items never squash while the card grows.
+                                // Laid out at full height and slid down into view, so items never squash while the island grows.
                                 h_stack()
                                     .absolute()
                                     .left_0()
                                     .right_0()
-                                    .top(px(lerp(-12., 0.)))
-                                    .h(px(DOCK_OPEN_H - 2.))
+                                    .top(px(lerp(-8., 0.)))
+                                    .h(px(DOCK_OPEN_H))
                                     .items_center()
                                     .justify_center()
                                     .opacity(((p - 0.3) / 0.7).clamp(0., 1.))
@@ -2248,96 +2338,19 @@ impl BrowserWindow {
             )
     }
 
-    /// macOS-style tab row: equal-width tabs with centred titles, shown once a window holds two or more.
-    fn window_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let mut row = h_stack()
-            .h(px(self.strip_h(front) as f32))
-            .flex_none()
-            .w_full()
-            .overflow_hidden()
-            .bg(paint.bg)
-            .border_b_1()
-            .border_color(paint.border)
-            .text_size(px(12.));
-        for (index, tab) in members.iter().enumerate() {
-            let shown = tab.id == front;
-            let id = tab.id.clone();
-            let close_id = tab.id.clone();
-            let hover_group = SharedString::from(format!("wtab-{id}"));
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("wtab-{id}")))
-                    .group(hover_group.clone())
-                    .relative()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .when(index > 0, |cell| cell.border_l_1().border_color(paint.border))
-                    .when(shown, |cell| cell.bg(paint.surface).text_color(paint.fg))
-                    .when(!shown, |cell| cell.text_color(paint.muted).hover(|style| style.bg(paint.secondary.opacity(0.5))))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.focus_window(&id, cx)))
-                    .child(
-                        h_stack()
-                            .min_w(px(0.))
-                            .px(px(26.))
-                            .gap(px(6.))
-                            .items_center()
-                            .child(favicon(tab, false))
-                            .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(3.))
-                            .top_0()
-                            .bottom_0()
-                            .flex()
-                            .items_center()
-                            .opacity(0.)
-                            .group_hover(hover_group, |style| style.opacity(1.))
-                            .child(self.tool_button(format!("wtab-close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
-                                this.with_model(|model| { let _ = model.close_tab(&close_id); });
-                                this.refresh_url(cx);
-                            })),
-                    ),
-            );
-        }
-        let front = front.to_string();
-        row.child(
-            div()
-                .flex_none()
-                .h_full()
-                .px(px(2.))
-                .flex()
-                .items_center()
-                .border_l_1()
-                .border_color(paint.border)
-                .child(self.tool_button(format!("wtab-new-{front}"), Icons::plus(), false, cx, move |this, cx| {
-                    this.new_tab_in(&front, cx);
-                })),
-        )
-    }
-
-    /// Opens a new tab inside the window holding `id`, sharing its frame.
-    fn new_tab_in(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// Opens a new tab inside the window holding `id`, sharing its frame. `None` opens the new-tab page
+    /// with the address field focused.
+    fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
         chrome.window = Some(group.clone());
-        let created = self.with_model(|model| model.create_tab(&model.settings.new_tab_url()));
+        let created = self.with_model(|model| model.create_tab(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string)));
         let Ok(new) = created else {
             return;
         };
-        if self.group_len(id) == 1 {
-            self.strip_since.insert(group, Instant::now());
-        }
         self.chrome.insert(new.clone(), chrome);
         self.focus_window(&new, cx);
-        self.focus_address = true;
+        self.focus_address = url.is_none();
     }
 
     /// The window a tab belongs to; a tab never added to another window is its own.
@@ -2374,15 +2387,6 @@ impl BrowserWindow {
         }
     }
 
-    /// Height of the window's tab row, sliding open just after a second tab joins.
-    fn strip_h(&self, id: &str) -> f64 {
-        if self.group_len(id) < 2 {
-            return 0.0;
-        }
-        let t = self.strip_since.get(&self.group_id(id)).map_or(1.0, |since| ease(since.elapsed().as_secs_f32() / STRIP_ANIM.as_secs_f32()));
-        TABS_H * f64::from(t)
-    }
-
     fn dock_progress(&self) -> f32 {
         let target = if self.dock_open { 1.0 } else { 0.0 };
         self.dock_from + (target - self.dock_from) * ease(self.dock_at.elapsed().as_secs_f32() / DOCK_ANIM.as_secs_f32())
@@ -2406,7 +2410,7 @@ impl BrowserWindow {
     }
 
     fn animating(&self) -> bool {
-        self.dock_at.elapsed() < DOCK_ANIM || !self.strip_since.is_empty()
+        self.dock_at.elapsed() < DOCK_ANIM
     }
 
     fn panel_icon(
@@ -2974,29 +2978,21 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
 }
 
 pub(crate) const TITLEBAR_H: f32 = 38.0;
-/// Height of a window's tab row once it holds two or more tabs.
-const TABS_H: f64 = 30.0;
-const STRIP_ANIM: Duration = Duration::from_millis(200);
 const DOCK_ANIM: Duration = Duration::from_millis(260);
 const DOCK_REST_W: f32 = 56.0;
 /// At rest the pill sits in the inset gap above top-snapped windows (2px + 5px < SNAP_INSET).
 const DOCK_REST_H: f32 = 5.0;
-const DOCK_OPEN_H: f32 = 74.0;
+const DOCK_OPEN_H: f32 = 44.0;
 const DOCK_GAP: f32 = 4.0;
-const DOCK_PAD: f32 = 8.0;
-/// Width of a window tile in the open dock, and of its new-window tile.
-const DOCK_ITEM_W: f32 = 84.0;
-const DOCK_NEW_W: f32 = 56.0;
+const DOCK_PAD: f32 = 6.0;
+/// Width of a window tile in the open dock (fits a three-icon stack), and of its new-window tile.
+const DOCK_ITEM_W: f32 = 54.0;
+const DOCK_NEW_W: f32 = 32.0;
+const DOCK_TILE_H: f32 = 32.0;
 
 /// Ease-out cubic over t in 0..=1: quick start, soft landing.
 fn ease(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
-}
-
-/// Colour `t` of the way from `a` to `b`.
-fn mix(a: gpui::Hsla, b: gpui::Hsla, t: f32) -> gpui::Hsla {
-    let at = |x: f32, y: f32| x + (y - x) * t;
-    gpui::hsla(at(a.h, b.h), at(a.s, b.s), at(a.l, b.l), at(a.a, b.a))
 }
 
 /// Empty title bar space that drags the app window and zooms it on double click.

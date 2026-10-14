@@ -38,9 +38,12 @@ pub fn patch_missing_apis(dir: &Path) -> anyhow::Result<()> {
 
 /// Chrome enum constants WebKit lacks, as the values Chrome gives them. They can't be polyfilled:
 /// WebKit's API objects take no new properties, and swapping the `chrome` global breaks popups.
-const CONSTANTS: [(&str, &str); 2] = [
+/// Also Chrome's extension URL scheme: code that trusts `sender.url` only when it starts with
+/// `chrome-extension://<id>/` (Kluff's sign-in) would reject its own pages here.
+const CONSTANTS: [(&str, &str); 3] = [
     ("chrome.scripting.ExecutionWorld.ISOLATED", "\"ISOLATED\""),
     ("chrome.scripting.ExecutionWorld.MAIN", "\"MAIN\""),
+    ("chrome-extension://", "webkit-extension://"),
 ];
 
 /// Adds the polyfill as the first script of every extension page (popup, options, side panel,
@@ -90,6 +93,7 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), r#"{"background":{"service_worker":"sw.js","type":"module"}}"#).unwrap();
         std::fs::write(dir.join("src/panel.html"), "<html><head><title>x</title></head></html>").unwrap();
         std::fs::write(dir.join("src/inject.js"), "run({world:chrome.scripting.ExecutionWorld.MAIN})").unwrap();
+        std::fs::write(dir.join("src/senders.js"), "u.startsWith(`chrome-extension://${id}/`)").unwrap();
         patch_missing_apis(&dir).unwrap();
         patch_missing_apis(&dir).unwrap();
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -98,6 +102,7 @@ mod tests {
         let html = std::fs::read_to_string(dir.join("src/panel.html")).unwrap();
         assert_eq!(html, "<html><head><script src=\"/nx-polyfill.js\"></script><title>x</title></head></html>");
         assert_eq!(std::fs::read_to_string(dir.join("src/inject.js")).unwrap(), "run({world:\"MAIN\"})");
+        assert_eq!(std::fs::read_to_string(dir.join("src/senders.js")).unwrap(), "u.startsWith(`webkit-extension://${id}/`)");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

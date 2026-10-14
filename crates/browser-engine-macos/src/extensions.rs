@@ -831,7 +831,7 @@ define_class!(
             } else {
                 shared.borrow_mut().pending_tabs.push((url.clone(), reply.copy()));
             }
-            let _ = shared.borrow().events.send(EngineEvent::OpenInNewTab { url });
+            let _ = shared.borrow().events.send(EngineEvent::OpenInNewTab { url, from: None });
         }
 
         #[unsafe(method(webExtensionController:openNewWindowUsingConfiguration:forExtensionContext:completionHandler:))]
@@ -845,7 +845,7 @@ define_class!(
             // Every page here is its own floating window already; open the URLs as pages of the one browser window.
             for url in unsafe { configuration.tabURLs() }.iter() {
                 if let Some(url) = url.absoluteString() {
-                    send(&self.ivars().shared, EngineEvent::OpenInNewTab { url: url.to_string() });
+                    send(&self.ivars().shared, EngineEvent::OpenInNewTab { url: url.to_string(), from: None });
                 }
             }
             let window = window_of(&self.ivars().shared, &self.ivars().store);
@@ -855,7 +855,7 @@ define_class!(
         #[unsafe(method(webExtensionController:openOptionsPageForExtensionContext:completionHandler:))]
         unsafe fn open_options(&self, _controller: &WKWebExtensionController, context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
             if let Some(url) = url_string(unsafe { context.optionsPageURL() }) {
-                send(&self.ivars().shared, EngineEvent::OpenInNewTab { url });
+                send(&self.ivars().shared, EngineEvent::OpenInNewTab { url, from: None });
             }
             done(reply);
         }
@@ -967,7 +967,7 @@ define_class!(
             _window_features: &WKWindowFeatures,
         ) -> Option<Retained<WKWebView>> {
             if let Some(url) = url_string(unsafe { navigation_action.request() }.URL()) {
-                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url });
+                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url, from: None });
                 unsafe { self.ivars().action.closePopup() };
             }
             None
