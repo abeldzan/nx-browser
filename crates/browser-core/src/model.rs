@@ -71,15 +71,14 @@ pub struct DownloadRecord {
 
 #[derive(Clone, Debug)]
 pub struct ExtensionRecord {
+    /// Chrome-style 32-letter id; also WebKit's unique identifier and `webkit-extension://` host.
     pub id: String,
     pub name: String,
     pub path: PathBuf,
+    /// `store` (unpacked into app support), `unpacked` (a folder the user picked) or `bundled`.
+    pub source: String,
     pub enabled: bool,
-    pub permissions: Vec<String>,
-    pub host_permissions: Vec<String>,
-    pub matches: Vec<String>,
-    pub content_script: String,
-    pub background: Option<String>,
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +109,6 @@ pub struct ProfileBundle {
     pub tabs: Vec<BundleTab>,
     pub bookmarks: Vec<BundleBookmark>,
     pub history: Vec<BundleHistory>,
-    pub extension_storage: Vec<BundleStorage>,
     pub permissions: Vec<BundlePermission>,
 }
 
@@ -142,13 +140,6 @@ pub struct BundleHistory {
     pub url: String,
     pub title: String,
     pub visited_at: i64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BundleStorage {
-    pub extension_id: String,
-    pub key: String,
-    pub value: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,8 +320,8 @@ impl Model {
         self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
         self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM extension_storage WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", params![id])?;
         self.reload()?;
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
@@ -721,42 +712,60 @@ impl Model {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn replace_extensions(&mut self, extensions: Vec<ExtensionRecord>) -> anyhow::Result<()> {
-        for extension in &extensions {
-            let manifest = serde_json::json!({
-                "name": extension.name,
-                "permissions": extension.permissions,
-                "host_permissions": extension.host_permissions,
-            });
-            self.storage.execute(
-                "INSERT INTO extensions (id, path, enabled, manifest_json) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET path = excluded.path, manifest_json = excluded.manifest_json",
-                params![
-                    extension.id,
-                    extension.path.display().to_string(),
-                    extension.enabled as i32,
-                    manifest.to_string()
-                ],
-            )?;
-        }
-        let mut merged = extensions;
-        for extension in &mut merged {
-            if let Ok(enabled) = self.storage.conn().query_row(
-                "SELECT enabled FROM extensions WHERE id = ?1",
-                params![extension.id],
-                |row| row.get::<_, i32>(0),
-            ) {
-                extension.enabled = enabled != 0;
-            }
-        }
-        self.extensions = merged;
+    /// Adds or updates an installed extension, keeping its enabled and pinned flags.
+    pub fn upsert_extension(&mut self, id: &str, name: &str, path: &Path, source: &str) -> anyhow::Result<()> {
+        self.storage.execute(
+            "INSERT INTO extensions (id, path, enabled, manifest_json, source) VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET path = excluded.path, manifest_json = excluded.manifest_json, source = excluded.source",
+            params![id, path.display().to_string(), serde_json::json!({ "name": name }).to_string(), source],
+        )?;
+        self.storage.execute(
+            "INSERT OR IGNORE INTO profile_extensions (profile_id, extension_id) VALUES (?1, ?2)",
+            params![self.active_profile_id, id],
+        )?;
+        self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
         Ok(())
+    }
+
+    /// Removes the extension from the active profile; true when no profile has it any more.
+    pub fn remove_extension(&mut self, id: &str) -> anyhow::Result<bool> {
+        self.storage.execute(
+            "DELETE FROM profile_extensions WHERE profile_id = ?1 AND extension_id = ?2",
+            params![self.active_profile_id, id],
+        )?;
+        self.extensions.retain(|extension| extension.id != id);
+        let last = !self
+            .storage
+            .conn()
+            .prepare("SELECT 1 FROM profile_extensions WHERE extension_id = ?1")?
+            .exists(params![id])?;
+        if last {
+            self.storage.execute("DELETE FROM extensions WHERE id = ?1", params![id])?;
+        }
+        Ok(last)
+    }
+
+    /// Data stores of every profile that has this extension installed and enabled.
+    pub fn extension_stores(&self, id: &str) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self.storage.conn().prepare(
+            "SELECT p.data_store_id FROM profile_extensions l JOIN profiles p ON p.id = l.profile_id
+             WHERE l.extension_id = ?1 AND l.enabled = 1",
+        )?;
+        let rows = stmt.query_map(params![id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Every extension installed in any profile: id, folder and source.
+    pub fn installed_extensions(&self) -> anyhow::Result<Vec<(String, PathBuf, String)>> {
+        let mut stmt = self.storage.conn().prepare("SELECT id, path, source FROM extensions ORDER BY rowid")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, PathBuf::from(row.get::<_, String>(1)?), row.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn set_extension_enabled(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
         self.storage.execute(
-            "UPDATE extensions SET enabled = ?1 WHERE id = ?2",
-            params![enabled as i32, id],
+            "UPDATE profile_extensions SET enabled = ?1 WHERE profile_id = ?2 AND extension_id = ?3",
+            params![enabled as i32, self.active_profile_id, id],
         )?;
         if let Some(extension) = self.extensions.iter_mut().find(|extension| extension.id == id) {
             extension.enabled = enabled;
@@ -764,95 +773,15 @@ impl Model {
         Ok(())
     }
 
-    pub fn storage_get(&self, extension_id: &str, key: &str) -> anyhow::Result<Option<String>> {
-        let value = self.storage.conn().query_row(
-            "SELECT value FROM extension_storage WHERE profile_id = ?1 AND extension_id = ?2 AND key = ?3",
-            params![self.active_profile_id, extension_id, key],
-            |row| row.get(0),
-        );
-        match value {
-            Ok(value) => Ok(Some(value)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    pub fn storage_set(&self, extension_id: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    pub fn set_extension_pinned(&mut self, id: &str, pinned: bool) -> anyhow::Result<()> {
         self.storage.execute(
-            "INSERT INTO extension_storage (profile_id, extension_id, key, value) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(profile_id, extension_id, key) DO UPDATE SET value = excluded.value",
-            params![self.active_profile_id, extension_id, key, value],
+            "UPDATE profile_extensions SET pinned = ?1 WHERE profile_id = ?2 AND extension_id = ?3",
+            params![pinned as i32, self.active_profile_id, id],
         )?;
+        if let Some(extension) = self.extensions.iter_mut().find(|extension| extension.id == id) {
+            extension.pinned = pinned;
+        }
         Ok(())
-    }
-
-    pub fn extension_call(&mut self, extension_id: &str, method: &str, args: &serde_json::Value) -> serde_json::Value {
-        let Some(extension) = self.extensions.iter().find(|item| item.id == extension_id).cloned() else {
-            return error_value("unknown extension");
-        };
-        if !extension.enabled {
-            return error_value("extension disabled");
-        }
-        match method {
-            "storage.get" => {
-                if !extension.permissions.iter().any(|item| item == "storage") {
-                    return error_value("missing storage permission");
-                }
-                let key = args.get("key").and_then(|value| value.as_str()).unwrap_or("");
-                match self.storage_get(extension_id, key) {
-                    Ok(Some(value)) => ok_value(serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value))),
-                    Ok(None) => ok_value(serde_json::Value::Null),
-                    Err(err) => error_value(&err.to_string()),
-                }
-            }
-            "storage.set" => {
-                if !extension.permissions.iter().any(|item| item == "storage") {
-                    return error_value("missing storage permission");
-                }
-                let Some(items) = args.get("items").and_then(|value| value.as_object()) else {
-                    return error_value("storage.set expects an object");
-                };
-                for (key, value) in items {
-                    if self.storage_set(extension_id, key, &value.to_string()).is_err() {
-                        return error_value("storage write failed");
-                    }
-                }
-                ok_value(serde_json::json!({}))
-            }
-            "tabs.query" => {
-                if !extension.permissions.iter().any(|item| item == "tabs") {
-                    return error_value("missing tabs permission");
-                }
-                let tabs = self
-                    .session_tabs()
-                    .into_iter()
-                    .map(|tab| serde_json::json!({ "id": tab.id, "url": tab.url, "title": tab.title, "active": tab.active }))
-                    .collect::<Vec<_>>();
-                ok_value(serde_json::Value::Array(tabs))
-            }
-            "tabs.create" => {
-                if !extension.permissions.iter().any(|item| item == "tabs") {
-                    return error_value("missing tabs permission");
-                }
-                let url = args.get("url").and_then(|value| value.as_str()).unwrap_or("nxbrowser://home");
-                match self.create_tab(url) {
-                    Ok(id) => ok_value(serde_json::json!({ "id": id, "url": url })),
-                    Err(err) => error_value(&err.to_string()),
-                }
-            }
-            "tabs.remove" => {
-                if !extension.permissions.iter().any(|item| item == "tabs") {
-                    return error_value("missing tabs permission");
-                }
-                let id = args.get("tabId").and_then(|value| value.as_str()).unwrap_or("");
-                match self.close_tab(id) {
-                    Ok(()) => ok_value(serde_json::json!({})),
-                    Err(err) => error_value(&err.to_string()),
-                }
-            }
-            "runtime.sendMessage" => ok_value(args.get("message").cloned().unwrap_or(serde_json::Value::Null)),
-            _ => error_value("unknown method"),
-        }
     }
 
     pub fn export_active(&self) -> anyhow::Result<ProfileBundle> {
@@ -880,18 +809,6 @@ impl Model {
                 visited_at: item.visited_at,
             })
             .collect();
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT extension_id, key, value FROM extension_storage WHERE profile_id = ?1",
-        )?;
-        let extension_storage = stmt
-            .query_map(params![profile.id], |row| {
-                Ok(BundleStorage {
-                    extension_id: row.get(0)?,
-                    key: row.get(1)?,
-                    value: row.get(2)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
         let permissions = self
             .permissions_map()?
             .into_iter()
@@ -911,7 +828,6 @@ impl Model {
             tabs,
             bookmarks,
             history,
-            extension_storage,
             permissions,
         })
     }
@@ -948,9 +864,6 @@ impl Model {
                 "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, ?3, ?4)",
                 params![id, entry.url, entry.title, entry.visited_at],
             )?;
-        }
-        for item in bundle.extension_storage {
-            self.storage_set(&item.extension_id, &item.key, &item.value)?;
         }
         for permission in bundle.permissions {
             self.set_permission(&permission.origin, &permission.permission, &permission.decision)?;
@@ -1114,16 +1027,30 @@ impl Model {
                 self.active_session_id = session.id.clone();
             }
         }
+        self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
         Ok(())
     }
 }
 
-fn error_value(message: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": false, "error": message, "value": null })
-}
-
-fn ok_value(value: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "error": "", "value": value })
+fn query_extensions(storage: &Storage, profile_id: &str) -> anyhow::Result<Vec<ExtensionRecord>> {
+    let mut stmt = storage.conn().prepare(
+        "SELECT e.id, e.path, l.enabled, e.manifest_json, e.source, l.pinned
+         FROM extensions e JOIN profile_extensions l ON l.extension_id = e.id AND l.profile_id = ?1
+         ORDER BY e.rowid",
+    )?;
+    let rows = stmt.query_map(params![profile_id], |row| {
+        let manifest: String = row.get(3)?;
+        let name = serde_json::from_str::<serde_json::Value>(&manifest).ok().and_then(|json| json["name"].as_str().map(str::to_string));
+        Ok(ExtensionRecord {
+            id: row.get(0)?,
+            path: PathBuf::from(row.get::<_, String>(1)?),
+            enabled: row.get::<_, i32>(2)? != 0,
+            name: name.unwrap_or_default(),
+            source: row.get(4)?,
+            pinned: row.get::<_, i32>(5)? != 0,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
@@ -1211,6 +1138,23 @@ mod tests {
     }
 
     #[test]
+    fn extensions_install_per_profile() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let first = model.active_profile_id.clone();
+        model.upsert_extension("ext", "Ext", Path::new("/x"), "store").unwrap();
+        model.create_profile("Work").unwrap();
+        assert!(model.extensions.is_empty(), "new profile starts without extensions");
+        model.upsert_extension("ext", "Ext", Path::new("/x"), "store").unwrap();
+        model.set_extension_enabled("ext", false).unwrap();
+        assert_eq!(model.extension_stores("ext").unwrap().len(), 1);
+        assert!(!model.remove_extension("ext").unwrap(), "first profile still has it");
+        model.switch_profile(&first).unwrap();
+        assert_eq!(model.extensions.len(), 1);
+        assert!(model.remove_extension("ext").unwrap());
+        assert!(model.installed_extensions().unwrap().is_empty());
+    }
+
+    #[test]
     fn appearance_and_settings_persist() {
         let path = std::env::temp_dir().join(format!("nxbrowser-test-{}.sqlite", Uuid::new_v4()));
         let mut model = Model::open(Storage::open(&path).unwrap()).unwrap();
@@ -1260,22 +1204,19 @@ mod tests {
     }
 
     #[test]
-    fn extension_storage_requires_permission() {
-        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
-        model
-            .replace_extensions(vec![ExtensionRecord {
-                id: "ext".into(),
-                name: "Ext".into(),
-                path: PathBuf::new(),
-                enabled: true,
-                permissions: vec![],
-                host_permissions: vec![],
-                matches: vec![],
-                content_script: String::new(),
-                background: None,
-            }])
-            .unwrap();
-        let denied = model.extension_call("ext", "storage.get", &serde_json::json!({"key": "a"}));
-        assert_eq!(denied["ok"], false);
+    fn extension_flags_survive_reinstall_and_reopen() {
+        let path = std::env::temp_dir().join(format!("nxbrowser-test-{}.sqlite", Uuid::new_v4()));
+        let mut model = Model::open(Storage::open(&path).unwrap()).unwrap();
+        model.upsert_extension("abc", "Ext", Path::new("/tmp/ext"), "store").unwrap();
+        model.set_extension_pinned("abc", true).unwrap();
+        model.set_extension_enabled("abc", false).unwrap();
+        model.upsert_extension("abc", "Ext 2", Path::new("/tmp/ext"), "store").unwrap();
+        drop(model);
+        let mut model = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let ext = &model.extensions[0];
+        assert_eq!((ext.name.as_str(), ext.enabled, ext.pinned), ("Ext 2", false, true));
+        model.remove_extension("abc").unwrap();
+        assert!(model.extensions.is_empty());
+        let _ = std::fs::remove_file(path);
     }
 }

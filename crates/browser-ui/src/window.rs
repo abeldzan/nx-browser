@@ -5,17 +5,18 @@ use crate::tabs::tab_label;
 use crate::SharedModel;
 use browser_core::{
     app_support_dir, downloads_dir, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
-    ExtensionRecord, Model,
+    Model,
 };
-use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, Shortcut, WebEngine};
-use browser_engine_macos::{choose_open_path, choose_save_path, MacEngine};
-use browser_extensions::{load_extension_dirs, BackgroundRuntime, HostFn};
+use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
+use browser_engine_macos::{choose_folder_path, choose_open_path, choose_save_path, MacEngine, EXTENSION_SCHEME};
+use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
 use browser_storage::Storage;
 use gpui::{
     canvas, div, img, prelude::*, px, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
     Subscription, Window,
 };
+use crate::extensions::extension_icon;
 use crate::settings::measure_overlay;
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
@@ -38,7 +39,18 @@ use uuid::Uuid;
 pub struct BrowserWindow {
     pub(crate) model: SharedModel,
     pub(crate) engine: MacEngine,
-    runtime: BackgroundRuntime,
+    /// Store URL or extension id typed in the extensions panel.
+    pub(crate) ext_input: Entity<InputState>,
+    /// What each installed extension's manifest says, by id.
+    pub(crate) ext_meta: HashMap<String, Manifest>,
+    /// Permission requests from extensions: (prompt, extension id, what it asks for).
+    pub(crate) ext_prompts: Vec<(u64, String, String)>,
+    /// Store ids being downloaded, and where finished installs report back.
+    pub(crate) installing: Vec<String>,
+    installs_tx: Sender<(String, Result<std::path::PathBuf, String>)>,
+    installs_rx: Receiver<(String, Result<std::path::PathBuf, String>)>,
+    /// Last tab reported to extensions as active.
+    ext_active: Option<String>,
     address: Entity<InputState>,
     find_input: Entity<InputState>,
     rename_input: Entity<InputState>,
@@ -56,6 +68,7 @@ pub struct BrowserWindow {
     pub(crate) overlay_rects: Vec<(LogicalRect, f64)>,
     /// Right-click menu on a rail profile: (profile id, index, click position).
     pub(crate) downloads_open: bool,
+    pub(crate) extensions_open: bool,
     /// Icon and color picked in the new-profile modal while it is open.
     pub(crate) new_profile: Option<(String, String)>,
     pub(crate) new_profile_input: Entity<InputState>,
@@ -104,6 +117,8 @@ struct SelfTest {
     value_a: Option<String>,
     value_b: Option<String>,
     sum: Option<String>,
+    /// Whether the example extension's content script ran in tab A.
+    ext: Option<String>,
     started: Instant,
 }
 
@@ -121,7 +136,8 @@ impl BrowserWindow {
         }
         model.request_show_active();
         let model = Arc::new(Mutex::new(model));
-        let runtime = BackgroundRuntime::new(host(Arc::clone(&model)));
+        let (installs_tx, installs_rx) = mpsc::channel();
+        let ext_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let (downloads_tx, downloads_rx) = mpsc::channel();
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -190,6 +206,14 @@ impl BrowserWindow {
                 // Keeps the badge preview in step with the typed name.
                 _ => cx.notify(),
             }),
+            cx.subscribe(&ext_input, |this, input, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit => {
+                    let raw = input.read(cx).content().to_string();
+                    this.install_from_input(&raw, cx);
+                }
+                _ => {}
+            }),
             cx.subscribe(&name_input, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::Submit => this.save_profile_name(cx),
@@ -199,7 +223,13 @@ impl BrowserWindow {
         let mut view = Self {
             model,
             engine: MacEngine::new(),
-            runtime,
+            ext_input,
+            ext_meta: HashMap::new(),
+            ext_prompts: Vec::new(),
+            installing: Vec::new(),
+            installs_tx,
+            installs_rx,
+            ext_active: None,
             address,
             find_input,
             rename_input,
@@ -214,6 +244,7 @@ impl BrowserWindow {
             overlay_rects: Vec::new(),
             rail_menu: None,
             downloads_open: false,
+            extensions_open: false,
             new_profile: None,
             new_profile_input,
             download_progress: HashMap::new(),
@@ -246,6 +277,7 @@ impl BrowserWindow {
                 value_a: None,
                 value_b: None,
                 sum: None,
+                ext: None,
                 started: Instant::now(),
             }),
             cookies_saved: Instant::now(),
@@ -288,6 +320,18 @@ impl BrowserWindow {
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.drain(cx);
         self.warm_tabs();
+        while let Ok((id, result)) = self.installs_rx.try_recv() {
+            self.installing.retain(|pending| pending != &id);
+            match result {
+                Ok(path) => self.add_extension(&id, &path, "store"),
+                Err(error) => self.status = format!("Install failed: {error}").into(),
+            }
+        }
+        let active = self.active_tab_id();
+        if active.is_some() && active != self.ext_active {
+            self.engine.extensions().activated(active.as_deref().unwrap_or_default());
+            self.ext_active = active;
+        }
         if let Some(id) = self.engine.take_page_click() {
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
@@ -377,16 +421,20 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Failed { message, .. } => self.status = message.into(),
-            EngineEvent::ScriptMessage { tab_id, body } => self.on_script_message(&tab_id, &body),
             EngineEvent::Download { url, .. } => self.start_download(&url),
             EngineEvent::Permission { origin, kind, .. } => {
                 self.permission = Some((origin.clone(), kind.clone()));
                 self.status = format!("Permission request: {kind} for {origin}").into();
             }
             EngineEvent::OpenInNewTab { url } => {
-                self.with_model(|model| {
-                    let _ = model.create_tab(&url);
-                });
+                // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
+                let panel = self.ext_meta.keys().find(|id| self.panel_url(id).as_deref() == Some(url.as_str())).cloned();
+                match panel {
+                    Some(id) => self.open_extension_panel(&id, &url, cx),
+                    None => self.with_model(|model| {
+                        let _ = model.create_tab(&url);
+                    }),
+                }
             }
             EngineEvent::Alert { message } => self.status = message.into(),
             EngineEvent::Eval { token, value, .. } if token == "favicon" => {
@@ -403,11 +451,19 @@ impl BrowserWindow {
                         "a" => test.value_a = Some(value),
                         "b" => test.value_b = Some(value),
                         "sum" => test.sum = Some(value),
+                        "ext" => test.ext = Some(value),
                         _ => {}
                     }
                 }
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
+            EngineEvent::ExtensionChanged { .. } => cx.notify(),
+            EngineEvent::ExtensionPrompt { prompt, id, request } => {
+                self.ext_prompts.push((prompt, id, request));
+                self.extensions_open = true;
+            }
+            EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
+            EngineEvent::CloseTab { tab_id } => self.with_model(|model| { let _ = model.close_tab(&tab_id); }),
         }
     }
 
@@ -437,25 +493,6 @@ impl BrowserWindow {
         self.refresh_url(cx);
     }
 
-    fn on_script_message(&mut self, tab_id: &str, body: &str) {
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(body) else {
-            return;
-        };
-        let extension_id = payload.get("extensionId").and_then(|value| value.as_str()).unwrap_or("").to_string();
-        let method = payload.get("method").and_then(|value| value.as_str()).unwrap_or("").to_string();
-        let id = payload.get("id").and_then(|value| value.as_u64()).unwrap_or(0);
-        let args = payload.get("args").cloned().unwrap_or(serde_json::json!({}));
-        let reply = self.with_model(|model| model.extension_call(&extension_id, &method, &args));
-        let javascript = format!(
-            "globalThis.__nxResolve({id}, {}, {});",
-            reply["ok"], reply["value"]
-        );
-        self.engine.resolve_extension(tab_id, &extension_id, &javascript);
-        if method == "runtime.sendMessage" {
-            self.runtime.dispatch(&extension_id, &reply["value"].to_string());
-        }
-    }
-
     pub(crate) fn with_model<T>(&mut self, f: impl FnOnce(&mut Model) -> T) -> T {
         let (value, effects) = {
             let mut model = self.model.lock().expect("model");
@@ -468,11 +505,10 @@ impl BrowserWindow {
     }
 
     fn apply(&mut self, effects: Vec<Effect>) {
-        let scripts = self.script_list();
         for effect in effects {
             match effect {
                 Effect::EnsureTab { tab_id, data_store_id, url } => {
-                    let _ = self.engine.ensure_tab(&tab_id, &data_store_id, &url, &scripts);
+                    let _ = self.engine.ensure_tab(&tab_id, &data_store_id, &url);
                 }
                 Effect::CloseTab { tab_id } => self.engine.close_tab(&tab_id),
                 Effect::SuspendTab { tab_id } => self.engine.suspend_tab(&tab_id),
@@ -501,7 +537,6 @@ impl BrowserWindow {
             (store, tabs)
         };
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
-        let scripts = self.script_list();
         for tab in tabs {
             let entry = self.chrome.get(&tab.id);
             let minimized = entry.is_some_and(|chrome| chrome.minimized);
@@ -509,66 +544,174 @@ impl BrowserWindow {
             if minimized || covered {
                 continue;
             }
-            let _ = self.engine.ensure_tab(&tab.id, &store, &tab.url, &scripts);
+            let _ = self.engine.ensure_tab(&tab.id, &store, &tab.url);
         }
     }
 
-    fn script_list(&self) -> Vec<ScriptInjection> {
-        self.model
-            .lock()
-            .expect("model")
-            .extensions
-            .iter()
-            .filter(|extension| extension.enabled && !extension.content_script.is_empty())
-            .map(|extension| ScriptInjection {
-                world: extension.id.clone(),
-                source: extension.content_script.clone(),
-            })
-            .collect()
-    }
-
-    fn reload_extensions(&mut self) {
-        let mut dirs = vec![
-            std::env::current_dir().unwrap_or_default().join("extensions/examples"),
-            app_support_dir().join("extensions"),
-        ];
+    /// Registers the example extensions, then loads every enabled extension into WebKit.
+    pub(crate) fn reload_extensions(&mut self) {
+        let mut dirs = vec![std::env::current_dir().unwrap_or_default().join("extensions/examples")];
         if let Some(parent) = std::env::current_exe().ok().and_then(|path| path.parent().map(|path| path.to_path_buf())) {
             dirs.push(parent.join("../../../extensions/examples"));
         }
-        let loaded = load_extension_dirs(&dirs);
-        let records = loaded
-            .iter()
-            .map(|extension| ExtensionRecord {
-                id: extension.id.clone(),
-                name: extension.name.clone(),
-                path: extension.path.clone(),
-                enabled: true,
-                permissions: extension.permissions.clone(),
-                host_permissions: extension.host_permissions.clone(),
-                matches: extension.matches.clone(),
-                content_script: extension.content_script.clone(),
-                background: extension.background.clone(),
-            })
-            .collect();
-        if let Ok(mut model) = self.model.lock() {
-            let _ = model.replace_extensions(records);
+        for path in discover(&dirs) {
+            let path = path.canonicalize().unwrap_or(path);
+            let name = read_manifest(&path).map(|manifest| manifest.name).unwrap_or_default();
+            let _ = self.model.lock().expect("model").upsert_extension(&local_id(&path), &name, &path, "bundled");
         }
-        let extensions = self.model.lock().expect("model").extensions.clone();
-        for extension in &extensions {
-            self.runtime.stop(&extension.id);
+        // Every profile's extensions, so background profiles keep running theirs.
+        let ids = self.model.lock().expect("model").installed_extensions().unwrap_or_default();
+        for (id, ..) in ids {
+            self.sync_extension(&id);
         }
-        for extension in extensions {
-            if extension.enabled {
-                if let Some(script) = extension.background {
-                    self.runtime.start(&extension.id, &script);
-                }
+    }
+
+    /// Re-reads one extension's manifest and starts or stops it in each profile that has it enabled.
+    pub(crate) fn sync_extension(&mut self, id: &str) {
+        let (installed, stores) = {
+            let model = self.model.lock().expect("model");
+            let installed = model.installed_extensions().unwrap_or_default().into_iter().find(|(found, ..)| found == id);
+            (installed, model.extension_stores(id).unwrap_or_default())
+        };
+        let Some((_, path, source)) = installed else {
+            self.ext_meta.remove(id);
+            self.engine.extensions().unload(id);
+            return;
+        };
+        if source == "store" {
+            if let Err(error) = patch_missing_apis(&path) {
+                eprintln!("could not add API polyfill to {id}: {error}");
             }
         }
-        let tab_ids: Vec<String> = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect();
-        let scripts = self.script_list();
-        for tab_id in tab_ids {
-            self.engine.set_scripts(&tab_id, &scripts);
+        self.ext_meta.insert(id.to_string(), read_manifest(&path).unwrap_or_default());
+        if !stores.is_empty() && path.join("manifest.json").is_file() {
+            self.engine.extensions().load(id, &path, stores);
+        } else {
+            self.engine.extensions().unload(id);
         }
+    }
+
+    fn add_extension(&mut self, id: &str, path: &std::path::Path, source: &str) {
+        let manifest = match read_manifest(path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.status = format!("Not an extension: {error}").into();
+                return;
+            }
+        };
+        let _ = self.model.lock().expect("model").upsert_extension(id, &manifest.name, path, source);
+        self.sync_extension(id);
+        self.status = format!("Installed {}", manifest.name).into();
+        self.extensions_open = true;
+    }
+
+    /// Installs from a Chrome Web Store URL or extension id, downloading on a background thread.
+    pub(crate) fn install_from_input(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let Some(id) = store_id(raw) else {
+            self.status = "Paste a Chrome Web Store link or a 32-letter extension id".into();
+            cx.notify();
+            return;
+        };
+        self.ext_input.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+        self.install_from_store(id);
+        cx.notify();
+    }
+
+    pub(crate) fn install_from_store(&mut self, id: String) {
+        if self.installing.contains(&id) {
+            return;
+        }
+        self.installing.push(id.clone());
+        self.status = "Downloading extension…".into();
+        let tx = self.installs_tx.clone();
+        std::thread::spawn(move || {
+            let result = install_from_store(&id, &app_support_dir().join("extensions")).map_err(|error| format!("{error:#}"));
+            let _ = tx.send((id, result));
+        });
+    }
+
+    pub(crate) fn load_unpacked(&mut self) {
+        let Some(path) = choose_folder_path() else {
+            return;
+        };
+        if !path.join("manifest.json").is_file() {
+            self.status = "That folder has no manifest.json".into();
+            return;
+        }
+        self.add_extension(&local_id(&path), &path, "unpacked");
+    }
+
+    pub(crate) fn remove_extension(&mut self, id: &str) {
+        let record = self.model.lock().expect("model").extensions.iter().find(|extension| extension.id == id).cloned();
+        let last = self.model.lock().expect("model").remove_extension(id).unwrap_or(false);
+        self.sync_extension(id);
+        // Only folders we unpacked ourselves are deleted, once no profile uses them; picked folders and examples stay.
+        let root = app_support_dir().join("extensions");
+        if let Some(record) = record.filter(|record| last && record.source == "store" && record.path.starts_with(&root)) {
+            let _ = std::fs::remove_dir_all(&record.path);
+        }
+    }
+
+    pub(crate) fn active_store(&self) -> String {
+        self.model.lock().expect("model").active_profile().map(|profile| profile.data_store_id.clone()).unwrap_or_default()
+    }
+
+    /// What clicking an extension's button at window x `at` does: its popup (a popover under the
+    /// title bar there) or `onClicked` via WebKit, or its side panel in a slim window.
+    pub(crate) fn open_extension(&mut self, id: &str, at: f32, cx: &mut Context<Self>) {
+        let meta = self.ext_meta.get(id).cloned().unwrap_or_default();
+        match self.panel_url(id).filter(|_| !meta.popup) {
+            Some(url) => self.open_extension_panel(id, &url, cx),
+            None => {
+                let (store, tab) = (self.active_store(), self.active_tab_id());
+                let anchor = [f64::from(at) - 13., 0., 26., f64::from(TITLEBAR_H)];
+                self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor);
+            }
+        }
+    }
+
+    pub(crate) fn open_extension_options(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.engine.extensions().options_url(id, &self.active_store()) {
+            Some(url) => self.open_extension_window(&url, cx),
+            None => self.status = "This extension has no options page".into(),
+        }
+    }
+
+    /// Options pages open as a regular floating window.
+    fn open_extension_window(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Ok(id) = self.with_model(|model| model.create_tab(url)) {
+            self.focus_window(&id, cx);
+        }
+    }
+
+    fn panel_url(&self, id: &str) -> Option<String> {
+        let path = self.ext_meta.get(id)?.side_panel.clone()?;
+        Some(format!("{EXTENSION_SCHEME}{id}/{}", path.trim_start_matches('/')))
+    }
+
+    /// A side panel: a narrow window docked right, titled with just the extension. One per space.
+    fn open_extension_panel(&mut self, id: &str, url: &str, cx: &mut Context<Self>) {
+        let open = self
+            .model
+            .lock()
+            .expect("model")
+            .session_tabs()
+            .into_iter()
+            .find(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.panel.as_deref() == Some(id)))
+            .map(|tab| tab.id.clone());
+        let Some(tab_id) = open.or_else(|| self.with_model(|model| model.create_tab(url)).ok()) else {
+            return;
+        };
+        let entry = self.chrome.entry(tab_id.clone()).or_default();
+        if entry.panel.is_none() {
+            entry.panel = Some(id.to_string());
+            if let Some(bounds) = self.stage_bounds {
+                let (sw, sh) = (f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32);
+                let w = 380f32.min(sw - 20.0);
+                entry.frame = Some(Frame { x: sw - w - 10.0, y: 10.0, w, h: sh - 20.0 });
+            }
+        }
+        self.focus_window(&tab_id, cx);
     }
 
     pub(crate) fn apply_settings(&mut self) {
@@ -649,7 +792,7 @@ impl BrowserWindow {
         self.status = if added { "Bookmark added".into() } else { "Bookmark removed".into() };
     }
 
-    fn active_tab_id(&self) -> Option<String> {
+    pub(crate) fn active_tab_id(&self) -> Option<String> {
         self.model.lock().ok().and_then(|model| model.active_tab().map(|tab| tab.id.clone()))
     }
 
@@ -758,6 +901,12 @@ impl BrowserWindow {
             std::process::exit(1);
         }
         if stage == 0 {
+            let waiting = self.model.lock().expect("model").extensions.iter().any(|extension| {
+                extension.enabled && !self.engine.extensions().is_loaded(&extension.id) && self.engine.extensions().errors(&extension.id).is_empty()
+            });
+            if waiting {
+                return;
+            }
             let (tab_a, store_a) = {
                 let model = self.model.lock().expect("model");
                 (
@@ -779,8 +928,8 @@ impl BrowserWindow {
                 eprintln!("SELFTEST FAIL profile ids were not isolated");
                 std::process::exit(1);
             }
-            let _ = self.engine.ensure_tab(&tab_a, &store_a, "nxbrowser://home", &[]);
-            let _ = self.engine.ensure_tab(&tab_b, &store_b, "nxbrowser://home", &[]);
+            let _ = self.engine.ensure_tab(&tab_a, &store_a, "nxbrowser://home");
+            let _ = self.engine.ensure_tab(&tab_b, &store_b, "nxbrowser://home");
             let html_a = "<script>localStorage.setItem('nx','A')</script><title>A</title>";
             let html_b = "<script>localStorage.setItem('nx','B')</script><title>B</title>";
             self.engine.load_html(&tab_a, html_a, Some("https://nxbrowser.test/"));
@@ -802,6 +951,7 @@ impl BrowserWindow {
             self.engine.eval(&tab_a, "a", "localStorage.getItem('nx')");
             self.engine.eval(&tab_b, "b", "localStorage.getItem('nx')");
             self.engine.eval(&tab_a, "sum", "String(1+1)");
+            self.engine.eval(&tab_a, "ext", "document.getElementById('nx-hello') ? 'banner' : 'none'");
             if let Some(test) = self.self_test.as_mut() {
                 test.stage = 2;
             }
@@ -815,20 +965,26 @@ impl BrowserWindow {
                 test.value_b.clone()?,
                 test.sum.clone()?,
                 test.tab_a.clone(),
+                test.ext.clone()?,
             ))
         });
-        if let Some((a, b, sum, tab_a)) = outcome {
+        if let Some((a, b, sum, tab_a, ext)) = outcome {
             let frame = self.engine.frame(&tab_a);
             let sample = snapshot(self.started);
             let isolated = a.contains('A') && b.contains('B') && !a.contains('B');
             let math = sum.contains('2');
             let sized = frame.map(|(width, _)| width > 100.0).unwrap_or(false);
+            let hello = self.model.lock().expect("model").extensions.iter().any(|extension| extension.enabled && extension.name == "Hello World");
+            let extension = !hello || ext.contains("banner");
+            for record in self.model.lock().expect("model").extensions.iter().filter(|extension| extension.enabled) {
+                println!("self-test extension {} loaded={} errors={:?}", record.name, self.engine.extensions().is_loaded(&record.id), self.engine.extensions().errors(&record.id));
+            }
             println!(
-                "self-test localStorage A={a:?} B={b:?} js={sum:?} frame={frame:?} startup_ms={} rss={}",
+                "self-test localStorage A={a:?} B={b:?} js={sum:?} extension={ext:?} frame={frame:?} startup_ms={} rss={}",
                 sample.startup.as_millis(),
                 sample.rss_bytes
             );
-            if isolated && math && sized {
+            if isolated && math && sized && extension {
                 println!("SELFTEST OK");
                 std::process::exit(0);
             }
@@ -909,7 +1065,6 @@ impl Render for BrowserWindow {
         let all_tabs = self.model.lock().expect("model").tabs.clone();
         let history = self.model.lock().expect("model").history().unwrap_or_default();
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
-        let extensions = self.model.lock().expect("model").extensions.clone();
         let colors = paint(cx);
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
         let live_ids = self.model.lock().expect("model").tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
@@ -965,7 +1120,6 @@ impl Render for BrowserWindow {
                             &sessions,
                             &history,
                             &bookmarks,
-                            &extensions,
                             cx,
                         ))
                     }),
@@ -976,6 +1130,7 @@ impl Render for BrowserWindow {
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
             .when(self.downloads_open, |root| root.child(self.downloads_popover(cx)))
+            .when(self.extensions_open, |root| root.child(self.extensions_popover(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
 }
@@ -1537,7 +1692,7 @@ impl BrowserWindow {
         entry.frame
     }
 
-    fn focus_window(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn focus_window(&mut self, id: &str, cx: &mut Context<Self>) {
         self.order.retain(|existing| existing != id);
         self.order.push(id.to_string());
         if let Some(entry) = self.chrome.get_mut(id) {
@@ -1640,6 +1795,9 @@ impl BrowserWindow {
     }
 
     fn window_titlebar(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
+        if let Some(ext) = self.chrome.get(&tab.id).and_then(|chrome| chrome.panel.clone()) {
+            return self.panel_titlebar(&tab.id, &ext, cx);
+        }
         let paint = paint(cx);
         let id = tab.id.clone();
         let nav = self.nav_controls(&tab.id, cx);
@@ -1666,6 +1824,37 @@ impl BrowserWindow {
                     ),
                 )
                 .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx)),
+        )
+    }
+
+    /// `[icon] Name ──── [×]`: a side panel needs no address bar or navigation.
+    fn panel_titlebar(&self, tab_id: &str, ext: &str, cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let meta = self.ext_meta.get(ext).cloned().unwrap_or_default();
+        let (move_id, close_id) = (tab_id.to_string(), tab_id.to_string());
+        let close = self.tool_button(format!("close-{tab_id}"), Icons::cross_2(), false, cx, move |this, cx| {
+            this.with_model(|model| {
+                let _ = model.close_tab(&close_id);
+            });
+            this.refresh_url(cx);
+        });
+        div().child(
+            h_stack()
+                .id(SharedString::from(format!("title-{tab_id}")))
+                .h(px(TITLE_H as f32))
+                .px(px(10.))
+                .items_center()
+                .gap(px(8.))
+                .bg(paint.surface)
+                .border_b_1()
+                .border_color(paint.border)
+                .cursor(CursorStyle::OpenHand)
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.begin_move(&move_id, event.position, cx);
+                }))
+                .child(extension_icon(&meta.name, meta.icon.clone(), 16.))
+                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.)).child(meta.name.clone()))
+                .child(self.hit_guard(format!("tools-guard-{tab_id}"), close, cx)),
         )
     }
 
@@ -1899,10 +2088,21 @@ impl BrowserWindow {
                     .items_center()
                     .gap(px(2.))
                     .child(drag_area().flex_1())
+                    .child(self.pinned_extensions(cx))
                     .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
                     .child(self.panel_icon("history-toggle", Icons::file_text(), Some(SidebarPage::History), cx))
                     .child(self.panel_icon("bookmarks-toggle", Icons::bookmark(), Some(SidebarPage::Bookmarks), cx))
-                    .child(self.panel_icon("extensions-toggle", Icons::mixer_horizontal(), Some(SidebarPage::Extensions), cx)),
+                    .child(
+                        icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
+                            .box_size(rems(1.625))
+                            .icon_size(rems(1.0))
+                            .selected(self.extensions_open)
+                            // Opens only: a click outside the popover (this one included) already closes it.
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.extensions_open = true;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 
@@ -2238,7 +2438,6 @@ impl BrowserWindow {
         sessions: &[browser_core::Session],
         history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
-        extensions: &[browser_core::ExtensionRecord],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
@@ -2262,7 +2461,6 @@ impl BrowserWindow {
                         sessions,
                         history,
                         bookmarks,
-                        extensions,
                         cx,
                     )),
             )
@@ -2305,14 +2503,12 @@ impl BrowserWindow {
         sessions: &[browser_core::Session],
         history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
-        extensions: &[browser_core::ExtensionRecord],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         match page {
             SidebarPage::Profiles => self.profile_page(profiles, active_profile, sessions, cx),
             SidebarPage::History => self.link_list("No history yet", history.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
             SidebarPage::Bookmarks => self.link_list("No bookmarks yet", bookmarks.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
-            SidebarPage::Extensions => self.extension_page(extensions, cx),
         }
     }
 
@@ -2428,36 +2624,6 @@ impl BrowserWindow {
         column
     }
 
-    fn extension_page(&self, extensions: &[browser_core::ExtensionRecord], cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let mut column = v_stack().gap(px(6.)).w_full();
-        if extensions.is_empty() {
-            column = column.child(div().text_color(paint.muted).child("No extensions in extensions/examples"));
-        }
-        for extension in extensions {
-            let id = extension.id.clone();
-            let enabled = extension.enabled;
-            column = column.child(
-                action_button(
-                    SharedString::from(format!("extension-{id}")),
-                    format!("{}  {}", if enabled { "On" } else { "Off" }, extension.name),
-                    Kind::Secondary,
-                    true,
-                    cx,
-                    move |this, cx| {
-                        let _ = this.model.lock().expect("model").set_extension_enabled(&id, !enabled);
-                        this.reload_extensions();
-                        cx.notify();
-                    },
-                ),
-            );
-        }
-        column.child(action_button("reload-extensions", "Reload extensions", Kind::Secondary, true, cx, |this, cx| {
-            this.reload_extensions();
-            cx.notify();
-        }))
-    }
-
     fn permission_row(&self, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let Some((origin, kind)) = self.permission.clone() else {
@@ -2511,6 +2677,9 @@ struct TabChrome {
     restore: Option<Frame>,
     /// Window (tab group) this tab lives in; `None` means its own, keyed by its id.
     window: Option<String>,
+    /// Extension id when this window is that extension's side panel.
+    #[serde(default)]
+    panel: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2804,7 +2973,7 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
     }
 }
 
-const TITLEBAR_H: f32 = 38.0;
+pub(crate) const TITLEBAR_H: f32 = 38.0;
 /// Height of a window's tab row once it holds two or more tabs.
 const TABS_H: f64 = 30.0;
 const STRIP_ANIM: Duration = Duration::from_millis(200);
@@ -3061,7 +3230,7 @@ fn is_web(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
-fn site_color(host: &str) -> gpui::Hsla {
+pub(crate) fn site_color(host: &str) -> gpui::Hsla {
     let mut hash = 0u32;
     for byte in host.bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
@@ -3103,19 +3272,6 @@ pub(crate) fn rail_mark(name: &str) -> String {
     let trimmed = name.trim();
     let word = trimmed.strip_prefix("Profile ").unwrap_or(trimmed);
     word.chars().next().unwrap_or('P').to_uppercase().to_string()
-}
-
-fn host(model: SharedModel) -> HostFn {
-    Arc::new(move |payload| {
-        let call: serde_json::Value = serde_json::from_str(payload).unwrap_or_else(|_| serde_json::json!({}));
-        let extension_id = call.get("extensionId").and_then(|value| value.as_str()).unwrap_or("");
-        let method = call.get("method").and_then(|value| value.as_str()).unwrap_or("");
-        let args = call.get("args").cloned().unwrap_or(serde_json::json!({}));
-        match model.lock() {
-            Ok(mut model) => model.extension_call(extension_id, method, &args).to_string(),
-            Err(_) => r#"{"ok":false,"error":"locked","value":null}"#.into(),
-        }
-    })
 }
 
 #[cfg(test)]

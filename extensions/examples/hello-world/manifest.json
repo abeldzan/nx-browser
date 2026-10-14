@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Hello World",
   "version": "1.0.0",
+  "description": "Shows a banner on every page and keeps a visit count.",
   "permissions": ["tabs", "storage"],
   "host_permissions": ["https://*/*", "http://*/*"],
   "content_scripts": [

@@ -837,8 +837,13 @@ fn swatch(id: String, selected: bool, paint: Paint) -> gpui::Stateful<gpui::Div>
 }
 
 fn switch(id: &'static str, on: bool, apply: Apply<bool>, paint: Paint, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
+    toggle(id, on, paint).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| apply(s, !on))))
+}
+
+/// An on/off track; the caller adds the click handler.
+pub(crate) fn toggle(id: impl Into<gpui::ElementId>, on: bool, paint: Paint) -> gpui::Stateful<gpui::Div> {
     div()
-        .id(id)
+        .id(id.into())
         .w(px(36.))
         .h(px(20.))
         .p(px(2.))
@@ -848,7 +853,6 @@ fn switch(id: &'static str, on: bool, apply: Apply<bool>, paint: Paint, cx: &mut
         .when(on, |track| track.justify_end())
         .bg(if on { paint.accent } else { paint.border })
         .child(div().size(px(16.)).rounded_full().bg(gpui::white()))
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| apply(s, !on))))
 }
 
 /// A segmented control.

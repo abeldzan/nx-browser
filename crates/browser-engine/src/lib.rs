@@ -9,12 +9,6 @@ pub struct LogicalRect {
 }
 
 #[derive(Clone, Debug)]
-pub struct ScriptInjection {
-    pub world: String,
-    pub source: String,
-}
-
-#[derive(Clone, Debug)]
 pub enum EngineEvent {
     Navigated {
         tab_id: String,
@@ -25,10 +19,6 @@ pub enum EngineEvent {
     Failed {
         tab_id: String,
         message: String,
-    },
-    ScriptMessage {
-        tab_id: String,
-        body: String,
     },
     Download {
         tab_id: String,
@@ -51,6 +41,22 @@ pub enum EngineEvent {
         value: String,
     },
     Shortcut(Shortcut),
+    /// An extension finished loading, failed, or changed its toolbar button (badge, icon).
+    ExtensionChanged {
+        id: String,
+    },
+    /// An extension asks for more permissions; answer with `answer_extension_prompt`.
+    ExtensionPrompt {
+        prompt: u64,
+        id: String,
+        request: String,
+    },
+    ActivateTab {
+        tab_id: String,
+    },
+    CloseTab {
+        tab_id: String,
+    },
 }
 
 /// Browser settings the engine applies to web views.
@@ -95,7 +101,7 @@ pub enum Shortcut {
 pub trait WebEngine {
     fn attach(&mut self, ns_view: *mut std::ffi::c_void) -> anyhow::Result<()>;
     fn set_bounds(&mut self, bounds: LogicalRect);
-    fn ensure_tab(&mut self, tab_id: &str, data_store_id: &str, url: &str, scripts: &[ScriptInjection]) -> anyhow::Result<()>;
+    fn ensure_tab(&mut self, tab_id: &str, data_store_id: &str, url: &str) -> anyhow::Result<()>;
     fn close_tab(&mut self, tab_id: &str);
     fn suspend_tab(&mut self, tab_id: &str);
     fn show_tab(&mut self, tab_id: Option<&str>);
@@ -106,8 +112,6 @@ pub trait WebEngine {
     fn reload(&mut self, tab_id: &str);
     fn find(&mut self, tab_id: &str, query: &str);
     fn eval(&mut self, tab_id: &str, token: &str, javascript: &str);
-    fn resolve_extension(&mut self, tab_id: &str, world: &str, javascript: &str);
-    fn set_scripts(&mut self, tab_id: &str, scripts: &[ScriptInjection]);
     fn focus_chrome(&mut self);
     fn remove_data_store(&mut self, data_store_id: &str);
     fn events(&self) -> &Receiver<EngineEvent>;

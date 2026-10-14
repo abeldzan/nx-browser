@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, LogicalRect, ScriptInjection, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
+use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -49,6 +50,7 @@ struct DelegateIvars {
     tab_id: String,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     https_only: Arc<AtomicBool>,
+    extensions: TabNotifier,
 }
 
 define_class!(
@@ -68,6 +70,16 @@ define_class!(
             navigation_action: &WKNavigationAction,
             decision_handler: &block2::DynBlock<dyn Fn(WKNavigationActionPolicy)>,
         ) {
+            // An extension page (side panel, options) sending the user to a site, e.g. to log in:
+            // open the site in a tab and leave the extension page where it is.
+            let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
+            let from_extension = web_view.URL().and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
+            let target = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
+            if let (true, true, Some(url)) = (main_frame, from_extension, target.filter(|url| url.starts_with("https://") || url.starts_with("http://"))) {
+                decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url });
+                return;
+            }
             if self.ivars().https_only.load(Ordering::Relaxed) {
                 let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
                 let url = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
@@ -162,6 +174,11 @@ define_class!(
             None
         }
 
+        #[unsafe(method(webViewDidClose:))]
+        unsafe fn webViewDidClose(&self, _web_view: &WKWebView) {
+            let _ = self.ivars().events.send(EngineEvent::CloseTab { tab_id: self.ivars().tab_id.clone() });
+        }
+
         #[unsafe(method(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:))]
         unsafe fn webView_runJavaScriptAlertPanelWithMessage_initiatedByFrame_completionHandler(
             &self,
@@ -240,20 +257,7 @@ define_class!(
                 if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key))) {
                     let _ = self.ivars().events.send(EngineEvent::Shortcut(shortcut));
                 }
-                return;
             }
-            let body = message.body();
-            let text = match body.downcast::<NSString>() {
-                Ok(string) => ns_string(&string),
-                Err(body) => {
-                    let description: Retained<NSString> = msg_send![&*body, description];
-                    ns_string(&description)
-                }
-            };
-            let _ = self.ivars().events.send(EngineEvent::ScriptMessage {
-                tab_id: self.ivars().tab_id.clone(),
-                body: text,
-            });
         }
     }
 );
@@ -278,13 +282,13 @@ impl NxWebDelegate {
             title,
             loading,
         });
+        self.ivars().extensions.changed(&self.ivars().tab_id);
     }
 }
 
 struct LiveTab {
     view: Retained<WKWebView>,
     delegate: Retained<NxWebDelegate>,
-    worlds: Vec<String>,
 }
 
 pub struct MacEngine {
@@ -313,6 +317,7 @@ pub struct MacEngine {
     held_loads: Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>,
     /// Tabs whose next page must not start media on its own (restored at launch or woken from suspension).
     hold_media: HashSet<String>,
+    extensions: Extensions,
 }
 
 impl MacEngine {
@@ -327,6 +332,7 @@ impl MacEngine {
         let monitor = install_shortcuts(events_tx.clone());
         let page_monitor = install_page_clicks();
         Self {
+            extensions: Extensions::new(events_tx.clone()),
             events_tx,
             events_rx,
             tabs: HashMap::new(),
@@ -352,6 +358,10 @@ impl MacEngine {
 
     /// The next page created for each of these tabs waits for a click before playing media,
     /// so a video that was playing when the app quit comes back paused.
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+
     pub fn hold_media(&mut self, tab_ids: impl IntoIterator<Item = String>) {
         self.hold_media.extend(tab_ids);
     }
@@ -446,6 +456,7 @@ impl MacEngine {
     /// Zoom, user agent and inspector apply to open tabs; the rest to tabs created afterwards.
     pub fn set_settings(&mut self, settings: EngineSettings) {
         self.https_only.store(settings.https_only, Ordering::Relaxed);
+        self.extensions.set_inspectable(settings.inspectable);
         for live in self.tabs.values() {
             apply_view_settings(&live.view, &settings);
         }
@@ -644,22 +655,23 @@ impl WebEngine for MacEngine {
         self.apply_frame();
     }
 
-    fn ensure_tab(
-        &mut self,
-        tab_id: &str,
-        data_store_id: &str,
-        url: &str,
-        scripts: &[ScriptInjection],
-    ) -> anyhow::Result<()> {
+    fn ensure_tab(&mut self, tab_id: &str, data_store_id: &str, url: &str) -> anyhow::Result<()> {
         if self.tabs.contains_key(tab_id) {
-            self.set_scripts(tab_id, scripts);
             return Ok(());
         }
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("WebKit must be created on the main thread"))?;
-        let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+        let store = data_store(data_store_id, mtm)?;
+        let configuration = if url.starts_with(SCHEME) {
+            // Retried every tick by the caller until the extension has loaded.
+            self.extensions.page_configuration(url, data_store_id).context("extension not loaded yet")?
+        } else {
+            let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+            let controller = self.extensions.controller(&store, data_store_id, mtm);
+            unsafe { configuration.setWebExtensionController(controller.as_deref()) };
+            configuration
+        };
         // Sites like YouTube Music sniff for the Safari suffix that bare WKWebView omits.
         unsafe { configuration.setApplicationNameForUserAgent(Some(&NSString::from_str(&safari_ua_suffix()))) };
-        let store = data_store(data_store_id, mtm)?;
         unsafe {
             configuration.setWebsiteDataStore(&store);
             let preferences = configuration.preferences();
@@ -681,15 +693,7 @@ impl WebEngine for MacEngine {
             )
         };
         apply_view_settings(&view, &self.settings);
-        let delegate = NxWebDelegate::new(
-            mtm,
-            DelegateIvars {
-                events: self.events_tx.clone(),
-                tab_id: tab_id.to_string(),
-                permissions: self.permissions.clone(),
-                https_only: self.https_only.clone(),
-            },
-        );
+        let delegate = self.page_delegate(tab_id, mtm);
         unsafe {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             view.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -698,19 +702,11 @@ impl WebEngine for MacEngine {
                 &key_world(mtm),
                 ns_string!("nxShortcut"),
             );
-            for key in OBSERVED_KEYS {
-                NSObject::addObserver_forKeyPath_options_context(&view, &delegate, &NSString::from_str(key), NSKeyValueObservingOptions::New, std::ptr::null_mut());
-            }
+            add_key_script(&view.configuration().userContentController(), mtm);
         }
-        self.tabs.insert(
-            tab_id.to_string(),
-            LiveTab {
-                view,
-                delegate,
-                worlds: Vec::new(),
-            },
-        );
-        self.set_scripts(tab_id, scripts);
+        observe(&view, &delegate);
+        self.extensions.opened(tab_id, data_store_id, url, &view, mtm);
+        self.tabs.insert(tab_id.to_string(), LiveTab { view, delegate });
         self.cookie_used.insert(data_store_id.to_string());
         if self.cookie_restore.remove(data_store_id) {
             self.begin_cookie_restore(data_store_id, &store);
@@ -725,21 +721,14 @@ impl WebEngine for MacEngine {
     }
 
     fn close_tab(&mut self, tab_id: &str) {
-        if let Some(live) = self.tabs.remove(tab_id) {
-            for key in OBSERVED_KEYS {
-                unsafe { NSObject::removeObserver_forKeyPath(&live.view, &live.delegate, &NSString::from_str(key)) };
-            }
-            unsafe { live.view.removeFromSuperview() };
-            self.stacked.clear();
-        }
-        if self.visible.as_deref() == Some(tab_id) {
-            self.visible = None;
-        }
+        self.extensions.closed(tab_id);
+        self.drop_view(tab_id);
     }
 
     fn suspend_tab(&mut self, tab_id: &str) {
         self.hold_media.insert(tab_id.to_string());
-        self.close_tab(tab_id);
+        self.extensions.suspended(tab_id);
+        self.drop_view(tab_id);
     }
 
     fn show_tab(&mut self, tab_id: Option<&str>) {
@@ -870,62 +859,6 @@ impl WebEngine for MacEngine {
         }
     }
 
-    fn resolve_extension(&mut self, tab_id: &str, world: &str, javascript: &str) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let Some(live) = self.tabs.get(tab_id) else {
-            return;
-        };
-        let content_world = unsafe { WKContentWorld::worldWithName(&NSString::from_str(world), mtm) };
-        unsafe {
-            live.view.evaluateJavaScript_inFrame_inContentWorld_completionHandler(
-                &NSString::from_str(javascript),
-                None,
-                &content_world,
-                None,
-            );
-        }
-    }
-
-    fn set_scripts(&mut self, tab_id: &str, scripts: &[ScriptInjection]) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return;
-        };
-        let Some(live) = self.tabs.get_mut(tab_id) else {
-            return;
-        };
-        let controller = unsafe { live.view.configuration().userContentController() };
-        unsafe { controller.removeAllUserScripts() };
-        add_key_script(&controller, mtm);
-        for script in scripts {
-            if script.source.is_empty() {
-                continue;
-            }
-            let world = unsafe { WKContentWorld::worldWithName(&NSString::from_str(&script.world), mtm) };
-            if !live.worlds.iter().any(|name| name == &script.world) {
-                unsafe {
-                    controller.addScriptMessageHandler_contentWorld_name(
-                        ProtocolObject::from_ref(&*live.delegate),
-                        &world,
-                        ns_string!("nxbrowser"),
-                    );
-                }
-                live.worlds.push(script.world.clone());
-            }
-            let user_script = unsafe {
-                WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
-                    WKUserScript::alloc(mtm),
-                    &NSString::from_str(&script.source),
-                    WKUserScriptInjectionTime::AtDocumentStart,
-                    true,
-                    &world,
-                )
-            };
-            unsafe { controller.addUserScript(&user_script) };
-        }
-    }
-
     fn focus_chrome(&mut self) {
         let Some(chrome) = &self.chrome else {
             return;
@@ -964,6 +897,33 @@ impl WebEngine for MacEngine {
 }
 
 impl MacEngine {
+    fn drop_view(&mut self, tab_id: &str) {
+        if let Some(live) = self.tabs.remove(tab_id) {
+            for key in OBSERVED_KEYS {
+                unsafe { NSObject::removeObserver_forKeyPath(&live.view, &live.delegate, &NSString::from_str(key)) };
+            }
+            unsafe { live.view.removeFromSuperview() };
+            self.stacked.clear();
+        }
+        if self.visible.as_deref() == Some(tab_id) {
+            self.visible = None;
+        }
+    }
+
+    fn page_delegate(&self, tab_id: &str, mtm: MainThreadMarker) -> Retained<NxWebDelegate> {
+        NxWebDelegate::new(
+            mtm,
+            DelegateIvars {
+                events: self.events_tx.clone(),
+                tab_id: tab_id.to_string(),
+                permissions: self.permissions.clone(),
+                https_only: self.https_only.clone(),
+                extensions: self.extensions.handle(),
+            },
+        )
+    }
+
+    /// Shows an extension popup WebKit already built and loaded; its own delegates stay in place.
     fn apply_frame(&self) {
         let Some(content) = &self.content else {
             return;
@@ -985,6 +945,13 @@ impl MacEngine {
     }
 }
 
+/// KVO on `URL` and `title`, so in-page navigations reach the address bar.
+fn observe(view: &WKWebView, delegate: &NxWebDelegate) {
+    for key in OBSERVED_KEYS {
+        unsafe { NSObject::addObserver_forKeyPath_options_context(view, delegate, &NSString::from_str(key), NSKeyValueObservingOptions::New, std::ptr::null_mut()) };
+    }
+}
+
 fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
     let agent = (!settings.user_agent.trim().is_empty()).then(|| NSString::from_str(settings.user_agent.trim()));
     unsafe {
@@ -994,7 +961,7 @@ fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
     }
 }
 
-fn safari_ua_suffix() -> String {
+pub(crate) fn safari_ua_suffix() -> String {
     let version = NSBundle::bundleWithPath(ns_string!("/Applications/Safari.app"))
         .and_then(|bundle| bundle.objectForInfoDictionaryKey(ns_string!("CFBundleShortVersionString")))
         .and_then(|value| value.downcast::<NSString>().ok())
@@ -1219,6 +1186,9 @@ extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *m
 /// AppKit offers Cmd-key combos to every view, so GPUI took Cmd+Z/C/V/D… even while a page had focus.
 /// While a page is focused they go to the page (and the Edit menu) instead.
 extern "C-unwind" fn key_equivalent(this: &AnyObject, _cmd: Sel, event: &NSEvent) -> Bool {
+    if crate::extensions::perform_command(event) {
+        return Bool::YES;
+    }
     if page_has_focus(event) {
         return Bool::NO;
     }

@@ -26,6 +26,10 @@ impl Storage {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
+        let had_links = self
+            .conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'profile_extensions'")?
+            .exists([])?;
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS profiles (
@@ -56,12 +60,12 @@ impl Storage {
                 enabled INTEGER NOT NULL,
                 manifest_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS extension_storage (
+            CREATE TABLE IF NOT EXISTS profile_extensions (
                 profile_id TEXT NOT NULL,
                 extension_id TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value TEXT NOT NULL,
-                PRIMARY KEY (profile_id, extension_id, key)
+                enabled INTEGER NOT NULL DEFAULT 1,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (profile_id, extension_id)
             );
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -109,6 +113,8 @@ impl Storage {
             ("profiles", "color", "TEXT NOT NULL DEFAULT ''"),
             ("profiles", "position", "INTEGER NOT NULL DEFAULT 0"),
             ("tabs", "layout", "TEXT NOT NULL DEFAULT ''"),
+            ("extensions", "source", "TEXT NOT NULL DEFAULT 'bundled'"),
+            ("extensions", "pinned", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has = self
                 .conn
@@ -119,6 +125,13 @@ impl Storage {
                     "ALTER TABLE {table} ADD COLUMN {column} {decl}"
                 ))?;
             }
+        }
+        // Extensions used to be global; the first time links exist, give every profile what was installed.
+        if !had_links {
+            self.conn.execute_batch(
+                "INSERT OR IGNORE INTO profile_extensions (profile_id, extension_id, enabled, pinned)
+                 SELECT p.id, e.id, e.enabled, e.pinned FROM profiles p, extensions e",
+            )?;
         }
         Ok(())
     }

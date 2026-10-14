@@ -6,9 +6,5 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-objc2 = { version = "0.6" }
-objc2-foundation = { version = "0.3" }
-objc2-javascript-core = { version = "0.3", features = ["JSContext", "JSValue"] }
-serde = { workspace = true }
 serde_json = { workspace = true }
-block2 = "0.6"
+ureq = "2.12"

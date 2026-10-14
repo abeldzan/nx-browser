@@ -12,7 +12,7 @@ if (document.readyState === "loading") {
   mount();
 }
 browser.storage.local.get("visits").then((value) => {
-  const visits = Number(value || 0) + 1;
+  const visits = Number(value.visits || 0) + 1;
   browser.storage.local.set({ visits });
   banner.textContent = "Hello from NxBrowser · visits " + visits;
 });

@@ -9,7 +9,7 @@ pub use download::{spawn_download, spawn_favicon, DownloadUpdate};
 pub use lifecycle::{suspend_candidates, LifeEvent, TabState};
 pub use metrics::{sample_cpu_seconds, snapshot, MetricsSnapshot};
 pub use model::{
-    Bookmark, BundleBookmark, BundleHistory, BundlePermission, BundleProfile, BundleStorage,
+    Bookmark, BundleBookmark, BundleHistory, BundlePermission, BundleProfile,
     BundleTab, DownloadRecord, Effect, ExtensionRecord, HistoryEntry, Model, Profile, ProfileBundle,
     Session, Tab,
 };

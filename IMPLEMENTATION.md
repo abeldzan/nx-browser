@@ -6,7 +6,7 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 
 - [x] macOS first, with the engine behind a platform module
 - [x] Direct WKWebView instead of Wry, so each profile can use its own persistent `WKWebsiteDataStore`
-- [x] WebExtensions-inspired API, not Chrome Web Store compatibility
+- [x] WebKit's native web extension runtime (`WKWebExtensionController`, as in Safari), so Chrome Web Store extensions run unmodified
 - [x] Many saved profiles, few live WebViews (suspension)
 
 ## Sprint 1 — foundation
@@ -39,13 +39,17 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 
 ## Phase 4 — extensions
 
-- [x] Manifest parsing and permission checks
-- [x] Content scripts injected into matching pages, isolated from the page world
-- [x] `browser.storage.local` get/set
-- [x] `browser.tabs` query/create/remove
-- [x] `browser.runtime.sendMessage`
-- [x] Background JavaScriptCore runtime
+- [x] WebKit runs backgrounds (MV2/MV3), content scripts, popups, options pages and the `chrome.*`/`browser.*` APIs
+- [x] One extension controller per profile, so extension storage stays per profile
+- [x] Tabs and the browser window exposed to extensions (`tabs`, `windows`, `activeTab`, `action` badges)
+- [x] Install from the Chrome Web Store (store page button, pasted link or id) and Load unpacked
+- [x] Popups open as a native popover under the clicked button, sized by WebKit to the page; options pages and side panels open as floating windows
+- [x] Pin extensions to the title bar
 - [x] Example extension
+- [x] Suspended tabs stay listed to extensions; `tabs.captureVisibleTab`; manifest `commands` shortcuts; prompted permission grants saved across launches
+- [x] Store extensions get a polyfill that defines `Symbol.dispose`/`Symbol.asyncDispose` (missing in this WebKit, needed by `using`), keeps the service worker alive while an extension page is open, and swaps `WebSocket` in service workers for one that fails at once: WebKit runs them on the main thread, where `new WebSocket()` deadlocks the extension's process (Bitwarden's login froze on it)
+- [ ] WebSockets from extension service workers (live sync such as Bitwarden's SignalR falls back to periodic sync)
+- [ ] Context menus (`chrome.contextMenus`), runtime `action.setIcon`/`setTitle`/`disable`, and `openPanelOnActionClick: false` (a side-panel button never fires `action.onClicked`)
 
 ## Phase 5 — performance
 
@@ -70,14 +74,14 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 
 ## Verification
 
-Proven by `cargo test -p browser-core -p browser-extensions` (8 tests) and `cargo run -p nxbrowser -- --self-test` (`SELFTEST OK`):
+Proven by `cargo test -p browser-core -p browser-extensions` (17 tests) and `cargo run -p nxbrowser -- --self-test` (`SELFTEST OK`):
 
 - Two profiles on the same origin keep separate `localStorage` (`A` vs `B`) in the same process, via distinct `WKWebsiteDataStore` identifiers.
 - JavaScript evaluation returns `2`.
 - WebView frame follows the content region (`840×577`).
 - Startup time and process RSS are recorded (self-test sample: 1292 ms, ~131 MB RSS).
 - SQLite restores a profile and its tab URL after the database is reopened.
-- Extension storage is rejected without the storage permission.
+- The bundled example extension's content script runs on a test page through WebKit's extension runtime.
 - Host match patterns and the tab suspension cap behave as coded.
 
 Not exercised by those runs, so treat them as implemented but unproven in a live window:

@@ -1,4 +1,5 @@
 mod downloads;
+mod extensions;
 mod profiles;
 mod settings;
 mod sidebar;
@@ -17,7 +18,7 @@ pub fn run() {
     let self_test = std::env::args().any(|arg| arg == "--self-test");
     let started = std::time::Instant::now();
     Application::with_platform(gpui_platform::current_platform(false))
-        .with_assets(gpuikit::assets())
+        .with_assets(Assets)
         .run(move |cx: &mut App| {
         gpuikit::init(cx);
         gpuikit::input::bind_input_keys(cx, None);
@@ -40,6 +41,24 @@ pub fn run() {
         .expect("open window");
         cx.activate(true);
     });
+}
+
+/// gpuikit's assets plus the app's own icons (Radix has no puzzle piece for extensions).
+struct Assets;
+
+pub(crate) const PUZZLE_ICON: &str = "icons/app/puzzle.svg";
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if path == PUZZLE_ICON {
+            return Ok(Some(include_bytes!("../assets/puzzle.svg").as_slice().into()));
+        }
+        gpuikit::assets().load(path)
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<gpui::SharedString>> {
+        gpuikit::assets().list(path)
+    }
 }
 
 pub(crate) type SharedModel = Arc<Mutex<browser_core::Model>>;

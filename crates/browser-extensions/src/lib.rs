@@ -1,32 +1,30 @@
+mod install;
 mod manifest;
-mod permissions;
-mod runtime;
-mod scripting;
+mod polyfill;
 
-pub use manifest::{load_extension, LoadedExtension};
-pub use permissions::host_allowed;
-pub use runtime::{BackgroundRuntime, HostFn};
-pub use scripting::{bridge_and_content, matches_url};
+pub use install::{crx_zip, install_from_store, local_id, store_id, unpack_crx};
+pub use manifest::{read_manifest, Manifest};
+pub use polyfill::patch_missing_apis;
 
-pub fn load_extension_dirs(dirs: &[std::path::PathBuf]) -> Vec<LoadedExtension> {
-    let mut loaded = Vec::new();
+/// Folders directly under `dirs` (or `dirs` themselves) that hold a `manifest.json`.
+pub fn discover(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
     for dir in dirs {
+        if dir.join("manifest.json").is_file() {
+            found.push(dir.clone());
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Ok(extension) = load_extension(&path) {
-                    loaded.push(extension);
-                }
-            }
-        }
-        if let Ok(extension) = load_extension(dir) {
-            if !loaded.iter().any(|item| item.id == extension.id) {
-                loaded.push(extension);
+            if path.join("manifest.json").is_file() {
+                found.push(path);
             }
         }
     }
-    loaded
+    found.sort();
+    found.dedup_by(|a, b| a.canonicalize().ok() == b.canonicalize().ok());
+    found
 }
