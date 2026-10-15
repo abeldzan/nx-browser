@@ -946,7 +946,12 @@ impl BrowserWindow {
     }
 
     fn title_h(&self) -> f64 {
-        if self.compact { 28.0 } else { TITLE_H }
+        if self.compact { 24.0 } else { TITLE_H }
+    }
+
+    /// Pills and buttons leave a 3px margin above and below in the window title bar.
+    fn pill_h(&self) -> f32 {
+        self.title_h() as f32 - 6.0
     }
 
     fn apply_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -2252,6 +2257,10 @@ impl BrowserWindow {
         let id = tab.id.clone();
         let nav = self.nav_controls(&tab.id, cx);
         let tools = self.window_tools(&tab.id, cx);
+        let new_tab_id = tab.id.clone();
+        let new_tab = self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
+            this.new_tab_in(&new_tab_id, None, cx);
+        });
         let bar = (tab.active && self.load_bar > 0.0).then(|| {
             let fade = self.load_done.map_or(1.0, |at| 1.0 - (at.elapsed().as_secs_f32() / LOAD_FADE.as_secs_f32()).min(1.0));
             div().absolute().left_0().bottom_0().h(px(2.)).w(relative(self.load_bar)).bg(paint.accent).opacity(fade)
@@ -2274,6 +2283,7 @@ impl BrowserWindow {
                 .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx).flex_none())
                 .child(div().flex_1().min_w(px(8.)).h_full())
                 .child(self.compact_tabs(&tab.id, members, cx))
+                .child(self.hit_guard(format!("new-tab-guard-{}", tab.id), new_tab, cx).flex_none())
                 .child(div().flex_1().min_w(px(8.)).h_full())
                 .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx).flex_none()),
         )
@@ -2307,7 +2317,7 @@ impl BrowserWindow {
                     // Shrinks to just the icon when the window is narrow.
                     .min_w(px(28.))
                     .max_w(px(160.))
-                    .h(px(28.))
+                    .h(px(self.pill_h()))
                     .px(px(8.))
                     .gap(px(6.))
                     .items_center()
@@ -2408,7 +2418,7 @@ impl BrowserWindow {
         let paint = paint(cx);
         let editing = tab.active && (self.address_editing || self.address_focused);
         let pill = div()
-            .h(px(28.))
+            .h(px(self.pill_h()))
             .w_full()
             .px(px(10.))
             .rounded(px(8.))
@@ -2491,7 +2501,6 @@ impl BrowserWindow {
     fn window_tools(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
         let reload_id = tab_id.to_string();
         let bookmark_id = tab_id.to_string();
-        let new_tab_id = tab_id.to_string();
         let min_id = tab_id.to_string();
         let zoom_id = tab_id.to_string();
         let close_id = tab_id.to_string();
@@ -2507,9 +2516,6 @@ impl BrowserWindow {
             .child(self.tool_button(format!("bookmark-{bookmark_id}"), Icons::star(), false, cx, move |this, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
-            }))
-            .child(self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
-                this.new_tab_in(&new_tab_id, None, cx);
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
             .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, cx| {
@@ -2543,11 +2549,10 @@ impl BrowserWindow {
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> gpuikit::elements::icon_button::IconButton {
-        let button = if prominent {
-            icon_button(id, icon).box_size(rems(1.875)).icon_size(rems(1.15))
-        } else {
-            icon_button(id, icon).box_size(rems(1.625)).icon_size(rems(1.0))
-        };
+        // Sized to the title bar so the bar sets the height, not its buttons.
+        let size = self.pill_h();
+        let icon_size = if prominent { size * 0.75 } else { size * 0.65 };
+        let button = icon_button(id, icon).box_size(rems(size / 16.)).icon_size(rems(icon_size / 16.));
         button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| action(this, cx)))
     }
 
@@ -3652,7 +3657,7 @@ fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
 const WINDOW_RADIUS: f64 = 10.0;
 /// Page URL and its icon URL, newline separated.
 const FAVICON_JS: &str = r#"(() => { const l = document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]'); return location.href + "\n" + (l ? l.href : location.origin + "/favicon.ico"); })()"#;
-const TITLE_H: f64 = 36.0;
+const TITLE_H: f64 = 26.0;
 const PAGE_INSET: f64 = 6.0;
 const FIND_H: f64 = 36.0;
 
