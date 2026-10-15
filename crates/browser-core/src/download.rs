@@ -92,7 +92,34 @@ pub fn spawn_favicon(url: String, dest: PathBuf) {
     });
 }
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+/// Fetches search-box completions from an OpenSearch suggest URL (`%s` = query); empty on any failure.
+pub fn fetch_suggestions(template: &str, query: &str) -> tokio::task::JoinHandle<Vec<String>> {
+    let url = template.replace("%s", &crate::url::percent_encode(query));
+    runtime().spawn_blocking(move || {
+        let Ok(response) = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call() else {
+            return Vec::new();
+        };
+        let mut body = String::new();
+        // Remote, untrusted body: cap what we read.
+        if response.into_reader().take(64 * 1024).read_to_string(&mut body).is_err() {
+            return Vec::new();
+        }
+        parse_opensearch(&body)
+    })
+}
+
+/// `["query", ["suggestion", ...], ...]`
+fn parse_opensearch(body: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(parts)) = serde_json::from_str(body) else {
+        return Vec::new();
+    };
+    let Some(serde_json::Value::Array(list)) = parts.get(1) else {
+        return Vec::new();
+    };
+    list.iter().filter_map(|item| item.as_str().map(String::from)).collect()
+}
+
+fn runtime() ->&'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         // Only spawn_blocking is used; one async worker is enough.
@@ -107,6 +134,13 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_opensearch_suggestions() {
+        assert_eq!(parse_opensearch(r#"["rust",["rustdesk","rust lang"],[],{}]"#), ["rustdesk", "rust lang"]);
+        assert!(parse_opensearch("<html>").is_empty());
+        assert!(parse_opensearch(r#"{"a":1}"#).is_empty());
+    }
 
     #[test]
     fn progress_reports_in_steps_and_copies_everything() {

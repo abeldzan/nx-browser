@@ -99,6 +99,17 @@ impl Settings {
             .1
     }
 
+    /// The engine's OpenSearch suggest endpoint; `None` when it has none, so typing is never sent elsewhere.
+    pub fn suggest_template(&self) -> Option<&'static str> {
+        match self.search_template() {
+            "https://duckduckgo.com/?q=%s" => Some("https://duckduckgo.com/ac/?type=list&q=%s"),
+            "https://www.google.com/search?q=%s" => Some("https://suggestqueries.google.com/complete/search?client=firefox&q=%s"),
+            "https://www.bing.com/search?q=%s" => Some("https://api.bing.com/osjson.aspx?query=%s"),
+            "https://search.brave.com/search?q=%s" => Some("https://search.brave.com/api/suggest?q=%s"),
+            _ => None,
+        }
+    }
+
     pub fn zoom_for(&self, host: &str) -> f64 {
         self.site_zoom.get(host).copied().unwrap_or(self.page_zoom)
     }

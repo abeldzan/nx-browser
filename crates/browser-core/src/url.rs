@@ -82,7 +82,7 @@ fn expand_bang(input: &str) -> Option<String> {
     Some(template.replace("%s", &percent_encode(&query)))
 }
 
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         match *byte {

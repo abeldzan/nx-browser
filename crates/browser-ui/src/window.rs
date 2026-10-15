@@ -5,7 +5,7 @@ use crate::tabs::tab_label;
 use crate::terminal::{self, is_terminal, TERMINAL_URL};
 use crate::SharedModel;
 use browser_core::{
-    app_support_dir, downloads_dir, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
+    app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
     Model,
 };
 use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
@@ -14,7 +14,7 @@ use browser_extensions::{discover, install_from_store, local_id, patch_missing_a
 use gpui::{
     canvas, div, img, prelude::*, px, relative, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
-    Subscription, Window,
+    Subscription, Task, Window,
 };
 use crate::extensions::extension_icon;
 use crate::settings::measure_overlay;
@@ -25,7 +25,7 @@ use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
-use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
+use gpuikit::input::{bindings, InputState, InputStateEvent, SubmitOn};
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
 use gpuikit::traits::control_sized::ControlSized;
@@ -168,9 +168,11 @@ pub struct BrowserWindow {
     load_done: Option<Instant>,
     /// New windows growing in.
     opened: HashMap<String, Instant>,
-    /// Address bar matches (url, title) and the one picked with the arrow keys.
-    suggestions: Vec<(String, String)>,
+    /// Address bar matches (url or search query, title, is a search) and the one picked with the arrow keys.
+    suggestions: Vec<(String, String, bool)>,
     suggestion: Option<usize>,
+    /// In-flight search-engine completion fetch; replacing it cancels the stale one.
+    suggest_task: Option<Task<()>>,
     address_bounds: Option<gpui::Bounds<Pixels>>,
     pub(crate) compact: bool,
     reduce_motion: bool,
@@ -284,9 +286,7 @@ impl BrowserWindow {
                 }
                 InputStateEvent::TextChanged => {
                     let typed = input.read(cx).content().to_string();
-                    this.suggestions = this.model.lock().suggest(&typed, 6).unwrap_or_default();
-                    this.suggestion = None;
-                    cx.notify();
+                    this.update_suggestions(typed, cx);
                 }
                 _ => {}
             }),
@@ -485,6 +485,7 @@ impl BrowserWindow {
             opened: HashMap::new(),
             suggestions: Vec::new(),
             suggestion: None,
+            suggest_task: None,
             address_bounds: None,
             compact: false,
             reduce_motion: false,
@@ -1203,6 +1204,49 @@ impl BrowserWindow {
         }
     }
 
+    /// Chrome-style: history and bookmark matches first, then the search engine's completions once they arrive.
+    fn update_suggestions(&mut self, typed: String, cx: &mut Context<Self>) {
+        let (history, template) = {
+            let model = self.model.lock();
+            (model.suggest(&typed, 4).unwrap_or_default(), model.settings.suggest_template())
+        };
+        self.suggestions = history.into_iter().map(|(url, title)| (url, title, false)).collect();
+        self.suggestion = None;
+        self.suggest_task = template.filter(|_| !typed.trim().is_empty()).map(|template| {
+            let fetch = fetch_suggestions(template, typed.trim());
+            cx.spawn(async move |this, cx| {
+                let found = fetch.await.unwrap_or_default();
+                let _ = this.update(cx, |view, cx| {
+                    if !view.address_focused {
+                        return;
+                    }
+                    let room = 8usize.saturating_sub(view.suggestions.len());
+                    view.suggestions.extend(found.into_iter().take(room).map(|query| (query, String::new(), true)));
+                    cx.notify();
+                });
+            })
+        });
+        cx.notify();
+    }
+
+    /// Arrow, Enter and Escape in the address bar; keys it doesn't use go on to the input.
+    fn address_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.suggestions.len();
+        match key {
+            "down" if count > 0 => self.suggestion = Some(self.suggestion.map_or(0, |at| (at + 1) % count)),
+            "up" if count > 0 => self.suggestion = Some(self.suggestion.map_or(count - 1, |at| (at + count - 1) % count)),
+            "enter" => match self.suggestion.and_then(|at| self.suggestions.get(at)).map(|(url, _, _)| url.clone()) {
+                Some(url) => self.commit_navigation(&url, cx),
+                None => return,
+            },
+            "escape" if count > 0 => self.suggestions.clear(),
+            "escape" => self.end_address_edit(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn commit_navigation(&mut self, raw: &str, cx: &mut Context<Self>) {
         let url = {
             let model = self.model.lock();
@@ -1212,6 +1256,7 @@ impl BrowserWindow {
         self.address_editing = false;
         self.suggestions.clear();
         self.suggestion = None;
+        self.suggest_task = None;
         self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         self.with_model(|model| {
             let _ = model.navigate_active(&url);
@@ -1905,7 +1950,7 @@ impl BrowserWindow {
             .shadow_md()
             .occlude()
             .child(measure_overlay(10., cx));
-        for (index, (url, title)) in self.suggestions.iter().enumerate() {
+        for (index, (url, title, search)) in self.suggestions.iter().enumerate() {
             let target = url.clone();
             let picked = self.suggestion == Some(index);
             list = list.child(
@@ -1919,15 +1964,17 @@ impl BrowserWindow {
                     .text_size(px(12.))
                     .when(picked, |row| row.bg(paint.accent_bg))
                     .hover(|row| row.bg(paint.secondary))
-                    .child(div().flex_none().max_w(px(220.)).truncate().child(if title.is_empty() { display_url(url) } else { title.clone() }))
-                    .child(div().flex_1().min_w_0().truncate().text_color(paint.muted).child(display_url(url)))
+                    .when(*search, |row| row.child(Icons::magnifying_glass().size(px(12.)).text_color(paint.muted)))
+                    .child(div().flex_none().max_w(px(220.)).truncate().child(if *search || title.is_empty() { display_url(url) } else { title.clone() }))
+                    .when(!*search, |row| row.child(div().flex_1().min_w_0().truncate().text_color(paint.muted).child(display_url(url))))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.commit_navigation(&target, cx);
                     })),
             );
         }
-        div().child(list)
+        // Absolute so the list's offsets count from the window origin, not from where this sits in the root column.
+        div().absolute().top_0().left_0().child(list)
     }
 
     fn toggle_panel(&mut self, page: SidebarPage, cx: &mut Context<Self>) {
@@ -2179,7 +2226,7 @@ impl BrowserWindow {
             }
             let out = torn_off(window, event.position);
             entity.update(cx, |view, cx| {
-                view.apply_gesture(event.position, cx);
+                view.apply_gesture(event.position, event.modifiers.shift, cx);
                 let tears = view.model.detached.is_none();
                 // Out past the margin the window leaves on release, so it previews no snap or swap.
                 if let Some(gesture) = view.gesture.as_mut().filter(|gesture| out && tears && gesture.kind == GestureKind::Move) {
@@ -2199,7 +2246,7 @@ impl BrowserWindow {
         });
     }
 
-    fn apply_gesture(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn apply_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
         let Some(mut gesture) = self.gesture.clone() else {
             return;
         };
@@ -2285,10 +2332,10 @@ impl BrowserWindow {
                         self.refresh_url(cx);
                     }
                 }
-                // A snapped window dropped on another snapped one (away from the snap edges) trades places with it.
+                // With Shift held, a snapped window dropped on another snapped one (away from the snap edges) trades places with it.
                 let inside = |f: Frame| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h;
                 gesture.swap = None;
-                if gesture.from.is_some() && gesture.snap.is_none() && !over_bar {
+                if shift && gesture.from.is_some() && gesture.snap.is_none() && !over_bar {
                     gesture.swap = self
                         .order
                         .iter()
@@ -3022,23 +3069,11 @@ impl BrowserWindow {
                 .relative()
                 .border_color(paint.accent.opacity(0.6))
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| this.end_address_edit(window, cx)))
-                // Runs before the input sees the key, so arrows move through suggestions instead of the caret.
-                .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                    let count = this.suggestions.len();
-                    match event.keystroke.key.as_str() {
-                        "down" if count > 0 => this.suggestion = Some(this.suggestion.map_or(0, |at| (at + 1) % count)),
-                        "up" if count > 0 => this.suggestion = Some(this.suggestion.map_or(count - 1, |at| (at + count - 1) % count)),
-                        "enter" => match this.suggestion.and_then(|at| this.suggestions.get(at)).map(|(url, _)| url.clone()) {
-                            Some(url) => this.commit_navigation(&url, cx),
-                            None => return,
-                        },
-                        "escape" if count > 0 => this.suggestions.clear(),
-                        "escape" => this.end_address_edit(window, cx),
-                        _ => return,
-                    }
-                    cx.stop_propagation();
-                    cx.notify();
-                }))
+                // The input turns these keys into actions; catching them first lets arrows move through suggestions instead of the caret.
+                .capture_action(cx.listener(|this, _: &bindings::Down, window, cx| this.address_key("down", window, cx)))
+                .capture_action(cx.listener(|this, _: &bindings::Up, window, cx| this.address_key("up", window, cx)))
+                .capture_action(cx.listener(|this, _: &bindings::Enter, window, cx| this.address_key("enter", window, cx)))
+                .capture_action(cx.listener(|this, _: &bindings::Escape, window, cx| this.address_key("escape", window, cx)))
                 .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.address_bounds = Some(bounds)), |_, _, _, _| {}).absolute().size_full())
                 .child(
                 input(&self.address, cx)

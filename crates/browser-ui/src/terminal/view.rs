@@ -505,6 +505,12 @@ impl Render for TerminalView {
             .size_full()
             .p(px(6.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.on_key(event, cx)))
+            // Dropped files arrive as typed paths, like Terminal.app; CLI agents spot image paths and attach them.
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.focus.focus(window, cx);
+                let bytes = paste_bytes(&dropped_paths(paths.paths()), this.emu.bracketed_paste());
+                this.write_input(&bytes, cx);
+            }))
             .on_mouse_down(gpui::MouseButton::Left, on_down(weak.clone(), self.focus.clone()))
             .on_mouse_down(gpui::MouseButton::Middle, on_down(weak.clone(), self.focus.clone()))
             .on_mouse_down(gpui::MouseButton::Right, on_down(weak.clone(), self.focus.clone()))
@@ -621,6 +627,21 @@ pub fn newline_bytes(bracketed_paste: bool) -> Vec<u8> {
 }
 
 /// Wrap pasted text the way the line editor expects.
+/// Shell-escaped paths, space separated with a trailing space so typing can continue.
+fn dropped_paths(paths: &[std::path::PathBuf]) -> String {
+    let mut out = String::new();
+    for path in paths {
+        for ch in path.to_string_lossy().chars() {
+            if !(ch.is_alphanumeric() || "/._-+,@%:".contains(ch)) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+        out.push(' ');
+    }
+    out
+}
+
 fn paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
     if bracketed_paste { format!("\x1b[200~{text}\x1b[201~").into_bytes() } else { text.as_bytes().to_vec() }
 }
@@ -874,6 +895,12 @@ fn indexed_color(index: u8) -> gpui::Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_paths_are_shell_escaped() {
+        let paths = [std::path::PathBuf::from("/tmp/Screen Shot (1).png"), std::path::PathBuf::from("/a/b.jpg")];
+        assert_eq!(dropped_paths(&paths), "/tmp/Screen\\ Shot\\ \\(1\\).png /a/b.jpg ");
+    }
 
     #[test]
     fn anchors_scroll_with_text_after_history_is_full() {
