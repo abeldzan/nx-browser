@@ -590,6 +590,21 @@ impl MacEngine {
     }
 
     /// `notches` are (outer corner, arc centre) points of rounded-corner slivers that also show the page.
+    /// Areas (window coordinates, top-left origin) that hit-test to the chrome even over a page.
+    pub fn set_grab_zones(&mut self, zones: &[LogicalRect]) {
+        let Some(content) = &self.content else {
+            return;
+        };
+        let height = content.bounds().size.height;
+        let rects = zones
+            .iter()
+            .map(|zone| NSRect::new(NSPoint::new(zone.x, height - zone.y - zone.height), NSSize::new(zone.width, zone.height)))
+            .collect();
+        if let Ok(mut grabs) = GRABS.lock() {
+            *grabs = rects;
+        }
+    }
+
     pub fn set_page_holes(&mut self, holes: &[(String, LogicalRect)], notches: &[Notch]) {
         let Some(chrome) = &self.chrome else {
             return;
@@ -1195,6 +1210,12 @@ struct PageHole {
 static HOLES: Mutex<Vec<PageHole>> = Mutex::new(Vec::new());
 static PAGE_CLICK: Mutex<Option<String>> = Mutex::new(None);
 static MODAL: AtomicBool = AtomicBool::new(false);
+/// Window resize rims (content coordinates); they belong to the chrome even where a page lies beneath.
+static GRABS: Mutex<Vec<NSRect>> = Mutex::new(Vec::new());
+
+fn in_grab_zone(point: NSPoint) -> bool {
+    GRABS.lock().is_ok_and(|grabs| grabs.iter().any(|rect| hole_contains(*rect, point)))
+}
 
 fn hole_contains(rect: NSRect, point: NSPoint) -> bool {
     point.x >= rect.origin.x
@@ -1216,7 +1237,7 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
             return event.as_ptr();
         };
         let point = content.convertPoint_fromView(event_ref.locationInWindow(), None);
-        if MODAL.load(Ordering::Relaxed) {
+        if MODAL.load(Ordering::Relaxed) || in_grab_zone(point) {
             return event.as_ptr();
         }
         if let Ok(holes) = HOLES.lock() {
@@ -1264,7 +1285,7 @@ fn install_hit_proxy(chrome: &NSView) {
 
 extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *mut AnyObject {
     if let (false, Ok(holes)) = (MODAL.load(Ordering::Relaxed), HOLES.lock()) {
-        if holes.iter().any(|hole| hole_contains(hole.rect, point)) {
+        if !in_grab_zone(point) && holes.iter().any(|hole| hole_contains(hole.rect, point)) {
             return std::ptr::null_mut();
         }
     }

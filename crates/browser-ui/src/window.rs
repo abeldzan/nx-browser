@@ -2039,6 +2039,8 @@ impl BrowserWindow {
             cut_overlay(&mut holes, &mut notches, rect, *radius);
         }
         self.engine.set_page_holes(&holes, &notches);
+        let resizable = self.chrome.iter().filter(|(_, entry)| !entry.maximized).map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        self.engine.set_grab_zones(&grab_zones(&stack, &resizable));
     }
 
     fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
@@ -2252,11 +2254,12 @@ impl BrowserWindow {
         // Occlude so a press on this window never also reaches the windows stacked beneath it.
         let (scale, alpha) = self.window_motion(&tab.id);
         let mut shell = div().absolute().overflow_hidden().occlude().opacity(alpha);
+        let frame = scaled(frame, scale);
+        // Not maximized: the shell sits inside a box GRIP_OUT larger, whose rim holds the resize grips.
         shell = if maximized {
             shell.left(px(8.)).top(px(8.)).right(px(8.)).bottom(px(8.))
         } else {
-            let frame = scaled(frame, scale);
-            shell.left(px(frame.x)).top(px(frame.y)).w(px(frame.w)).h(px(frame.h))
+            shell.left(px(GRIP_OUT)).top(px(GRIP_OUT)).right(px(GRIP_OUT)).bottom(px(GRIP_OUT))
         };
         let target = tab.id.clone();
         let mut body = div().relative().size_full().child(
@@ -2277,8 +2280,17 @@ impl BrowserWindow {
                 })
                 .child(div().flex_1().min_h(px(0.))),
         );
-        if !maximized {
-            body = body
+        if maximized {
+            return Some(shell.child(body));
+        }
+        Some(
+            div()
+                .absolute()
+                .left(px(frame.x - GRIP_OUT))
+                .top(px(frame.y - GRIP_OUT))
+                .w(px(frame.w + GRIP_OUT * 2.0))
+                .h(px(frame.h + GRIP_OUT * 2.0))
+                .child(shell.child(body))
                 .child(self.resize_grip(&tab.id, Edges::left(), cx))
                 .child(self.resize_grip(&tab.id, Edges::right(), cx))
                 .child(self.resize_grip(&tab.id, Edges::bottom(), cx))
@@ -2286,9 +2298,8 @@ impl BrowserWindow {
                 .child(self.resize_grip(&tab.id, Edges::top_left(), cx))
                 .child(self.resize_grip(&tab.id, Edges::top_right(), cx))
                 .child(self.resize_grip(&tab.id, Edges::bottom_left(), cx))
-                .child(self.resize_grip(&tab.id, Edges::bottom_right(), cx));
-        }
-        Some(shell.child(body))
+                .child(self.resize_grip(&tab.id, Edges::bottom_right(), cx)),
+        )
     }
 
     fn resize_grip(&self, tab_id: &str, edges: Edges, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2311,8 +2322,8 @@ impl BrowserWindow {
                 this.begin_resize(&id, edges, event.position, cx);
             }));
         let corner = (edges.left || edges.right) && (edges.top || edges.bottom);
-        let band = px(GRIP);
-        let corner_size = px(GRIP_CORNER);
+        let band = px(GRIP_OUT + GRIP_IN);
+        let corner_size = px(GRIP_OUT + GRIP_CORNER);
         if corner {
             grip = grip.size(corner_size);
             grip = if edges.left { grip.left(px(0.)) } else { grip.right(px(0.)) };
@@ -3650,6 +3661,11 @@ impl Edges {
 }
 
 const GRIP: f32 = 6.0;
+/// Resize grips reach this far outside the window edge; the page now runs almost to the edge,
+/// so the grab area lives mostly in the gap around the window.
+const GRIP_OUT: f32 = 6.0;
+/// …and this far inside it, over the page's thin border.
+const GRIP_IN: f32 = 3.0;
 const GRIP_CORNER: f32 = 12.0;
 
 /// Which resize grip contains a point in window-local coordinates, if any.
@@ -3860,6 +3876,31 @@ fn visible_pages(
 }
 
 /// Removes `rect` from the page holes, giving back its rounded corners where a page lies beneath them.
+/// The resize rims around resizable windows, minus what windows in front cover. Clicks there go to the
+/// grips even over a page. `stack` is back to front, as for `visible_pages`.
+fn grab_zones(stack: &[(String, LogicalRect, LogicalRect)], resizable: &[String]) -> Vec<LogicalRect> {
+    let (out, inn) = (f64::from(GRIP_OUT), f64::from(GRIP_IN));
+    let mut zones = Vec::new();
+    for (index, (id, shell, _)) in stack.iter().enumerate() {
+        if !resizable.contains(id) {
+            continue;
+        }
+        let (x, y, w, h) = (shell.x - out, shell.y - out, shell.width + out * 2.0, shell.height + out * 2.0);
+        let band = out + inn;
+        let mut parts = vec![
+            LogicalRect { x, y, width: band, height: h },
+            LogicalRect { x: x + w - band, y, width: band, height: h },
+            LogicalRect { x: x + band, y, width: w - band * 2.0, height: band },
+            LogicalRect { x: x + band, y: y + h - band, width: w - band * 2.0, height: band },
+        ];
+        for (_, front, _) in &stack[index + 1..] {
+            parts = parts.iter().flat_map(|part| subtract(part, front)).collect();
+        }
+        zones.extend(parts);
+    }
+    zones
+}
+
 fn cut_overlay(holes: &mut Vec<(String, LogicalRect)>, notches: &mut Vec<((f64, f64), (f64, f64))>, rect: &LogicalRect, radius: f64) {
     let (x2, y2) = (rect.x + rect.width, rect.y + rect.height);
     let corners = [
@@ -3878,7 +3919,16 @@ fn cut_overlay(holes: &mut Vec<(String, LogicalRect)>, notches: &mut Vec<((f64, 
         .into_iter()
         .flat_map(|(id, hole)| subtract(&hole, rect).into_iter().map(move |part| (id.clone(), part)))
         .collect();
-    notches.retain(|&((x, y), _)| !(x > rect.x && y > rect.y && x < x2 && y < y2));
+    // A wedge toggles the mask, so one even partly under the card would cut a sliver out of the card itself.
+    notches.retain(|&(corner, center)| {
+        let square = LogicalRect {
+            x: corner.0.min(center.0),
+            y: corner.1.min(center.1),
+            width: (corner.0 - center.0).abs(),
+            height: (corner.1 - center.1).abs(),
+        };
+        !overlaps(&square, rect)
+    });
     notches.extend(rounded);
 }
 
@@ -4043,6 +4093,37 @@ mod tests {
 
     fn r(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
         LogicalRect { x, y, width, height }
+    }
+
+    #[test]
+    fn grab_zones_ring_the_window_but_not_what_covers_it() {
+        let stack = vec![
+            ("back".to_string(), r(100., 100., 200., 100.), r(101., 126., 198., 73.)),
+            ("front".to_string(), r(250., 50., 200., 200.), r(251., 76., 198., 173.)),
+        ];
+        let zones = grab_zones(&stack, &["back".to_string(), "front".to_string()]);
+        let hit = |x: f64, y: f64| zones.iter().any(|z| x >= z.x && y >= z.y && x < z.x + z.width && y < z.y + z.height);
+        // Just outside and just inside the back window's left edge.
+        assert!(hit(96., 150.) && hit(102., 150.));
+        // Deep inside a page is never a grip.
+        assert!(!hit(150., 150.));
+        // The back window's right rim lies under the front window, so the front page keeps those clicks.
+        assert!(!hit(299., 150.));
+        // The front window's own left rim is a grip.
+        assert!(hit(248., 150.));
+        // A maximized (non-resizable) window has no rim.
+        assert!(grab_zones(&stack, &[]).is_empty());
+    }
+
+    #[test]
+    fn overlay_drops_page_corner_wedges_it_touches() {
+        let stack = vec![("page".to_string(), r(0., 0., 100., 120.), r(1., 26., 98., 93.))];
+        let (mut holes, mut notches) = visible_pages(&stack, &r(0., 0., 1000., 1000.));
+        assert_eq!(notches.len(), 2);
+        // A popover whose edge crosses the bottom-left corner square, but not the corner point.
+        cut_overlay(&mut holes, &mut notches, &r(5., 60., 40., 55.), 10.);
+        assert!(!notches.contains(&((1., 119.), (10., 110.))));
+        assert!(notches.contains(&((99., 119.), (90., 110.))));
     }
 
     #[test]
