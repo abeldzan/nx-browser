@@ -28,6 +28,10 @@ gpuikit = "0.9"
 [patch.crates-io]
 gpui-apple-gpui-unofficial = { path = "vendor/gpui-apple" }
 
+# GPUI is far slower unoptimized; optimize dependencies in dev builds so `cargo run` stays smooth.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

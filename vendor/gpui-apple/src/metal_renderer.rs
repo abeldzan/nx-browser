@@ -395,7 +395,9 @@ impl MetalRenderer {
                 ];
             }
         }
-        self.update_path_intermediate_textures(size);
+        // Allocated lazily by the first frame with paths: a full-window texture is ~100 MB on a 6K display.
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -680,6 +682,9 @@ impl MetalRenderer {
                 }
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
+                    if self.path_intermediate_texture.is_none() {
+                        self.update_path_intermediate_textures(viewport_size);
+                    }
                     command_encoder.end_encoding();
 
                     let did_draw = self.draw_paths_to_intermediate(

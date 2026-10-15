@@ -1479,7 +1479,12 @@ impl Render for BrowserWindow {
         let sessions = self.model.lock().expect("model").profile_sessions().into_iter().cloned().collect::<Vec<_>>();
         let active_session = self.model.lock().expect("model").active_session_id.clone();
         let all_tabs = self.model.lock().expect("model").tabs.clone();
-        let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
+        // Bookmarks are a SQLite query; render runs every frame while dragging, so only fetch them when shown.
+        let bookmarks = if self.shown_panel == Some(SidebarPage::Bookmarks) {
+            self.model.lock().expect("model").bookmarks().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let colors = paint(cx);
         if !cx.has_active_drag() {
             self.tab_drag = None;
@@ -1866,7 +1871,8 @@ impl BrowserWindow {
 
     /// Writes changed window layouts to the tab rows so they survive restarts.
     fn save_layouts(&mut self, tabs: &[browser_core::Tab]) {
-        if self.gesture.is_some() || self.self_test.is_some() {
+        // Mid-motion layouts change every frame; save once things settle instead of writing SQLite per frame.
+        if self.gesture.is_some() || self.self_test.is_some() || self.animating() {
             return;
         }
         let Some((sw, sh)) = self.layout_stage else {
