@@ -108,6 +108,7 @@ pub enum Shortcut {
     PrevTab,
     Print,
     CommandPalette,
+    Inspect,
 }
 
 pub trait WebEngine {

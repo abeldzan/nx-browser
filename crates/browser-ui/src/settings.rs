@@ -79,7 +79,7 @@ impl BrowserWindow {
         self.settings_note = None;
         if self.settings_open {
             let (settings, active) = {
-                let model = self.model.lock().expect("model");
+                let model = self.model.lock();
                 (model.settings.clone(), model.active_profile_id.clone())
             };
             self.home_input.update(cx, |input, cx| input.set_content_silent(settings.home_page, cx));
@@ -111,7 +111,7 @@ impl BrowserWindow {
             return;
         };
         let typed = self.new_profile_input.read(cx).content().trim().to_string();
-        let count = self.model.lock().map(|model| model.profiles.len()).unwrap_or(0) + 1;
+        let count = self.model.lock().profiles.len().max(0) + 1;
         let name = if typed.is_empty() { format!("Profile {count}") } else { typed };
         let id = self.with_model(|model| {
             let id = model.create_profile(&name).ok()?;
@@ -186,7 +186,7 @@ impl BrowserWindow {
         }
         self.delete_prompt = None;
         if self.settings_profile.as_deref() == Some(id) {
-            let active = self.model.lock().expect("model").active_profile_id.clone();
+            let active = self.model.lock().active_profile_id.clone();
             self.select_settings_profile(active, cx);
         }
         self.refresh_url(cx);
@@ -196,12 +196,7 @@ impl BrowserWindow {
     /// Confirmation for deleting a profile, stacked above everything else.
     pub(crate) fn delete_modal(&self, id: &str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let paint = paint(cx);
-        let name = self
-            .model
-            .lock()
-            .ok()
-            .and_then(|model| model.profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()))
-            .unwrap_or_default();
+        let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
         let id = id.to_string();
         let card = v_stack()
             .w(px(380.))
@@ -286,7 +281,7 @@ impl BrowserWindow {
     pub(crate) fn rail_menu_view(&self, (id, index, position): (String, usize, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let danger = cx.theme().danger();
-        let count = self.model.lock().map(|model| model.profiles.len()).unwrap_or(1);
+        let count = self.model.lock().profiles.len().max(1);
         let watch = cx.entity();
         let item = |label: &'static str, enabled: bool, destructive: bool, run: fn(&mut Self, &str, usize, &mut Context<Self>), cx: &mut Context<Self>| {
             let id = id.clone();
@@ -339,18 +334,13 @@ impl BrowserWindow {
     }
 
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
-        let _ = self.model.lock().expect("model").update_settings(f);
+        let _ = self.model.lock().update_settings(f);
         self.apply_settings();
         cx.notify();
     }
 
     fn select_settings_profile(&mut self, id: String, cx: &mut Context<Self>) {
-        let name = self
-            .model
-            .lock()
-            .ok()
-            .and_then(|model| model.profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()))
-            .unwrap_or_default();
+        let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
         self.name_input.update(cx, |input, cx| input.set_content_silent(name, cx));
         self.settings_profile = Some(id);
     }
@@ -423,7 +413,7 @@ impl BrowserWindow {
     }
 
     fn settings_page(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
-        let settings = self.model.lock().expect("model").settings.clone();
+        let settings = self.model.lock().settings.clone();
         let page = v_stack()
             .w_full()
             .gap(px(4.))
@@ -537,17 +527,17 @@ impl BrowserWindow {
                         .gap(px(8.))
                         .flex_wrap()
                         .child(action_button("clear-history", "Clear history", Kind::Secondary, true, cx, |this, cx| {
-                            let _ = this.model.lock().expect("model").clear_data(true, false);
+                            let _ = this.model.lock().clear_data(true, false);
                             this.settings_note = Some("History cleared".into());
                             cx.notify();
                         }))
                         .child(action_button("clear-downloads", "Clear download list", Kind::Secondary, true, cx, |this, cx| {
-                            let _ = this.model.lock().expect("model").clear_data(false, true);
+                            let _ = this.model.lock().clear_data(false, true);
                             this.settings_note = Some("Download list cleared".into());
                             cx.notify();
                         }))
                         .child(action_button("clear-site-data", "Clear cookies & site data", Kind::Secondary, true, cx, |this, cx| {
-                            let store = this.model.lock().ok().and_then(|model| model.active_profile().map(|p| p.data_store_id.clone()));
+                            let store = Some(this.model.lock()).and_then(|model| model.active_profile().map(|p| p.data_store_id.clone()));
                             if let Some(store) = store {
                                 this.engine.clear_site_data(&store);
                             }
@@ -615,7 +605,7 @@ impl BrowserWindow {
                 )),
             SettingsSection::Developer => page.child(row(
                 "Allow Web Inspector",
-                Some("Right-click a page and choose Inspect Element."),
+                Some("Right-click a page and choose Inspect Element, or press ⌥⌘I."),
                 switch("inspector", settings.inspector, |s, v| s.inspector = v, paint, cx),
                 paint,
             )),
@@ -628,7 +618,7 @@ impl BrowserWindow {
 
     fn profiles_settings(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
         let (profiles, active) = {
-            let model = self.model.lock().expect("model");
+            let model = self.model.lock();
             (model.profiles.clone(), model.active_profile_id.clone())
         };
         let editing = self.settings_profile.clone().unwrap_or_else(|| active.clone());
@@ -679,7 +669,7 @@ impl BrowserWindow {
         };
         let (icons, colors) = appearance_pickers("edit", &profile.name, &profile.icon, &profile.color, |this, icon, color| {
             if let Some(id) = this.settings_profile.clone() {
-                let _ = this.model.lock().expect("model").set_profile_appearance(&id, &icon, &color);
+                let _ = this.model.lock().set_profile_appearance(&id, &icon, &color);
             }
         }, paint, cx);
         let is_active = profile.id == active;
@@ -732,7 +722,7 @@ impl BrowserWindow {
     pub(crate) fn save_profile_name(&mut self, cx: &mut Context<Self>) {
         let name = self.name_input.read(cx).content().trim().to_string();
         if let (false, Some(id)) = (name.is_empty(), self.settings_profile.clone()) {
-            let _ = self.model.lock().expect("model").rename_profile(&id, &name);
+            let _ = self.model.lock().rename_profile(&id, &name);
             self.settings_note = Some("Profile renamed".into());
         }
         cx.notify();
@@ -777,7 +767,7 @@ impl BrowserWindow {
     }
 
     fn permission_list(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
-        let entries = self.model.lock().expect("model").permissions_map().unwrap_or_default();
+        let entries = self.model.lock().permissions_map().unwrap_or_default();
         if entries.is_empty() {
             return div().text_color(paint.muted).child("No sites have asked for permissions yet");
         }
@@ -791,7 +781,7 @@ impl BrowserWindow {
                     _ => "Reset",
                 };
                 action_button(SharedString::from(format!("perm-{index}-{action}")), label, Kind::Secondary, action != decision, cx, move |this, cx| {
-                    let model = this.model.lock().expect("model");
+                    let model = this.model.lock();
                     let _ = if action == "reset" {
                         model.remove_permission(&origin, &kind)
                     } else {

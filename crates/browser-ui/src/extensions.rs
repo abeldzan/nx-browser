@@ -17,7 +17,7 @@ impl BrowserWindow {
     /// Extension manager, dropped from the title bar's puzzle button.
     pub(crate) fn extensions_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
-        let extensions = self.model.lock().expect("model").extensions.clone();
+        let extensions = self.model.lock().extensions.clone();
         let on = extensions.iter().filter(|extension| extension.enabled).count();
         let summary = match extensions.len() {
             0 => "Nothing installed".to_string(),
@@ -237,7 +237,7 @@ impl BrowserWindow {
                                         let id = id.clone();
                                         move |this, _: &ClickEvent, _, cx| {
                                             cx.stop_propagation();
-                                            let _ = this.model.lock().expect("model").set_extension_pinned(&id, !pinned);
+                                            let _ = this.model.lock().set_extension_pinned(&id, !pinned);
                                             cx.notify();
                                         }
                                     })),
@@ -248,7 +248,7 @@ impl BrowserWindow {
                         let id = id.clone();
                         move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            let _ = this.model.lock().expect("model").set_extension_enabled(&id, !enabled);
+                            let _ = this.model.lock().set_extension_enabled(&id, !enabled);
                             this.sync_extension(&id);
                             cx.notify();
                         }
@@ -315,7 +315,7 @@ impl BrowserWindow {
 
     /// The store id when the active page is a Chrome Web Store listing not yet installed.
     pub(crate) fn store_page_id(&self) -> Option<String> {
-        let model = self.model.lock().expect("model");
+        let model = self.model.lock();
         let url = model.active_tab()?.url.clone();
         let id = store_id(&url).filter(|_| url.contains("://"))?;
         let installed = model.extensions.iter().any(|extension| extension.id == id) || self.installing.contains(&id);
@@ -326,7 +326,7 @@ impl BrowserWindow {
     pub(crate) fn pinned_extensions(&self, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let (store, tab) = (self.active_store(), self.active_tab_id());
-        let pinned = self.model.lock().expect("model").extensions.iter().filter(|extension| extension.enabled && extension.pinned).cloned().collect::<Vec<_>>();
+        let pinned = self.model.lock().extensions.iter().filter(|extension| extension.enabled && extension.pinned).cloned().collect::<Vec<_>>();
         let mut row = h_stack().items_center().gap(px(2.));
         if self.store_page_id().is_some() {
             row = row.child(

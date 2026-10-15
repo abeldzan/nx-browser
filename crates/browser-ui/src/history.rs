@@ -16,7 +16,7 @@ impl BrowserWindow {
     /// Recent visits, dropped from the title bar's history button.
     pub(crate) fn history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
-        let entries = self.model.lock().expect("model").search_history("", POPUP_LIMIT).unwrap_or_default();
+        let entries = self.model.lock().search_history("", POPUP_LIMIT).unwrap_or_default();
         let groups = group_entries(&entries);
         let empty = if entries.is_empty() { 72. } else { 0. };
         let height = (112. + entries.len() as f32 * 48. + groups.len() as f32 * 26. + empty).min(440.);
@@ -90,7 +90,7 @@ impl BrowserWindow {
     pub(crate) fn history_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let query = self.history_query.read(cx).content().to_string();
-        let entries = self.model.lock().expect("model").search_history(&query, MODAL_LIMIT).unwrap_or_default();
+        let entries = self.model.lock().search_history(&query, MODAL_LIMIT).unwrap_or_default();
         let empty = if query.trim().is_empty() { "No history yet" } else { "No matches" };
         let card = v_stack()
             .w(px(560.))

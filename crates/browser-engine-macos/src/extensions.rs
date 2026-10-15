@@ -74,6 +74,7 @@ struct State {
     _errors_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
 }
 
+#[derive(Clone)]
 pub struct Extensions(Rc<RefCell<State>>);
 
 impl Extensions {

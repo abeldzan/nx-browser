@@ -15,12 +15,12 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSUUID,
+    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
@@ -63,11 +63,25 @@ define_class!(
             }
             let _: () = unsafe { msg_send![super(self), willOpenMenu: menu, withEvent: event] };
         }
+
+        /// WebKit re-sends Cmd keys the page ignored down the responder chain, which ends in the system beep;
+        /// the page-first ones are run by the key script instead, so stop them here.
+        #[unsafe(method(keyDown:))]
+        fn key_down(&self, event: &NSEvent) {
+            let flags = event.modifierFlags();
+            let page_first = flags.contains(NSEventModifierFlags::Command)
+                && !flags.contains(NSEventModifierFlags::Control)
+                && event.charactersIgnoringModifiers().is_some_and(|chars| PAGE_FIRST_KEYS.contains(&ns_string(&chars).to_ascii_lowercase().as_str()));
+            if !page_first {
+                let _: () = unsafe { msg_send![super(self), keyDown: event] };
+            }
+        }
     }
 );
 
 struct DelegateIvars {
-    events: Sender<EngineEvent>,
+    /// Swapped when the page moves to another window's engine.
+    events: RefCell<Sender<EngineEvent>>,
     tab_id: String,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     https_only: Arc<AtomicBool>,
@@ -98,7 +112,7 @@ define_class!(
             let target = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
             if let (true, true, Some(url)) = (main_frame, from_extension, target.filter(|url| url.starts_with("https://") || url.starts_with("http://"))) {
                 decision_handler.call((WKNavigationActionPolicy::Cancel,));
-                let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url, from: None });
+                let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url, from: None });
                 return;
             }
             if self.ivars().https_only.load(Ordering::Relaxed) {
@@ -126,7 +140,7 @@ define_class!(
                 // The generated `response()` assumes non-null, but WebKit can hand back nil; a panic here aborts the app.
                 let response: Option<Retained<NSURLResponse>> = msg_send![navigation_response, response];
                 if let Some(url) = response.and_then(|response| response.URL()).and_then(|url| url.absoluteString()) {
-                    let _ = self.ivars().events.send(EngineEvent::Download {
+                    let _ = self.ivars().events.borrow().send(EngineEvent::Download {
                         tab_id: self.ivars().tab_id.clone(),
                         url: ns_string(&url),
                     });
@@ -158,7 +172,7 @@ define_class!(
             _navigation: Option<&WKNavigation>,
             error: &NSError,
         ) {
-            let _ = self.ivars().events.send(EngineEvent::Failed {
+            let _ = self.ivars().events.borrow().send(EngineEvent::Failed {
                 tab_id: self.ivars().tab_id.clone(),
                 message: ns_string(&error.localizedDescription()),
             });
@@ -171,7 +185,7 @@ define_class!(
             _navigation: Option<&WKNavigation>,
             error: &NSError,
         ) {
-            let _ = self.ivars().events.send(EngineEvent::Failed {
+            let _ = self.ivars().events.borrow().send(EngineEvent::Failed {
                 tab_id: self.ivars().tab_id.clone(),
                 message: ns_string(&error.localizedDescription()),
             });
@@ -189,7 +203,7 @@ define_class!(
         ) -> Option<Retained<WKWebView>> {
             if navigation_action.targetFrame().is_none() {
                 if let Some(url) = navigation_action.request().URL().and_then(|url| url.absoluteString()) {
-                    let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url: ns_string(&url), from: Some(self.ivars().tab_id.clone()) });
+                    let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url: ns_string(&url), from: Some(self.ivars().tab_id.clone()) });
                 }
             }
             None
@@ -197,7 +211,7 @@ define_class!(
 
         #[unsafe(method(webViewDidClose:))]
         unsafe fn webViewDidClose(&self, _web_view: &WKWebView) {
-            let _ = self.ivars().events.send(EngineEvent::CloseTab { tab_id: self.ivars().tab_id.clone() });
+            let _ = self.ivars().events.borrow().send(EngineEvent::CloseTab { tab_id: self.ivars().tab_id.clone() });
         }
 
         #[unsafe(method(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:))]
@@ -208,10 +222,26 @@ define_class!(
             _frame: &objc2_web_kit::WKFrameInfo,
             completion_handler: &block2::DynBlock<dyn Fn()>,
         ) {
-            let _ = self.ivars().events.send(EngineEvent::Alert {
+            let _ = self.ivars().events.borrow().send(EngineEvent::Alert {
                 message: ns_string(message),
             });
             completion_handler.call(());
+        }
+
+        // `<input type=file>`: without this WebKit on macOS shows no picker at all.
+        #[unsafe(method(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:))]
+        unsafe fn webView_runOpenPanelWithParameters_initiatedByFrame_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            parameters: &objc2_web_kit::WKOpenPanelParameters,
+            _frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSArray<NSURL>)>,
+        ) {
+            let panel = NSOpenPanel::openPanel(MainThreadMarker::from(self));
+            panel.setAllowsMultipleSelection(parameters.allowsMultipleSelection());
+            panel.setCanChooseDirectories(parameters.allowsDirectories());
+            let urls = (panel.runModal() == NSModalResponseOK).then(|| panel.URLs());
+            completion_handler.call((urls.as_ref().map_or(std::ptr::null_mut(), |urls| Retained::as_ptr(urls).cast_mut()),));
         }
 
         #[unsafe(method(webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:))]
@@ -237,7 +267,7 @@ define_class!(
                 .ok()
                 .and_then(|map| map.get(&key).cloned())
                 .unwrap_or_else(|| "deny".into());
-            let _ = self.ivars().events.send(EngineEvent::Permission {
+            let _ = self.ivars().events.borrow().send(EngineEvent::Permission {
                 tab_id: self.ivars().tab_id.clone(),
                 origin,
                 kind: kind.into(),
@@ -276,7 +306,7 @@ define_class!(
         ) {
             if ns_string(&message.name()) == "nxShortcut" {
                 if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key), false)) {
-                    let _ = self.ivars().events.send(EngineEvent::Shortcut(shortcut));
+                    let _ = self.ivars().events.borrow().send(EngineEvent::Shortcut(shortcut));
                 }
             }
         }
@@ -297,7 +327,7 @@ impl NxWebDelegate {
         let title = unsafe { web_view.title() }
             .map(|title| ns_string(&title))
             .unwrap_or_default();
-        let _ = self.ivars().events.send(EngineEvent::Navigated {
+        let _ = self.ivars().events.borrow().send(EngineEvent::Navigated {
             tab_id: self.ivars().tab_id.clone(),
             url,
             title,
@@ -307,7 +337,8 @@ impl NxWebDelegate {
     }
 }
 
-struct LiveTab {
+/// A page with its delegate, handed between window engines with `take_tab` / `adopt_tab`.
+pub struct LiveTab {
     view: Retained<WKWebView>,
     delegate: Retained<NxWebDelegate>,
 }
@@ -326,8 +357,8 @@ pub struct MacEngine {
     settings: EngineSettings,
     https_only: Arc<AtomicBool>,
     dimmers: HashMap<String, Retained<NSView>>,
-    _monitor: Option<Retained<AnyObject>>,
-    _page_monitor: Option<Retained<AnyObject>>,
+    /// `windowNumber` of the window this engine is attached to; keys its entry in `WINDOWS`.
+    window_no: isize,
     /// Where session cookies are snapshotted, as `<dir>/<data store id>.plist`; None when not restoring.
     cookie_dir: Option<PathBuf>,
     /// Stores with a snapshot still to restore before their first page loads.
@@ -342,7 +373,8 @@ pub struct MacEngine {
 }
 
 impl MacEngine {
-    pub fn new() -> Self {
+    /// `extensions` is the app's one extension host, shared by every window; `None` creates it.
+    pub fn new(extensions: Option<Extensions>) -> Self {
         if let Ok(home) = std::env::var("HOME") {
             if let Err(error) = unify_data_root(&std::path::Path::new(&home).join("Library/WebKit")) {
                 eprintln!("could not unify WebKit data stores: {error}");
@@ -350,10 +382,14 @@ impl MacEngine {
         }
         let (events_tx, events_rx) = mpsc::channel();
         let permissions = Arc::new(Mutex::new(HashMap::new()));
-        let monitor = install_shortcuts(events_tx.clone());
-        let page_monitor = install_page_clicks();
+        // App-wide monitors; they route each event to its own window's engine through `WINDOWS`.
+        static MONITORS: OnceLock<()> = OnceLock::new();
+        MONITORS.get_or_init(|| {
+            std::mem::forget(install_shortcuts());
+            std::mem::forget(install_page_clicks());
+        });
         Self {
-            extensions: Extensions::new(events_tx.clone()),
+            extensions: extensions.unwrap_or_else(|| Extensions::new(events_tx.clone())),
             events_tx,
             events_rx,
             tabs: HashMap::new(),
@@ -367,8 +403,7 @@ impl MacEngine {
             settings: EngineSettings::default(),
             https_only: Arc::new(AtomicBool::new(false)),
             dimmers: HashMap::new(),
-            _monitor: monitor,
-            _page_monitor: page_monitor,
+            window_no: 0,
             cookie_dir: None,
             cookie_restore: HashSet::new(),
             cookie_used: HashSet::new(),
@@ -447,8 +482,29 @@ impl MacEngine {
         unsafe { store.httpCookieStore().setCookies_completionHandler(&cookies, Some(&done)) };
     }
 
+    /// Takes a live page out of this window, still loaded, for another window's engine to `adopt_tab`.
+    pub fn take_tab(&mut self, tab_id: &str) -> Option<LiveTab> {
+        let live = self.tabs.remove(tab_id)?;
+        live.view.removeFromSuperview();
+        if let Some(dimmer) = self.dimmers.remove(tab_id) {
+            dimmer.removeFromSuperview();
+        }
+        self.stacked.clear();
+        if self.visible.as_deref() == Some(tab_id) {
+            self.visible = None;
+        }
+        Some(live)
+    }
+
+    /// Takes over a page from another window; it shows on the next `place_tab`.
+    pub fn adopt_tab(&mut self, tab_id: &str, live: LiveTab) {
+        *live.delegate.ivars().events.borrow_mut() = self.events_tx.clone();
+        live.view.setHidden(true);
+        self.tabs.insert(tab_id.to_string(), live);
+    }
+
     pub fn take_page_click(&mut self) -> Option<String> {
-        PAGE_CLICK.lock().ok().and_then(|mut click| click.take())
+        with_window(self.window_no, |state| state.click.take()).flatten()
     }
 
     pub fn focus_page(&mut self) {
@@ -482,6 +538,22 @@ impl MacEngine {
     pub fn set_alpha(&mut self, tab_id: &str, alpha: f64) {
         if let Some(live) = self.tabs.get(tab_id) {
             live.view.setAlphaValue(alpha);
+        }
+    }
+
+    /// Opens WebKit's native Web Inspector for the tab (private `_inspector`; needs developer extras on).
+    pub fn inspect(&mut self, tab_id: &str) {
+        let Some(live) = self.tabs.get(tab_id) else {
+            return;
+        };
+        if !live.view.respondsToSelector(sel!(_inspector)) {
+            return;
+        }
+        unsafe {
+            let inspector: *mut AnyObject = msg_send![&*live.view, _inspector];
+            if let Some(inspector) = inspector.as_ref() {
+                let _: () = msg_send![inspector, show];
+            }
         }
     }
 
@@ -524,7 +596,7 @@ impl MacEngine {
 
     /// While a chrome modal is open, pages stay visible but dimmed and stop taking clicks.
     pub fn set_modal(&mut self, on: bool) {
-        MODAL.store(on, Ordering::Relaxed);
+        with_window(self.window_no, |state| state.modal = on);
         // Dim layers live inside each page view: sibling views do not reliably draw over WebKit's layers.
         self.dimmers.retain(|id, dimmer| {
             let keep = on && self.tabs.contains_key(id);
@@ -600,9 +672,7 @@ impl MacEngine {
             .iter()
             .map(|zone| NSRect::new(NSPoint::new(zone.x, height - zone.y - zone.height), NSSize::new(zone.width, zone.height)))
             .collect();
-        if let Ok(mut grabs) = GRABS.lock() {
-            *grabs = rects;
-        }
+        with_window(self.window_no, |state| state.grabs = rects);
     }
 
     pub fn set_page_holes(&mut self, holes: &[(String, LogicalRect)], notches: &[Notch]) {
@@ -634,9 +704,8 @@ impl MacEngine {
             );
             placed.push(PageHole { tab_id: tab_id.clone(), rect });
         }
-        if let Ok(mut shared) = HOLES.lock() {
-            *shared = placed;
-        }
+        let rects = placed.iter().map(|hole| hole.rect).collect::<Vec<_>>();
+        with_window(self.window_no, |state| state.holes = placed);
         // Mask changes must land in the same frame as the GPUI paint, not animate in.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
@@ -645,10 +714,9 @@ impl MacEngine {
             let path = CGMutablePath::new();
             let bounds = chrome.bounds();
             CGMutablePath::add_rect(Some(&path), std::ptr::null(), bounds);
-            let holes = HOLES.lock().ok();
-            if let Some(holes) = holes.as_ref() {
-                for hole in holes.iter() {
-                    let local = chrome.convertRect_fromView(hole.rect, Some(content));
+            {
+                for hole in rects {
+                    let local = chrome.convertRect_fromView(hole, Some(content));
                     let rect = if chrome.isFlipped() == host.isGeometryFlipped() {
                         local
                     } else {
@@ -708,7 +776,20 @@ impl MacEngine {
 
 impl Default for MacEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
+    }
+}
+
+impl Drop for MacEngine {
+    fn drop(&mut self) {
+        // A closed window's pages stop; their tabs stay in the model and load again wherever they are shown next.
+        for id in self.tabs.keys().cloned().collect::<Vec<_>>() {
+            self.extensions.suspended(&id);
+            self.drop_view(&id);
+        }
+        if let Some(windows) = WINDOWS.lock().ok().as_mut().and_then(|windows| windows.as_mut()) {
+            windows.remove(&self.window_no);
+        }
     }
 }
 
@@ -717,6 +798,9 @@ impl WebEngine for MacEngine {
         let chrome = unsafe { Retained::retain(ns_view as *mut NSView) }
             .ok_or_else(|| anyhow::anyhow!("GPUI view pointer was null"))?;
         let window = chrome.window().ok_or_else(|| anyhow::anyhow!("GPUI view has no window"))?;
+        self.window_no = window.windowNumber();
+        let events = self.events_tx.clone();
+        with_window(self.window_no, |state| state.events = Some(events));
         let content = window
             .contentView()
             .ok_or_else(|| anyhow::anyhow!("window has no content view"))?;
@@ -770,6 +854,7 @@ impl WebEngine for MacEngine {
         let view: Retained<NxWebView> = unsafe { msg_send![NxWebView::alloc(mtm), initWithFrame: frame, configuration: &*configuration] };
         let view = Retained::into_super(view);
         apply_view_settings(&view, &self.settings);
+        detach_inspector(&view, mtm);
         let delegate = self.page_delegate(tab_id, mtm);
         unsafe {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -992,7 +1077,7 @@ impl MacEngine {
         NxWebDelegate::new(
             mtm,
             DelegateIvars {
-                events: self.events_tx.clone(),
+                events: RefCell::new(self.events_tx.clone()),
                 tab_id: tab_id.to_string(),
                 permissions: self.permissions.clone(),
                 https_only: self.https_only.clone(),
@@ -1030,10 +1115,25 @@ fn observe(view: &WKWebView, delegate: &NxWebDelegate) {
     }
 }
 
+/// WebKit docks the inspector into the web view's superview (our shared tab container), resizing
+/// views our layout owns. A hidden zero-size attachment view makes it unable to dock, so it opens
+/// in its own window. WebKit holds the view weakly; as our subview it lives as long as the page.
+fn detach_inspector(view: &WKWebView, mtm: MainThreadMarker) {
+    if !view.respondsToSelector(sel!(_setInspectorAttachmentView:)) {
+        return;
+    }
+    let anchor = NSView::new(mtm);
+    anchor.setHidden(true);
+    view.addSubview(&anchor);
+    let _: () = unsafe { msg_send![view, _setInspectorAttachmentView: &*anchor] };
+}
+
 fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
     let agent = (!settings.user_agent.trim().is_empty()).then(|| NSString::from_str(settings.user_agent.trim()));
     unsafe {
         view.setInspectable(settings.inspectable);
+        // Private key: adds Inspect Element to the page's context menu (isInspectable only covers Safari's Develop menu).
+        let _: () = msg_send![&*view.configuration().preferences(), setValue: &*NSNumber::new_bool(settings.inspectable), forKey: ns_string!("developerExtrasEnabled")];
         view.setCustomUserAgent(agent.as_deref());
         view.setPageZoom(settings.page_zoom);
     }
@@ -1170,9 +1270,13 @@ fn parse_uuid(id: &str) -> anyhow::Result<Retained<NSUUID>> {
     NSUUID::from_string(&NSString::from_str(id)).context("invalid WebKit data store UUID")
 }
 
-fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>> {
+fn install_shortcuts() -> Option<Retained<AnyObject>> {
     let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
+        let window = MainThreadMarker::new().and_then(|mtm| event_ref.window(mtm));
+        let Some(events) = window.and_then(|window| with_window(window.windowNumber(), |state| state.events.clone()).flatten()) else {
+            return event.as_ptr();
+        };
         let flags = event_ref.modifierFlags();
         let shift = flags.contains(NSEventModifierFlags::Shift);
         if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command)
@@ -1184,6 +1288,10 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
             if let Some(chars) = event_ref.charactersIgnoringModifiers() {
                 let key = ns_string(&chars).to_ascii_lowercase();
                 // A focused page gets these first; the key script reports them back if it ignores them.
+                if key == "i" && flags.contains(NSEventModifierFlags::Option) {
+                    let _ = events.send(EngineEvent::Shortcut(Shortcut::Inspect));
+                    return std::ptr::null_mut();
+                }
                 let page_first = PAGE_FIRST_KEYS.contains(&key.as_str()) && page_has_focus(event_ref);
                 if let Some(shortcut) = shortcut_for(&key, shift).filter(|_| !page_first) {
                     let _ = events.send(EngineEvent::Shortcut(shortcut));
@@ -1207,14 +1315,34 @@ struct PageHole {
     rect: NSRect,
 }
 
-static HOLES: Mutex<Vec<PageHole>> = Mutex::new(Vec::new());
-static PAGE_CLICK: Mutex<Option<String>> = Mutex::new(None);
-static MODAL: AtomicBool = AtomicBool::new(false);
-/// Window resize rims (content coordinates); they belong to the chrome even where a page lies beneath.
-static GRABS: Mutex<Vec<NSRect>> = Mutex::new(Vec::new());
+/// What the app-wide event monitors and hit-test need to know about one browser window.
+#[derive(Default)]
+struct WindowState {
+    holes: Vec<PageHole>,
+    /// Window resize rims (content coordinates); they belong to the chrome even where a page lies beneath.
+    grabs: Vec<NSRect>,
+    /// A chrome modal is open; pages take no clicks.
+    modal: bool,
+    /// Tab whose page was clicked since the engine last asked.
+    click: Option<String>,
+    /// Where this window's shortcuts go.
+    events: Option<Sender<EngineEvent>>,
+}
 
-fn in_grab_zone(point: NSPoint) -> bool {
-    GRABS.lock().is_ok_and(|grabs| grabs.iter().any(|rect| hole_contains(*rect, point)))
+/// Per browser window, by `windowNumber`.
+static WINDOWS: Mutex<Option<HashMap<isize, WindowState>>> = Mutex::new(None);
+
+fn with_window<T>(window_no: isize, f: impl FnOnce(&mut WindowState) -> T) -> Option<T> {
+    let mut windows = WINDOWS.lock().ok()?;
+    Some(f(windows.get_or_insert_with(HashMap::new).entry(window_no).or_default()))
+}
+
+/// Whether `point` (content coordinates) is over a page and outside the chrome's grab rims.
+fn over_page(state: &WindowState, point: NSPoint) -> Option<&PageHole> {
+    if state.modal || state.grabs.iter().any(|rect| hole_contains(*rect, point)) {
+        return None;
+    }
+    state.holes.iter().rev().find(|hole| hole_contains(hole.rect, point))
 }
 
 fn hole_contains(rect: NSRect, point: NSPoint) -> bool {
@@ -1237,16 +1365,10 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
             return event.as_ptr();
         };
         let point = content.convertPoint_fromView(event_ref.locationInWindow(), None);
-        if MODAL.load(Ordering::Relaxed) || in_grab_zone(point) {
-            return event.as_ptr();
-        }
-        if let Ok(holes) = HOLES.lock() {
-            if let Some(hit) = holes.iter().rev().find(|hole| hole_contains(hole.rect, point)) {
-                if let Ok(mut click) = PAGE_CLICK.lock() {
-                    *click = Some(hit.tab_id.clone());
-                }
-            }
-        }
+        with_window(window.windowNumber(), |state| {
+            // The latest click wins: a page click still waiting for the UI tick would blur an address field opened since.
+            state.click = over_page(state, point).map(|hit| hit.tab_id.clone());
+        });
         event.as_ptr()
     });
     let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::LeftMouseDown, &block) };
@@ -1284,8 +1406,9 @@ fn install_hit_proxy(chrome: &NSView) {
 }
 
 extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *mut AnyObject {
-    if let (false, Ok(holes)) = (MODAL.load(Ordering::Relaxed), HOLES.lock()) {
-        if !in_grab_zone(point) && holes.iter().any(|hole| hole_contains(hole.rect, point)) {
+    let view = unsafe { &*std::ptr::from_ref(this).cast::<NSView>() };
+    if let Some(window) = view.window() {
+        if with_window(window.windowNumber(), |state| over_page(state, point).is_some()) == Some(true) {
             return std::ptr::null_mut();
         }
     }

@@ -38,6 +38,10 @@ pub struct Settings {
     pub density: String,
     /// Page zoom per host, for hosts zoomed away from `page_zoom`.
     pub site_zoom: BTreeMap<String, f64>,
+    /// Spaces open in their own window, reopened at launch.
+    pub detached_spaces: Vec<String>,
+    /// Hidden spaces each holding one window torn off into an OS window of its own; never shown as spaces.
+    pub detached_windows: Vec<String>,
 }
 
 impl Default for Settings {
@@ -63,6 +67,8 @@ impl Default for Settings {
             reduce_motion: false,
             density: "comfortable".into(),
             site_zoom: BTreeMap::new(),
+            detached_spaces: Vec::new(),
+            detached_windows: Vec::new(),
         }
     }
 }

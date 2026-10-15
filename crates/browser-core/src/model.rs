@@ -451,13 +451,39 @@ impl Model {
         self.reload()
     }
 
+    /// Points the model at another window's space without saving it as the launch context.
+    pub fn set_active(&mut self, session_id: &str) -> anyhow::Result<()> {
+        let Some(profile_id) = self.sessions.iter().find(|session| session.id == session_id).map(|session| session.profile_id.clone()) else {
+            return Ok(());
+        };
+        self.active_session_id = session_id.to_string();
+        if profile_id != self.active_profile_id {
+            self.active_profile_id = profile_id;
+            self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
+        }
+        Ok(())
+    }
+
+    /// A new space in the active profile holding no tabs, for tabs about to be moved in; stays in the background.
+    pub fn create_empty_session(&mut self) -> anyhow::Result<String> {
+        let taken = self.profile_sessions().into_iter().map(|session| session.name.clone()).collect::<Vec<_>>();
+        let name = (1..).map(|n| format!("Space {n}")).find(|name| !taken.contains(name)).unwrap_or_default();
+        let id = Uuid::new_v4().to_string();
+        self.storage.execute(
+            "INSERT INTO sessions (id, profile_id, name, active) VALUES (?1, ?2, ?3, 0)",
+            params![id, self.active_profile_id, name],
+        )?;
+        self.reload()?;
+        Ok(id)
+    }
+
     /// Moves tabs of the active space into another space of this profile; an emptied space keeps a home tab.
     pub fn move_tabs_to_session(&mut self, ids: &[String], session_id: &str) -> anyhow::Result<()> {
         let from = self.active_session_id.clone();
         if session_id == from || !self.profile_sessions().iter().any(|session| session.id == session_id) {
             return Ok(());
         }
-        let base = self.tabs.iter().filter(|tab| tab.session_id == session_id).count() as i32;
+        let base = self.tabs.iter().filter(|tab| tab.session_id == session_id).map(|tab| tab.position + 1).max().unwrap_or(0);
         for (index, id) in ids.iter().enumerate() {
             self.storage.execute(
                 "UPDATE tabs SET session_id = ?1, active = 0, position = ?2 WHERE id = ?3 AND session_id = ?4",
@@ -474,7 +500,8 @@ impl Model {
 
     pub fn create_tab(&mut self, url: &str) -> anyhow::Result<String> {
         let session_id = self.active_session_id.clone();
-        let position = self.session_tabs().len() as i32;
+        // Closed and moved tabs leave gaps in positions, so the count could land mid-list.
+        let position = self.session_tabs().last().map_or(0, |tab| tab.position + 1);
         self.mark_active_background();
         let id = self.insert_tab(&session_id, url, "New Tab", true, position, TabState::Active)?;
         self.reload()?;
@@ -1126,15 +1153,16 @@ impl Model {
         self.profiles = query_profiles(&self.storage)?;
         self.sessions = query_sessions(&self.storage)?;
         self.tabs = query_tabs(&self.storage)?;
+        // Only at open: afterwards the in-memory ids lead, and windows pin their own (see `set_active`).
         if let Ok((profile_id, session_id)) = self.storage.conn().query_row(
             "SELECT profile_id, session_id FROM active_context WHERE id = 1",
             [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         ) {
-            if self.profiles.iter().any(|profile| profile.id == profile_id) {
+            if self.active_profile_id.is_empty() && self.profiles.iter().any(|profile| profile.id == profile_id) {
                 self.active_profile_id = profile_id;
             }
-            if self.sessions.iter().any(|session| session.id == session_id) {
+            if self.active_session_id.is_empty() && self.sessions.iter().any(|session| session.id == session_id) {
                 self.active_session_id = session_id;
             }
         }
@@ -1303,6 +1331,16 @@ mod tests {
     }
 
     #[test]
+    fn new_tab_opens_last_after_a_close() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let a = model.create_tab("https://a.com/").unwrap();
+        model.create_tab("https://b.com/").unwrap();
+        model.close_tab(&a).unwrap();
+        let c = model.create_tab("https://c.com/").unwrap();
+        assert_eq!(model.session_tabs().last().unwrap().id, c);
+    }
+
+    #[test]
     fn empty_navigation_url_keeps_the_tab() {
         let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
         let id = model.active_tab().unwrap().id.clone();
@@ -1448,5 +1486,36 @@ mod tests {
         model.remove_extension("abc").unwrap();
         assert!(model.extensions.is_empty());
         let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn detached_space_keeps_its_tabs_and_pin() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let main = model.active_session_id.clone();
+        let moved = model.create_tab("https://example.com/").unwrap();
+        let space = model.create_empty_session().unwrap();
+        assert_eq!(model.active_session_id, main);
+        model.move_tabs_to_session(&[moved.clone()], &space).unwrap();
+        model.set_active(&space).unwrap();
+        assert_eq!(model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(), [moved.clone()]);
+        // A tab opened while pinned stays in the pinned space even though reload runs.
+        let second = model.create_tab("https://rust-lang.org/").unwrap();
+        assert_eq!(model.active_session_id, space);
+        model.set_active(&main).unwrap();
+        assert!(model.session_tabs().iter().all(|tab| tab.id != moved && tab.id != second));
+    }
+    #[test]
+    fn torn_off_window_merges_back_and_its_space_goes() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let main = model.active_session_id.clone();
+        let tab = model.create_tab("https://example.com/").unwrap();
+        let hidden = model.create_empty_session().unwrap();
+        model.move_tabs_to_session(&[tab.clone()], &hidden).unwrap();
+        model.set_active(&hidden).unwrap();
+        model.move_tabs_to_session(&[tab.clone()], &main).unwrap();
+        model.set_active(&main).unwrap();
+        model.delete_session(&hidden).unwrap();
+        assert!(model.session_tabs().iter().any(|t| t.id == tab));
+        assert!(!model.sessions.iter().any(|s| s.id == hidden));
+        assert_eq!(model.active_session_id, main);
     }
 }

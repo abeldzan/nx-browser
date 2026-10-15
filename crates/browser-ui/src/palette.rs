@@ -21,7 +21,7 @@ const SCOPES: [(&str, &str, &str); 5] = [
     ("@spaces", "", "Spaces"),
 ];
 
-const ACTIONS: [(&str, &str, Shortcut); 17] = [
+const ACTIONS: [(&str, &str, Shortcut); 18] = [
     ("New tab", "⌘T", Shortcut::NewTab),
     ("Close tab", "⌘W", Shortcut::CloseTab),
     ("Reopen closed tab", "⇧⌘T", Shortcut::ReopenTab),
@@ -32,6 +32,7 @@ const ACTIONS: [(&str, &str, Shortcut); 17] = [
     ("Bookmark page", "⌘D", Shortcut::Bookmark),
     ("Open settings", "⌘,", Shortcut::Settings),
     ("Print page", "⌘P", Shortcut::Print),
+    ("Inspect page", "⌥⌘I", Shortcut::Inspect),
     ("Zoom in", "⌘+", Shortcut::ZoomIn),
     ("Zoom out", "⌘-", Shortcut::ZoomOut),
     ("Reset zoom", "⌘0", Shortcut::ZoomReset),
@@ -171,7 +172,7 @@ impl BrowserWindow {
         let typed = self.palette_input.read(cx).content().trim().to_string();
         let (only, query) = scope(&typed);
         let wants = |section: &str| only.is_none_or(|only| only == section);
-        let model = self.model.lock().expect("model");
+        let model = self.model.lock();
         let settings = model.settings.clone();
         // An active bang is the whole intent: show only what Enter will do, with the site's icon.
         if let Some((trigger, site, template)) = self.palette_bang {
@@ -247,7 +248,10 @@ impl BrowserWindow {
             }
         }
         if wants("Spaces") {
-            for (index, session) in model.profile_sessions().into_iter().enumerate() {
+            // Torn-off windows show one space and never switch.
+            let detached = [model.settings.detached_spaces.as_slice(), model.settings.detached_windows.as_slice()].concat();
+            let listed = self.model.detached.is_none();
+            for (index, session) in model.profile_sessions().into_iter().filter(|s| listed && !detached.contains(&s.id)).enumerate() {
                 let name = if session.name.is_empty() { format!("Space {}", index + 1) } else { session.name.clone() };
                 let hint = if session.active { "Current space" } else { "Switch to space" };
                 add(&name, item("Spaces", name.clone(), hint, Run::Space(session.id.clone())));
@@ -316,24 +320,24 @@ impl BrowserWindow {
             Run::Downloads => (self.downloads_open, keep_focus) = (true, true),
             Run::Extensions => (self.extensions_open, keep_focus) = (true, true),
             Run::CopyUrl => {
-                let url = self.model.lock().expect("model").active_tab().map(|tab| tab.url.clone()).unwrap_or_default();
+                let url = self.model.lock().active_tab().map(|tab| tab.url.clone()).unwrap_or_default();
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
                 self.status = "Copied page URL".into();
             }
             Run::Duplicate => {
-                let tab = self.model.lock().expect("model").active_tab().map(|tab| (tab.id.clone(), tab.url.clone()));
+                let tab = self.model.lock().active_tab().map(|tab| (tab.id.clone(), tab.url.clone()));
                 if let Some((id, url)) = tab {
                     self.new_tab_in(&id, Some(&url), cx);
                 }
             }
             Run::CloseOthers => {
                 let active = self.active_tab_id();
-                let others = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone())
+                let others = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone())
                     .filter(|id| Some(id) != active.as_ref()).collect::<Vec<_>>();
                 self.close_tabs(others, cx);
             }
             Run::CloseAll => {
-                let all = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect();
+                let all = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect();
                 self.close_tabs(all, cx);
             }
             Run::NewSpace => self.with_model(|model| { let _ = model.create_session(); }),

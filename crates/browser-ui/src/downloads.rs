@@ -14,7 +14,7 @@ impl BrowserWindow {
     pub(crate) fn downloads_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let danger = cx.theme().danger();
-        let downloads = self.model.lock().expect("model").downloads().unwrap_or_default();
+        let downloads = self.model.lock().downloads().unwrap_or_default();
         let mut list = v_stack().w_full().gap(px(2.));
         if downloads.is_empty() {
             list = list.child(div().p(px(16.)).text_color(paint.muted).child("No downloads yet"));
@@ -139,7 +139,7 @@ impl BrowserWindow {
                         h_stack()
                             .gap(px(6.))
                             .child(action_button("downloads-clear", "Clear", Kind::Secondary, true, cx, |this, cx| {
-                                let _ = this.model.lock().expect("model").clear_finished_downloads();
+                                let _ = this.model.lock().clear_finished_downloads();
                                 cx.notify();
                             }))
                             .child(icon_button("downloads-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
