@@ -335,6 +335,18 @@ impl Extensions {
             self.handle().changed(tab_id);
             return;
         }
+        // Side panels aren't tabs in Chrome: Kluff only trusts its panel's messages when `sender.tab` is unset.
+        if self.is_side_panel(url, store_id) {
+            let reply = {
+                let mut state = self.0.borrow_mut();
+                let index = state.pending_tabs.iter().position(|(pending, _)| pending == url);
+                index.map(|index| state.pending_tabs.remove(index).1)
+            };
+            if let Some(reply) = reply {
+                reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
+            }
+            return;
+        }
         let tab = NxExtTab::new(
             mtm,
             TabIvars {
@@ -403,6 +415,18 @@ impl Extensions {
         if let Some(controller) = self.tab_controller(&tab) {
             unsafe { controller.didActivateTab_previousActiveTab(ProtocolObject::from_ref(&*tab), previous.as_deref().map(ProtocolObject::from_ref)) };
         }
+    }
+
+    fn is_side_panel(&self, url: &str, store_id: &str) -> bool {
+        let Some(context) = url.strip_prefix(SCHEME).and_then(|rest| rest.split('/').next()).and_then(|id| self.context(id, store_id)) else {
+            return false;
+        };
+        let manifest = unsafe { context.webExtension().manifest() };
+        let value: Option<Retained<AnyObject>> = unsafe { msg_send![&*manifest, valueForKeyPath: &*NSString::from_str("side_panel.default_path")] };
+        let Some(path) = value.and_then(|value| value.downcast::<NSString>().ok()) else {
+            return false;
+        };
+        url_string(NSURL::URLWithString_relativeToURL(&path, Some(&*unsafe { context.baseURL() }))).as_deref() == Some(url)
     }
 
     fn context(&self, id: &str, store_id: &str) -> Option<Retained<WKWebExtensionContext>> {

@@ -332,7 +332,7 @@ impl BrowserWindow {
             row = row.child(
                 div()
                     .id("titlebar-add-extension")
-                    .h(px(24.))
+                    .h(px(22.))
                     .px(px(10.))
                     .mr(px(4.))
                     .flex()
@@ -359,7 +359,7 @@ impl BrowserWindow {
                 div()
                     .id(SharedString::from(format!("pinned-{id}")))
                     .relative()
-                    .size(px(26.))
+                    .size(px(22.))
                     .flex()
                     .items_center()
                     .justify_center()

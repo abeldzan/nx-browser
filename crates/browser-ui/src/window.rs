@@ -88,6 +88,7 @@ pub struct BrowserWindow {
     /// A page was clicked while the address was being edited; end the edit on the next render.
     blur_address: bool,
     find_open: bool,
+    focus_find: bool,
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_index: usize,
@@ -104,6 +105,9 @@ pub struct BrowserWindow {
     subscriptions: Vec<Subscription>,
     pub(crate) status: SharedString,
     renaming: bool,
+    /// Space whose chip is showing the rename field.
+    space_rename: Option<String>,
+    space_input: Entity<InputState>,
     confirm_delete: bool,
     permission: Option<(String, String)>,
     downloads_tx: Sender<DownloadUpdate>,
@@ -135,8 +139,8 @@ pub struct BrowserWindow {
     rail_grab: Rc<Cell<gpui::Point<Pixels>>>,
     /// Where the dragged tab pill was grabbed, so it stays under the pointer at that spot.
     tab_grab: Rc<Cell<gpui::Point<Pixels>>>,
-    /// A tab or profile being dragged and its row in the order shown while dragging; it is dropped into that order.
-    reorder: Option<(String, Vec<String>)>,
+    /// A tab or profile being dragged, and the row it would drop into.
+    reorder: Option<Reorder>,
     find: Tween,
     panel_tween: Tween,
     /// Sidebar page still drawn while its panel slides shut.
@@ -196,6 +200,29 @@ impl Tween {
     }
 }
 
+/// A drag over reorderable rows: tab rows keyed by window, or the profile rail.
+struct Reorder {
+    id: String,
+    size: gpui::Size<Pixels>,
+    /// Where the dragged item's top-left is drawn.
+    at: gpui::Point<Pixels>,
+    /// The row under the dragged item and its order with a gap for it there; none off every row.
+    row: Option<String>,
+    order: Vec<String>,
+}
+
+/// `ids` of row `key` as drawn during the drag in `state`: with the gap where it hovers,
+/// and without the dragged item in the row it left for another.
+fn shown_row(state: Option<&Reorder>, key: &str, ids: &[String]) -> Vec<String> {
+    match state {
+        Some(state) if state.row.as_deref() == Some(key) => state.order.clone(),
+        Some(state) if state.row.is_some() => ids.iter().filter(|id| **id != state.id).cloned().collect(),
+        _ => ids.to_vec(),
+    }
+}
+
+const RAIL_ROW: &str = "rail";
+
 struct SelfTest {
     stage: u8,
     tab_a: String,
@@ -229,6 +256,7 @@ impl BrowserWindow {
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let rename_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -284,6 +312,17 @@ impl BrowserWindow {
                     let _ = this.model.lock().expect("model").rename_profile(&id, &name);
                     this.renaming = false;
                 }
+            }),
+            cx.subscribe(&space_input, |this, input, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit | InputStateEvent::Blur => {
+                    if let Some(id) = this.space_rename.take() {
+                        let name = input.read(cx).content().to_string();
+                        this.with_model(|model| { let _ = model.rename_session(&id, &name); });
+                        cx.notify();
+                    }
+                }
+                _ => {}
             }),
             cx.subscribe(&home_input, |this, input, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
@@ -363,6 +402,7 @@ impl BrowserWindow {
             address_editing: false,
             blur_address: false,
             find_open: false,
+            focus_find: false,
             palette_open: false,
             palette_input,
             palette_index: 0,
@@ -378,6 +418,8 @@ impl BrowserWindow {
             subscriptions,
             status: "Ready".into(),
             renaming: false,
+            space_rename: None,
+            space_input,
             confirm_delete: false,
             permission: None,
             downloads_tx,
@@ -471,11 +513,10 @@ impl BrowserWindow {
         }
         if let Some(id) = self.engine.take_page_click() {
             changed = true;
-            // Page clicks never reach GPUI, so the address input would stay focused and expanded.
-            if self.address_editing || self.address_focused {
-                self.blur_address = true;
-                cx.notify();
-            }
+            // Page clicks never reach GPUI, so whichever input had GPUI focus would keep it. A later click on
+            // that input then fires no Focus event, the chrome never takes first responder, and keys go to the page.
+            self.blur_address = true;
+            cx.notify();
             self.close_palette(cx);
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
@@ -645,7 +686,10 @@ impl BrowserWindow {
             Shortcut::Reload => self.reload(),
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
-            Shortcut::Find => self.find_open = true,
+            Shortcut::Find => {
+                self.find_open = true;
+                self.focus_find = true;
+            }
             Shortcut::Bookmark => self.bookmark(),
             Shortcut::Settings => self.toggle_settings(cx),
             Shortcut::ReopenTab => match self.with_model(|model| model.reopen_closed()) {
@@ -1301,6 +1345,15 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&palette.focus_handle(cx), cx));
     }
 
+    fn request_find_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_find) {
+            return;
+        }
+        let find = self.find_input.clone();
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&find.focus_handle(cx), cx));
+    }
+
     fn request_history_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.focus_history) {
             return;
@@ -1312,6 +1365,7 @@ impl BrowserWindow {
 
     fn request_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.blur_address) && !self.focus_address {
+            window.blur();
             self.end_address_edit(window, cx);
         }
         if !self.focus_address {
@@ -1404,10 +1458,19 @@ impl Render for BrowserWindow {
         self.attach(window);
         self.overlay_rects.clear();
         self.space_chips.clear();
+        if !cx.has_active_drag() {
+            // A drag dropped nowhere puts its item back in its gap.
+            if let Some(state) = self.reorder.take().filter(|state| state.row.is_none()) {
+                self.land(&state.id, state.at);
+            }
+        }
+        // Only rows drawn this frame count as drop targets.
+        self.slots.clear();
         self.apply_theme(window, cx);
         self.request_address_focus(window, cx);
         self.request_palette_focus(window, cx);
         self.request_history_focus(window, cx);
+        self.request_find_focus(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
         let tabs = self.model.lock().expect("model").session_tabs().into_iter().cloned().collect::<Vec<_>>();
@@ -1454,6 +1517,16 @@ impl Render for BrowserWindow {
             .bg(colors.bg)
             .text_color(colors.fg)
             .text_size(px(13.))
+            // Inputs only ask for keys on a GPUI focus change; clicking one that already had GPUI focus while a page
+            // held first responder left typing going to the page. Once the click settles, give keys to whoever GPUI focused.
+            .capture_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                let view = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    if window.focused(cx).is_some() {
+                        view.update(cx, |view, _| view.engine.focus_chrome());
+                    }
+                });
+            }))
             .child(self.titlebar(&sessions, &all_tabs, &active_session, cx))
             .child(
                 h_stack()
@@ -1486,16 +1559,14 @@ impl Render for BrowserWindow {
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
                 let id = event.drag(cx).0.id.clone();
                 this.tab_drag = Some((event.drag(cx).0.clone(), event.event.position));
-                let group = this.group_id(&id);
-                let row = this.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-                let row = row.into_iter().filter(|other| this.group_id(other) == group).collect();
-                this.preview_reorder(&id, row, event.event.position - this.tab_grab.get(), false, 2.0);
+                let rows = this.tab_rows();
+                this.preview_drag(&id, event.event.position - this.tab_grab.get(), rows, false, 2.0);
                 cx.notify();
             }))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<RailDrag>, _, cx| {
                 let id = event.drag(cx).0.id.clone();
                 let row = this.model.lock().expect("model").profiles.iter().map(|profile| profile.id.clone()).collect();
-                this.preview_reorder(&id, row, event.event.position - this.rail_grab.get(), true, 6.0);
+                this.preview_drag(&id, event.event.position - this.rail_grab.get(), vec![(RAIL_ROW.to_string(), row)], true, 6.0);
                 cx.notify();
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
@@ -1643,7 +1714,8 @@ impl BrowserWindow {
     ) -> gpui::Div {
         let paint = paint(cx);
         let mut profile_list = v_stack().w_full().items_center().gap(px(6.)).py(px(4.));
-        for profile in self.previewed(profiles.iter().collect(), |profile| &profile.id) {
+        let ids = profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>();
+        for profile in shown_row(self.reorder.as_ref(), RAIL_ROW, &ids).iter().filter_map(|id| profiles.iter().find(|profile| profile.id == *id)) {
             let index = profiles.iter().position(|other| other.id == profile.id).unwrap_or(0);
             let id = profile.id.clone();
             let active = profile.id == active_profile;
@@ -2187,7 +2259,10 @@ impl BrowserWindow {
         let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
         let carried = self.carried().map(|(id, _)| id);
         // Windows occlude, so only a tab dropped on empty stage lands here.
-        stage = stage.on_drop(cx.listener(|this, drag: &TabDrag, window, cx| this.detach_tab(&drag.0.id, window.mouse_position(), cx)));
+        stage = stage.on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
+            this.reorder = None;
+            this.detach_tab(&drag.0.id, window.mouse_position(), cx);
+        }));
         for tab in ordered {
             if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
                 stage = stage.child(self.snap_preview(*snap, &tab.id, cx));
@@ -2271,6 +2346,12 @@ impl BrowserWindow {
         cx.notify();
     }
 
+    /// The active profile's color for window decorations; the theme accent when it has none.
+    fn profile_accent(&self, paint: Paint) -> gpui::Hsla {
+        let model = self.model.lock().expect("model");
+        model.active_profile().filter(|profile| !profile.color.is_empty()).map_or(paint.accent, |profile| parse_hex(&profile.color))
+    }
+
     fn shown_tabs<'a>(&self, tabs: &'a [browser_core::Tab]) -> Vec<&'a browser_core::Tab> {
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         tabs.iter()
@@ -2285,6 +2366,7 @@ impl BrowserWindow {
 
     fn floating_window(&self, tab: &browser_core::Tab, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> Option<gpui::Div> {
         let paint = paint(cx);
+        let accent = self.profile_accent(paint);
         let active = tab.active;
         let maximized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized);
         let frame = self.chrome.get(&tab.id).and_then(|chrome| chrome.frame)?;
@@ -2306,9 +2388,9 @@ impl BrowserWindow {
                 .size_full()
                 .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
-                .border_color(if active { paint.accent } else { paint.border })
+                .border_color(if active { accent } else { paint.border })
                 .drag_over::<TabDrag>(move |style, drag, _, _| {
-                    if own.contains(&drag.0.id) { style } else { style.border_color(paint.accent).bg(paint.accent.opacity(0.12)) }
+                    if own.contains(&drag.0.id) { style } else { style.border_color(accent).bg(accent.opacity(0.12)) }
                 })
                 .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| this.drop_tab_on(&drag.0.id, &target, window.mouse_position(), cx)))
                 .shadow_md()
@@ -2423,7 +2505,16 @@ impl BrowserWindow {
     fn compact_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let mut row = h_stack().min_w(px(0.)).h_full().items_center().gap(px(2.)).text_size(px(12.));
-        for tab in self.previewed(members.to_vec(), |tab| &tab.id) {
+        let ids = members.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        for id in shown_row(self.reorder.as_ref(), &self.group_id(front), &ids) {
+            let Some(tab) = members.iter().find(|tab| tab.id == id) else {
+                // The gap for a tab dragged in from another window.
+                let width = self.reorder.as_ref().map_or(px(0.), |state| state.size.width);
+                row = row.child(
+                    div().id(SharedString::from(format!("ctab-{id}"))).relative().flex_none().w(width).h(px(self.pill_h())).child(self.measure_slot(&id, cx)),
+                );
+                continue;
+            };
             let shown = tab.id == front;
             if shown && tab.active && (self.address_editing || self.address_focused) {
                 row = row.child(
@@ -2723,26 +2814,30 @@ impl BrowserWindow {
                     .id(SharedString::from(format!("space-{id}")))
                     .group(hover_group.clone())
                     .relative()
-                    .h(px(28.))
-                    .px(px(10.))
-                    .gap(px(8.))
+                    .h(px(22.))
+                    .px(px(8.))
+                    .gap(px(6.))
                     .items_center()
-                    .rounded(px(8.))
+                    .rounded(px(6.))
+                    .text_size(px(12.))
                     .cursor_pointer()
                     .text_color(if active { paint.fg } else { paint.muted })
                     .when(active, |chip| chip.bg(paint.secondary))
                     .when(!active, |chip| chip.hover(|style| style.bg(paint.secondary.opacity(0.5)).text_color(paint.fg)))
                     .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.space_chips.push((chip_id, bounds))), |_, _, _, _| {}).absolute().size_full())
                     .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
-                    .child(session.name.clone())
+                    .map(|chip| match self.space_rename.as_deref() == Some(session.id.as_str()) {
+                        true => chip.child(input(&self.space_input, cx).w(px(96.)).text_size(px(12.)).text_color(paint.fg)),
+                        false => chip.child(session.name.clone()),
+                    })
                     .when(closable, |chip| {
                         chip.child(
                             div()
                                 .id(SharedString::from(format!("space-close-{close_id}")))
                                 .absolute()
-                                .top(px(-5.))
-                                .left(px(-5.))
-                                .size(px(16.))
+                                .top(px(-4.))
+                                .left(px(-4.))
+                                .size(px(14.))
                                 .rounded_full()
                                 .flex()
                                 .items_center()
@@ -2760,7 +2855,17 @@ impl BrowserWindow {
                                 })),
                         )
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            let name = this.model.lock().expect("model").sessions.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+                            this.space_input.update(cx, |input, cx| input.set_content_silent(name, cx));
+                            this.space_rename = Some(id.clone());
+                            this.engine.focus_chrome();
+                            let field = this.space_input.clone();
+                            window.defer(cx, move |window, cx| window.focus(&field.focus_handle(cx), cx));
+                            cx.notify();
+                            return;
+                        }
                         this.with_model(|model| { let _ = model.switch_session(&id); });
                         this.refresh_url(cx);
                     })),
@@ -2795,7 +2900,7 @@ impl BrowserWindow {
                     .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
                     .child(
                         icon_button("history-toggle", Icons::file_text())
-                            .box_size(rems(1.625))
+                            .box_size(rems(1.375))
                             .icon_size(rems(1.0))
                             .selected(self.history_open || self.history_modal)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -2806,7 +2911,7 @@ impl BrowserWindow {
                     .child(self.panel_icon("bookmarks-toggle", Icons::bookmark(), Some(SidebarPage::Bookmarks), cx))
                     .child(
                         icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
-                            .box_size(rems(1.625))
+                            .box_size(rems(1.375))
                             .icon_size(rems(1.0))
                             .selected(self.extensions_open)
                             // Opens only: a click outside the popover (this one included) already closes it.
@@ -3037,7 +3142,7 @@ impl BrowserWindow {
                 .h(px(frame.h))
                 .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
-                .border_color(paint.accent)
+                .border_color(self.profile_accent(paint))
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .child(measure_overlay(WINDOW_RADIUS, cx))
@@ -3069,98 +3174,143 @@ impl BrowserWindow {
         .size_full()
     }
 
-    /// Slides the items of a reordered row from where they are drawn now into their places in `order`, laid out `gap` apart.
-    fn slide_into(&mut self, order: &[String], gap: f32, vertical: bool) {
+    /// Slides a row's items from where they are drawn in `before` to their places in `after`, laid out `gap` apart.
+    /// Items new to the row just appear: the only one is the invisible gap for a dragged item.
+    fn slide_row(&mut self, before: &[String], after: &[String], gap: f32, vertical: bool) {
         if self.reduce_motion {
             return;
         }
-        let Some(slots) = order.iter().map(|id| self.slots.get(id).copied()).collect::<Option<Vec<_>>>() else {
-            return;
-        };
         let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
-        let Some(mut next) = slots.iter().map(|slot| along(slot.origin)).reduce(|a, b| if b < a { b } else { a }) else {
+        let start = before.iter().filter_map(|id| self.slots.get(id)).map(|slot| along(slot.origin)).reduce(|a, b| if b < a { b } else { a });
+        let (Some(mut next), Some(size)) = (start, self.reorder.as_ref().map(|state| state.size)) else {
             return;
         };
         let now = Instant::now();
-        for (id, slot) in order.iter().zip(&slots) {
-            let target = if vertical { gpui::point(slot.origin.x, next) } else { gpui::point(next, slot.origin.y) };
-            next += if vertical { slot.size.height } else { slot.size.width } + px(gap);
-            let from = slot.origin + self.slide_offset(id);
-            self.slides.insert(id.clone(), (from - target, now));
+        for id in after {
+            // A dragged item new to the row has no slot here yet, but its size is known.
+            let slot = self.slots.get(id).copied().filter(|_| before.contains(id));
+            let target = match slot {
+                Some(slot) if vertical => gpui::point(slot.origin.x, next),
+                Some(slot) => gpui::point(next, slot.origin.y),
+                None => gpui::Point::default(),
+            };
+            let span = slot.map_or(size, |slot| slot.size);
+            next += if vertical { span.height } else { span.width } + px(gap);
+            match slot {
+                Some(slot) => {
+                    let from = slot.origin + self.slide_offset(id);
+                    self.slides.insert(id.clone(), (from - target, now));
+                }
+                None => {
+                    self.slides.remove(id);
+                }
+            }
         }
     }
 
     /// Whether `id` is lifted out of its row by a drag, leaving its gap behind.
     fn picked(&self, id: &str, cx: &Context<Self>) -> bool {
-        cx.has_active_drag() && self.reorder.as_ref().is_some_and(|(dragged, _)| dragged == id)
+        cx.has_active_drag() && self.reorder.as_ref().is_some_and(|state| state.id == id)
     }
 
-    /// `items` in the order the drag in progress shows them, if it is their row.
-    fn previewed<T>(&self, mut items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
-        if let Some((_, order)) = &self.reorder {
-            if items.iter().all(|item| order.iter().any(|other| other == id(item))) {
-                items.sort_by_key(|item| order.iter().position(|other| other == id(item)));
-            }
+    /// Tab rows of the windows on show, back to front, each in its tab order.
+    fn tab_rows(&self) -> Vec<(String, Vec<String>)> {
+        let tabs = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let mut groups = Vec::<String>::new();
+        for id in tabs.iter().chain(&self.order) {
+            let group = self.group_id(id);
+            groups.retain(|other| *other != group);
+            groups.push(group);
         }
-        items
+        groups
+            .into_iter()
+            .map(|group| {
+                let ids = tabs.iter().filter(|id| self.group_id(id) == group).cloned().collect();
+                (group, ids)
+            })
+            .collect()
     }
 
-    /// Opens a gap in `row` under the pointer for the dragged `id`, sliding the others aside;
-    /// with the pointer off the row it goes back to how it was.
+    /// Opens a gap under the dragged `id` in whichever of `rows` it is over (the front one wins),
+    /// sliding that row's items aside and closing the gap in the row it left.
     /// `origin` is where the dragged item's top-left is drawn; its centre decides the gap.
-    fn preview_reorder(&mut self, id: &str, row: Vec<String>, origin: gpui::Point<Pixels>, vertical: bool, gap: f32) {
+    fn preview_drag(&mut self, id: &str, origin: gpui::Point<Pixels>, rows: Vec<(String, Vec<String>)>, vertical: bool, gap: f32) {
+        let old = self.reorder.take().filter(|state| state.id == id);
+        let Some(size) = old.as_ref().map(|state| state.size).or_else(|| self.slots.get(id).map(|slot| slot.size)) else {
+            return;
+        };
         let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
         let across = |p: gpui::Point<Pixels>| if vertical { p.x } else { p.y };
-        let slots = row.iter().filter_map(|other| self.slots.get(other).copied()).collect::<Vec<_>>();
-        let Some(own) = self.slots.get(id).copied().filter(|_| slots.len() == row.len()) else {
-            return;
-        };
-        let at = origin + gpui::point(own.size.width / 2., own.size.height / 2.);
-        let depth = if vertical { own.size.width } else { own.size.height };
-        let (first, last) = slots.iter().fold((along(own.origin), along(own.origin)), |(lo, hi), slot| {
-            let end = along(slot.origin) + if vertical { slot.size.height } else { slot.size.width };
-            (if along(slot.origin) < lo { along(slot.origin) } else { lo }, if end > hi { end } else { hi })
-        });
-        let over = (across(at) - across(own.center())).abs() < depth && along(at) > first - depth && along(at) < last + depth;
-        let mut order = row.clone();
-        if over {
-            order.retain(|other| other != id);
-            let index = order.iter().filter(|other| self.slots.get(*other).is_some_and(|slot| along(slot.center()) < along(at))).count();
-            order.insert(index, id.to_string());
+        let probe = origin + gpui::point(size.width / 2., size.height / 2.);
+        let (length, depth) = if vertical { (size.height, size.width) } else { (size.width, size.height) };
+        let mut target = None;
+        for (key, ids) in &rows {
+            let shown = shown_row(old.as_ref(), key, ids);
+            let Some(slots) = shown.iter().map(|other| self.slots.get(other).copied()).collect::<Option<Vec<_>>>() else {
+                continue;
+            };
+            let Some(first) = slots.first() else {
+                continue;
+            };
+            let (mut lo, mut hi, mut top, mut bottom) = (along(first.origin), along(first.origin), across(first.origin), across(first.origin));
+            for slot in &slots {
+                let (start, side) = (slot.origin, if vertical { (slot.size.height, slot.size.width) } else { (slot.size.width, slot.size.height) });
+                lo = if along(start) < lo { along(start) } else { lo };
+                hi = if along(start) + side.0 > hi { along(start) + side.0 } else { hi };
+                top = if across(start) < top { across(start) } else { top };
+                bottom = if across(start) + side.1 > bottom { across(start) + side.1 } else { bottom };
+            }
+            let over = along(probe) > lo - length / 2. && along(probe) < hi + length / 2. && across(probe) > top - depth / 2. && across(probe) < bottom + depth / 2.;
+            if over {
+                let mut order = shown.into_iter().filter(|other| other != id).collect::<Vec<_>>();
+                let index = order.iter().filter(|other| self.slots.get(*other).is_some_and(|slot| along(slot.center()) < along(probe))).count();
+                order.insert(index, id.to_string());
+                target = Some((key.clone(), order));
+            }
         }
-        let shown = self.reorder.as_ref().filter(|(dragged, _)| dragged == id).map_or(row, |(_, shown)| shown.clone());
-        if shown != order {
-            self.slide_into(&order, gap, vertical);
+        let (row, order) = target.map_or((None, Vec::new()), |(key, order)| (Some(key), order));
+        self.reorder = Some(Reorder { id: id.to_string(), size, at: origin, row, order });
+        for (key, ids) in &rows {
+            let before = shown_row(old.as_ref(), key, ids);
+            let after = shown_row(self.reorder.as_ref(), key, ids);
+            if before != after {
+                self.slide_row(&before, &after, gap, vertical);
+            }
         }
-        self.reorder = Some((id.to_string(), order));
     }
 
-    /// The order the drag of `id` shows, once it is dropped.
-    fn dropped_order(&mut self, id: &str) -> Option<Vec<String>> {
-        self.reorder.take().filter(|(dragged, _)| dragged == id).map(|(_, order)| order)
+    /// The order the drag of `id` showed for row `key`, once it is dropped there.
+    fn dropped_order(&mut self, id: &str, key: &str) -> Option<Vec<String>> {
+        self.reorder.take().filter(|state| state.id == id && state.row.as_deref() == Some(key)).map(|state| state.order)
     }
 
-    /// A tab dropped on its own window lands where the drag showed it; on another window it joins that one.
+    /// A tab dropped on a window lands where the drag showed it in that window's tabs.
     fn drop_tab_on(&mut self, id: &str, target: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        if self.group_id(id) != self.group_id(target) {
-            return self.move_tab_to_window(id, target, cx);
+        let group = self.group_id(target);
+        let own = self.group_id(id) == group;
+        let order = self.dropped_order(id, &group);
+        self.reorder = None;
+        if !own {
+            self.move_tab_to_window(id, target, cx);
         }
-        let Some(order) = self.dropped_order(id) else {
-            return;
-        };
-        // The window's row is a slice of the space's tab order: land before the next tab in it, or after the one before.
-        let mut rest = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        rest.retain(|other| other != id);
-        let at_row = order.iter().position(|other| other == id).unwrap_or(0);
-        let index = match (order.get(at_row + 1), at_row.checked_sub(1).and_then(|before| order.get(before))) {
-            (Some(next), _) => rest.iter().position(|other| other == next),
-            (None, Some(before)) => rest.iter().position(|other| other == before).map(|index| index + 1),
-            (None, None) => None,
-        };
-        if let Some(index) = index {
-            self.with_model(|model| { let _ = model.move_tab(id, index); });
+        if let Some(order) = &order {
+            // The window's row is a slice of the space's tab order: land before the next tab in it, or after the one before.
+            let mut rest = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+            rest.retain(|other| other != id);
+            let at_row = order.iter().position(|other| other == id).unwrap_or(0);
+            let index = match (order.get(at_row + 1), at_row.checked_sub(1).and_then(|before| order.get(before))) {
+                (Some(next), _) => rest.iter().position(|other| other == next),
+                (None, Some(before)) => rest.iter().position(|other| other == before).map(|index| index + 1),
+                (None, None) => None,
+            };
+            if let Some(index) = index {
+                self.with_model(|model| { let _ = model.move_tab(id, index); });
+            }
         }
-        self.land(id, at - self.tab_grab.get());
+        // Its slot is the gap it was dropped into, or its own when dropped off the row of its own window.
+        if order.is_some() || own {
+            self.land(id, at - self.tab_grab.get());
+        }
         cx.notify();
     }
 
@@ -3173,11 +3323,11 @@ impl BrowserWindow {
 
     /// A profile dropped on the rail lands where the drag showed it.
     fn drop_profile(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(order) = self.dropped_order(id) else {
-            return;
-        };
-        let index = order.iter().position(|other| other == id).unwrap_or(0);
-        self.with_model(|model| { let _ = model.move_profile(id, index); });
+        if let Some(order) = self.dropped_order(id, RAIL_ROW) {
+            let index = order.iter().position(|other| other == id).unwrap_or(0);
+            self.with_model(|model| { let _ = model.move_profile(id, index); });
+        }
+        self.reorder = None;
         self.land(id, at - self.rail_grab.get());
         cx.notify();
     }
@@ -3187,7 +3337,7 @@ impl BrowserWindow {
         let (tab, at) = self.tab_drag.as_ref()?;
         let paint = paint(cx);
         let at = *at - self.tab_grab.get();
-        let width = self.slots.get(&tab.id).map_or(px(160.), |slot| slot.size.width);
+        let width = self.reorder.as_ref().map_or(px(160.), |state| state.size.width);
         Some(
             h_stack()
                 .absolute()
@@ -3284,9 +3434,10 @@ impl BrowserWindow {
             Some(page) => self.panel == Some(page),
             None => self.find_open,
         };
-        icon_button(id, icon).box_size(rems(1.625)).icon_size(rems(1.0)).selected(selected).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+        icon_button(id, icon).box_size(rems(1.375)).icon_size(rems(0.875)).selected(selected).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             if page.is_none() {
                 this.find_open = !this.find_open;
+                this.focus_find = this.find_open;
                 cx.notify();
             } else if let Some(page) = page {
                 this.toggle_panel(page, cx);
@@ -3894,7 +4045,7 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
     }
 }
 
-const TITLEBAR_H: f32 = 38.0;
+const TITLEBAR_H: f32 = 30.0;
 const DOCK_ANIM: Duration = Duration::from_millis(260);
 const LIFT_ANIM: Duration = Duration::from_millis(220);
 const LAND_ANIM: Duration = Duration::from_millis(280);
@@ -4252,11 +4403,11 @@ impl Render for RailDragPreview {
     }
 }
 
-/// Profile icon (emoji or initial) on its color; a ring marks the active profile.
+/// Profile icon (emoji, Radix icon, or initial); the accent marks the active profile and a corner dot shows its color.
 pub(crate) fn profile_badge(profile: &browser_core::Profile, active: bool, size: f32, paint: Paint) -> gpui::Div {
-    let custom = !profile.color.is_empty();
-    let label = if profile.icon.is_empty() { rail_mark(&profile.name) } else { profile.icon.clone() };
+    let fg = if active { paint.bg } else { paint.fg };
     div()
+        .relative()
         .size(px(size))
         .flex_none()
         .rounded(px(size / 4.))
@@ -4264,11 +4415,34 @@ pub(crate) fn profile_badge(profile: &browser_core::Profile, active: bool, size:
         .items_center()
         .justify_center()
         .text_size(px(size * 0.45))
-        .bg(if custom { parse_hex(&profile.color) } else if active { paint.accent } else { paint.secondary })
-        .text_color(if custom { gpui::white() } else if active { paint.bg } else { paint.fg })
-        .border_2()
-        .border_color(if active && custom { paint.fg } else { gpui::transparent_black() })
-        .child(label)
+        .bg(if active { paint.accent } else { paint.secondary })
+        .text_color(fg)
+        .child(profile_glyph(&profile.icon, &profile.name, size * 0.5, fg))
+        .when(!profile.color.is_empty(), |badge| {
+            badge.child(
+                div()
+                    .absolute()
+                    .right(px(-3.))
+                    .bottom(px(-3.))
+                    .size(px(size * 0.32))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(paint.surface)
+                    .bg(parse_hex(&profile.color)),
+            )
+        })
+}
+
+/// Draws an icon value: a `.svg` asset path, an emoji, or (empty) the name's initial.
+pub(crate) fn profile_glyph(icon: &str, name: &str, size: f32, color: gpui::Hsla) -> gpui::AnyElement {
+    // SVGs don't inherit the parent's text color, so it is passed in.
+    if icon.ends_with(".svg") {
+        gpui::svg().path(icon.to_string()).size(px(size)).text_color(color).into_any_element()
+    } else if icon.is_empty() {
+        rail_mark(name).into_any_element()
+    } else {
+        icon.to_string().into_any_element()
+    }
 }
 
 pub(crate) fn rail_mark(name: &str) -> String {
@@ -4280,6 +4454,16 @@ pub(crate) fn rail_mark(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragged_tab_leaves_its_row_for_the_one_it_hovers() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let state = Reorder { id: "b".into(), size: Default::default(), at: Default::default(), row: Some("w2".into()), order: ids(&["x", "b", "y"]) };
+        assert_eq!(shown_row(Some(&state), "w1", &ids(&["a", "b", "c"])), ids(&["a", "c"]));
+        assert_eq!(shown_row(Some(&state), "w2", &ids(&["x", "y"])), ids(&["x", "b", "y"]));
+        let off = Reorder { row: None, ..state };
+        assert_eq!(shown_row(Some(&off), "w1", &ids(&["a", "b", "c"])), ids(&["a", "b", "c"]));
+    }
 
     fn r(x: f64, y: f64, width: f64, height: f64) -> LogicalRect {
         LogicalRect { x, y, width, height }

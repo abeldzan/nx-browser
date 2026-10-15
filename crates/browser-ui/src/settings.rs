@@ -15,6 +15,12 @@ use gpuikit::traits::control_sized::ControlSized;
 
 pub const PROFILE_ICONS: [&str; 17] =
     ["", "😀", "🦊", "🐱", "🐼", "🚀", "💼", "🏠", "🎮", "🎨", "📚", "🌙", "⭐", "🔥", "🌿", "☕", "🎵"];
+pub const PROFILE_SVG_ICONS: [&str; 16] = [
+    "icons/radix/home.svg", "icons/radix/person.svg", "icons/radix/rocket.svg", "icons/radix/star.svg",
+    "icons/radix/heart.svg", "icons/radix/gear.svg", "icons/radix/globe.svg", "icons/radix/lightning-bolt.svg",
+    "icons/radix/moon.svg", "icons/radix/sun.svg", "icons/radix/code.svg", "icons/radix/backpack.svg",
+    "icons/radix/camera.svg", "icons/radix/laptop.svg", "icons/radix/reader.svg", "icons/radix/target.svg",
+];
 pub const PROFILE_COLORS: [&str; 11] = [
     "", "#e5484d", "#f76b15", "#ffc53d", "#46a758", "#12a594", "#0090ff", "#3e63dd", "#8e4ec6", "#d6409f", "#8b8d98",
 ];
@@ -855,8 +861,8 @@ fn appearance_pickers(
     cx: &mut Context<BrowserWindow>,
 ) -> (gpui::Div, gpui::Div) {
     let mut icons = h_stack().flex_wrap().gap(px(6.));
-    for option in PROFILE_ICONS {
-        let label = if option.is_empty() { crate::window::rail_mark(name) } else { option.to_string() };
+    for option in PROFILE_ICONS.into_iter().chain(PROFILE_SVG_ICONS) {
+        let label = crate::window::profile_glyph(option, name, 15., paint.fg);
         let color = color.to_string();
         icons = icons.child(
             swatch(format!("{prefix}-icon-{option}"), icon == option, paint)

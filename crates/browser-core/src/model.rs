@@ -14,7 +14,7 @@ pub struct Profile {
     pub storage_path: PathBuf,
     pub data_store_id: String,
     pub created_at: i64,
-    /// Emoji shown in place of the initial letter; empty means the letter.
+    /// Emoji or `.svg` asset path shown in place of the initial letter; empty means the letter.
     pub icon: String,
     /// `#rrggbb`; empty means the theme accent.
     pub color: String,
@@ -399,6 +399,16 @@ impl Model {
         // switch_session only knows sessions already loaded.
         self.reload()?;
         self.switch_session(&session_id)?;
+        Ok(())
+    }
+
+    pub fn rename_session(&mut self, session_id: &str, name: &str) -> anyhow::Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        self.storage.execute("UPDATE sessions SET name = ?1 WHERE id = ?2", params![name, session_id])?;
+        self.reload()?;
         Ok(())
     }
 

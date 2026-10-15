@@ -30,7 +30,7 @@ pub fn run() {
                 titlebar: Some(TitlebarOptions {
                     title: Some("NxBrowser".into()),
                     appears_transparent: true,
-                    traffic_light_position: Some(point(px(12.), px(13.))),
+                    traffic_light_position: Some(point(px(12.), px(9.))),
                 }),
                 // Tabs live in the titlebar; empty titlebar space moves the window itself.
                 app_owns_titlebar_drag: true,
