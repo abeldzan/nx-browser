@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
 use objc2_foundation::{
@@ -567,6 +567,17 @@ impl MacEngine {
                 &block,
             );
         }
+    }
+
+    /// Forces the app (and so every page's prefers-color-scheme) light or dark; None follows the system.
+    pub fn set_appearance(&mut self, dark: Option<bool>) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let appearance = dark.and_then(|dark| {
+            NSAppearance::appearanceNamed(unsafe { if dark { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua } })
+        });
+        NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
     }
 
     pub fn set_permissions(&mut self, entries: Vec<(String, String, String)>) {

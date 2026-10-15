@@ -959,9 +959,15 @@ impl BrowserWindow {
             "dark" => true,
             _ => matches!(window.appearance(), gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark),
         };
-        let key = format!("{dark}{accent}");
+        let key = format!("{theme}{dark}{accent}");
         if key != self.applied_theme || (cx.theme().variant == ThemeVariant::Dark) != dark {
-            let mut next = if dark { Theme::default() } else { Theme::gruvbox_light() };
+            // Pages read prefers-color-scheme from the app appearance; None follows the system.
+            self.engine.set_appearance(match theme.as_str() {
+                "light" => Some(false),
+                "dark" => Some(true),
+                _ => None,
+            });
+            let mut next = if dark { Theme::default() } else { light_theme() };
             if !accent.is_empty() {
                 next.accent_color = parse_hex(&accent);
             }
@@ -1260,6 +1266,35 @@ pub(crate) struct Paint {
     pub(crate) border: gpui::Hsla,
     pub(crate) accent: gpui::Hsla,
     pub(crate) accent_bg: gpui::Hsla,
+}
+
+/// Neutral macOS-style light palette (gpuikit only ships tinted light themes).
+fn light_theme() -> Theme {
+    let mut t = Theme::new(
+        "Light",
+        ThemeVariant::Light,
+        parse_hex("#1d1d1f"), // fg
+        parse_hex("#ffffff"), // bg
+        parse_hex("#f5f5f7"), // surface
+        parse_hex("#d2d2d7"), // border
+        parse_hex("#007aff"), // accent
+    );
+    t.fg_muted_color = Some(parse_hex("#6e6e73"));
+    t.fg_disabled_color = Some(parse_hex("#aeaeb2"));
+    t.surface_secondary_color = Some(parse_hex("#e8e8ed"));
+    t.surface_tertiary_color = Some(parse_hex("#dcdce1"));
+    t.border_secondary_color = Some(parse_hex("#c7c7cc"));
+    t.border_subtle_color = Some(parse_hex("#e5e5ea"));
+    t.info_color = Some(parse_hex("#007aff"));
+    t.success_color = Some(parse_hex("#248a3d"));
+    t.warning_color = Some(parse_hex("#c93400"));
+    t.danger_color = Some(parse_hex("#d70015"));
+    t.button_bg_color = Some(parse_hex("#f5f5f7"));
+    t.button_bg_hover_color = Some(parse_hex("#e8e8ed"));
+    t.button_bg_active_color = Some(parse_hex("#dcdce1"));
+    t.button_border_color = Some(parse_hex("#d2d2d7"));
+    t.input_border_hover_color = Some(parse_hex("#c7c7cc"));
+    t
 }
 
 pub(crate) fn paint(cx: &gpui::App) -> Paint {
