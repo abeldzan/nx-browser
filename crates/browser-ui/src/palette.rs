@@ -49,6 +49,7 @@ pub(crate) enum Run {
     CopyUrl,
     Duplicate,
     CloseOthers,
+    CloseAll,
     NewSpace,
     Pref(fn(&mut Settings)),
     Tab(String),
@@ -221,6 +222,7 @@ impl BrowserWindow {
                 ("Copy page URL", Run::CopyUrl),
                 ("Duplicate tab", Run::Duplicate),
                 ("Close other tabs", Run::CloseOthers),
+                ("Close all tabs", Run::CloseAll),
                 ("New space", Run::NewSpace),
                 ("Show downloads", Run::Downloads),
                 ("Manage extensions", Run::Extensions),
@@ -329,6 +331,10 @@ impl BrowserWindow {
                 let others = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone())
                     .filter(|id| Some(id) != active.as_ref()).collect::<Vec<_>>();
                 self.close_tabs(others, cx);
+            }
+            Run::CloseAll => {
+                let all = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect();
+                self.close_tabs(all, cx);
             }
             Run::NewSpace => self.with_model(|model| { let _ = model.create_session(); }),
             Run::Pref(change) => self.set_pref(cx, change),

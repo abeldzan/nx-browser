@@ -129,6 +129,8 @@ pub struct BrowserWindow {
     space_chips: Vec<(String, gpui::Bounds<Pixels>)>,
     /// A dropped carried window growing back into place: (tab id, rect it was dropped at, started).
     landing: Option<(String, Frame, Instant)>,
+    /// A window closed; re-tile the stage on the next layout pass.
+    retile: bool,
     /// Tab pill being dragged and the pointer; drawn here so pages can be cut out beneath it.
     tab_drag: Option<(browser_core::Tab, gpui::Point<Pixels>)>,
     /// Where tab pills and rail badges were laid out last frame, before any slide offset.
@@ -445,6 +447,7 @@ impl BrowserWindow {
             lift: Tween::new(false),
             space_chips: Vec::new(),
             landing: None,
+            retile: false,
             tab_drag: None,
             slots: HashMap::new(),
             slides: HashMap::new(),
@@ -1015,6 +1018,10 @@ impl BrowserWindow {
                 .filter(open)
                 .find(|id| self.is_front(id) && !self.chrome.get(*id).is_some_and(|chrome| chrome.minimized))
                 .cloned()
+        });
+        self.retile |= ids.iter().any(|id| {
+            let group = self.group_id(id);
+            current.iter().filter(|other| self.group_id(other) == group).all(|other| ids.contains(other))
         });
         self.with_model(|model| {
             for id in &ids {
@@ -1840,14 +1847,8 @@ impl BrowserWindow {
                 }
             }
         }
-        let count = tabs.len().max(1);
-        let cols = if count == 1 { 1 } else { 2 };
-        let rows = count.div_ceil(cols);
-        let gap = 10.0;
-        let pad = 10.0;
-        let cell_w = (sw - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32;
-        let cell_h = (sh - pad * 2.0 - gap * (rows as f32 - 1.0)) / rows as f32;
-        for (index, tab) in tabs.iter().enumerate() {
+        let mut fresh = false;
+        for tab in tabs {
             if !self.order.iter().any(|id| id == &tab.id) {
                 self.order.push(tab.id.clone());
             }
@@ -1855,17 +1856,34 @@ impl BrowserWindow {
             if entry.frame.is_some() {
                 continue;
             }
+            fresh = true;
             if self.layout_stage.is_some() && self.self_test.is_none() && !self.reduce_motion {
                 self.opened.insert(tab.id.clone(), Instant::now());
             }
-            let col = (index % cols) as f32;
-            let row = (index / cols) as f32;
-            entry.frame = Some(Frame {
-                x: pad + col * (cell_w + gap),
-                y: pad + row * (cell_h + gap),
-                w: cell_w.max(160.0),
-                h: cell_h.max(120.0),
-            });
+        }
+        if !fresh && !self.retile {
+            return;
+        }
+        self.retile = false;
+        // Like a tiling window manager: a new or closed window re-splits the stage among all of them.
+        let mut windows = tabs
+            .iter()
+            .filter_map(|tab| Some((tab.id.clone(), self.chrome.get(&tab.id)?.clone())))
+            .filter(|(id, entry)| self.is_front(id) && !entry.minimized && entry.panel.is_none())
+            .collect::<Vec<_>>();
+        // Keep the windows already on the stage in their reading order; new ones (no frame yet) go last, on the right.
+        windows.sort_by(|(_, a), (_, b)| match (a.frame, b.frame) {
+            (Some(a), Some(b)) => a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)),
+            (a, b) => a.is_none().cmp(&b.is_none()),
+        });
+        let windows = windows.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        for (id, frame) in windows.iter().zip(tile(windows.len(), sw, sh)) {
+            if let Some(entry) = self.chrome.get_mut(id) {
+                entry.frame = Some(frame);
+                entry.snap = Some(Snap::Tiled);
+                entry.restore = None;
+                entry.maximized = false;
+            }
         }
     }
 
@@ -2011,6 +2029,22 @@ impl BrowserWindow {
                         self.refresh_url(cx);
                     }
                 }
+                // A snapped window dropped on another snapped one (away from the snap edges) trades places with it.
+                let inside = |f: Frame| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h;
+                gesture.swap = None;
+                if gesture.from.is_some() && gesture.snap.is_none() && !over_bar {
+                    gesture.swap = self
+                        .order
+                        .iter()
+                        .rev()
+                        .filter(|other| current.contains(other) && self.group_id(other) != group && self.is_front(other))
+                        .find(|other| {
+                            self.chrome.get(*other).is_some_and(|entry| {
+                                entry.snap.is_some() && !entry.minimized && !entry.maximized && entry.frame.is_some_and(inside)
+                            })
+                        })
+                        .cloned();
+                }
             }
             GestureKind::Resize(edges) => {
                 frame = magnet(frame, edges, &others, sw, sh);
@@ -2053,6 +2087,16 @@ impl BrowserWindow {
             self.landing = (!self.reduce_motion).then(|| (id, from, Instant::now()));
         }
         self.update_dock(cx);
+        if let (Some(target), Some((snap, frame, restore))) = (&gesture.swap, gesture.from) {
+            if let Some(theirs) = self.chrome.get(target).cloned() {
+                if let Some(entry) = self.chrome.get_mut(target) {
+                    (entry.snap, entry.frame, entry.restore) = (Some(snap), Some(frame), restore);
+                }
+                if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
+                    (entry.snap, entry.frame, entry.restore) = (theirs.snap, theirs.frame, theirs.restore);
+                }
+            }
+        }
         if let (Some(snap), Some(stage)) = (gesture.snap, self.stage_bounds) {
             let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
             // The size the window had when the drag began is what dragging it out of the snap brings back.
@@ -2096,15 +2140,14 @@ impl BrowserWindow {
         // `order` spans every space; only this space's windows are on the stage.
         let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
-        let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
+        let preview = self.drop_preview();
         let carried = self.carried().map(|(id, _)| id);
         for id in ids {
             let Some(entry) = self.chrome.get(&id).cloned() else {
                 continue;
             };
-            if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == id) {
+            if let Some((_, frame)) = preview.as_ref().filter(|(dragged, _)| *dragged == id) {
                 // The preview hides pages behind it but has no page of its own.
-                let frame = self.snap_frame(*snap, &id, stage_w as f32, stage_h as f32);
                 let shell = LogicalRect {
                     x: origin_x + f64::from(frame.x),
                     y: origin_y + f64::from(frame.y),
@@ -2177,6 +2220,7 @@ impl BrowserWindow {
         };
         // A maximized window keeps its floating frame; a snapped one keeps it in `restore`.
         let restore = self.chrome.get(id).and_then(|entry| if entry.maximized { entry.frame } else { entry.restore });
+        let from = self.chrome.get(id).filter(|entry| !entry.maximized).and_then(|entry| Some((entry.snap?, start, entry.restore)));
         self.gesture = Some(Gesture {
             tab_id: id.to_string(),
             kind: GestureKind::Move,
@@ -2187,6 +2231,8 @@ impl BrowserWindow {
             snap: None,
             partners: Vec::new(),
             pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
+            from,
+            swap: None,
         });
         self.engine.focus_chrome();
         cx.notify();
@@ -2224,6 +2270,8 @@ impl BrowserWindow {
             restore: None,
             snap: None,
             partners,
+            from: None,
+            swap: None,
             pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
         });
         self.engine.focus_chrome();
@@ -2262,7 +2310,7 @@ impl BrowserWindow {
             );
         let mut ordered = shown;
         ordered.sort_by_key(|tab| self.order.iter().position(|id| id == &tab.id).unwrap_or(0));
-        let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
+        let preview = self.drop_preview();
         let carried = self.carried().map(|(id, _)| id);
         // Windows occlude, so only a tab dropped on empty stage lands here.
         stage = stage.on_drop(cx.listener(|this, drag: &TabDrag, window, cx| {
@@ -2270,8 +2318,8 @@ impl BrowserWindow {
             this.detach_tab(&drag.0.id, window.mouse_position(), cx);
         }));
         for tab in ordered {
-            if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
-                stage = stage.child(self.snap_preview(*snap, &tab.id, cx));
+            if let Some((_, frame)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
+                stage = stage.child(snap_preview(*frame, cx));
             }
             if carried.as_deref() == Some(tab.id.as_str()) {
                 continue;
@@ -2298,22 +2346,18 @@ impl BrowserWindow {
         fit_snap(snap, sw, sh, &others)
     }
 
-    fn snap_preview(&self, snap: Snap, id: &str, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let Some(stage) = self.stage_bounds else {
-            return div();
+    /// Where releasing the drag would put the dragged window: its snap target, or the snapped window it would swap with.
+    fn drop_preview(&self) -> Option<(String, Frame)> {
+        let gesture = self.gesture.as_ref()?;
+        let frame = match (gesture.snap, &gesture.swap) {
+            (Some(snap), _) => {
+                let stage = self.stage_bounds?;
+                self.snap_frame(snap, &gesture.tab_id, f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32)
+            }
+            (None, Some(target)) => self.chrome.get(target)?.frame?,
+            (None, None) => return None,
         };
-        let frame = self.snap_frame(snap, id, f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
-        div()
-            .absolute()
-            .left(px(frame.x))
-            .top(px(frame.y))
-            .w(px(frame.w))
-            .h(px(frame.h))
-            .rounded(px(WINDOW_RADIUS as f32))
-            .border_2()
-            .border_color(paint.accent.opacity(0.7))
-            .bg(paint.accent.opacity(0.16))
+        Some((gesture.tab_id.clone(), frame))
     }
 
     fn edges_under_pointer(&self, id: &str, position: gpui::Point<Pixels>) -> Option<Edges> {
@@ -3710,6 +3754,10 @@ struct Gesture {
     partners: Vec<(String, Frame)>,
     /// Pointer in window coordinates.
     pointer: (f32, f32),
+    /// Snap, frame and restore frame of a snapped window when its move began, handed to the window it swaps with.
+    from: Option<(Snap, Frame, Option<Frame>)>,
+    /// Snapped window under the pointer that the dragged one would trade places with on release.
+    swap: Option<String>,
 }
 
 /// The address as shown when not editing: no scheme, no trailing slash on a bare host.
@@ -3741,13 +3789,15 @@ enum Snap {
     BottomLeft,
     BottomRight,
     Maximize,
+    /// Placed by the tiler; follows the stage like a snap, and its neighbours share borders.
+    Tiled,
 }
 
 impl Snap {
     /// (column, row): -1 left/top, 1 right/bottom, 0 spanning.
     fn place(self) -> (i8, i8) {
         match self {
-            Snap::Maximize => (0, 0),
+            Snap::Maximize | Snap::Tiled => (0, 0),
             Snap::Left => (-1, 0),
             Snap::Right => (1, 0),
             Snap::TopLeft => (-1, -1),
@@ -3766,7 +3816,7 @@ impl Snap {
         let right = SNAP_INSET * 2.0 + half_w;
         let bottom = SNAP_INSET * 2.0 + half_h;
         let (x, y, w, h) = match self {
-            Snap::Maximize => (SNAP_INSET, SNAP_INSET, full_w, full_h),
+            Snap::Maximize | Snap::Tiled => (SNAP_INSET, SNAP_INSET, full_w, full_h),
             Snap::Left => (SNAP_INSET, SNAP_INSET, half_w, full_h),
             Snap::Right => (right, SNAP_INSET, half_w, full_h),
             Snap::TopLeft => (SNAP_INSET, SNAP_INSET, half_w, half_h),
@@ -3891,6 +3941,29 @@ fn fit_snap(snap: Snap, sw: f32, sh: f32, others: &[(Snap, Frame)]) -> Frame {
 
 /// Fits a snapped frame to a resized stage. Borders on the stage inset stay there; inner borders keep
 /// their proportional place, measured at the middle of the gap so neighbours stay one inset apart.
+/// Splits the stage among `n` windows like a dwindling tiler: each window halves the space left along its longer side.
+fn tile(n: usize, sw: f32, sh: f32) -> Vec<Frame> {
+    let mut rest = Snap::Tiled.frame(sw, sh);
+    (0..n)
+        .map(|index| {
+            if index + 1 == n {
+                return rest;
+            }
+            if rest.w >= rest.h {
+                let w = ((rest.w - SNAP_INSET) / 2.0).max(1.0);
+                let frame = Frame { w, ..rest };
+                rest = Frame { x: rest.x + w + SNAP_INSET, w: rest.w - w - SNAP_INSET, ..rest };
+                frame
+            } else {
+                let h = ((rest.h - SNAP_INSET) / 2.0).max(1.0);
+                let frame = Frame { h, ..rest };
+                rest = Frame { y: rest.y + h + SNAP_INSET, h: rest.h - h - SNAP_INSET, ..rest };
+                frame
+            }
+        })
+        .collect()
+}
+
 fn rescale_snapped(frame: Frame, ow: f32, oh: f32, sw: f32, sh: f32) -> Frame {
     let lead = |v: f32, old: f32, new: f32| {
         if v <= SNAP_INSET + 0.5 { SNAP_INSET } else { (v - SNAP_INSET / 2.0) * new / old + SNAP_INSET / 2.0 }
@@ -4317,6 +4390,20 @@ fn mostly_off(frame: Frame, sw: f32, sh: f32) -> bool {
     visible_w < frame.w * 0.6 || visible_h < frame.h * 0.6 || frame.w > sw + 1.0 || frame.h > sh + 1.0
 }
 
+fn snap_preview(frame: Frame, cx: &mut Context<BrowserWindow>) -> gpui::Div {
+    let paint = paint(cx);
+    div()
+        .absolute()
+        .left(px(frame.x))
+        .top(px(frame.y))
+        .w(px(frame.w))
+        .h(px(frame.h))
+        .rounded(px(WINDOW_RADIUS as f32))
+        .border_2()
+        .border_color(paint.accent.opacity(0.7))
+        .bg(paint.accent.opacity(0.16))
+}
+
 fn keep_on_stage(frame: Frame, sw: f32, sh: f32) -> Frame {
     let visible = 64.0;
     Frame {
@@ -4586,6 +4673,16 @@ mod tests {
         assert_eq!(snap_zone(500., 698., 1000., 700.), None);
         assert_eq!(snap_zone(2., 10., 1000., 700.), Some(Snap::TopLeft));
         assert_eq!(snap_zone(999., 690., 1000., 700.), Some(Snap::BottomRight));
+    }
+
+    #[test]
+    fn tiler_halves_the_last_window() {
+        let one = tile(1, 1000., 700.);
+        assert_eq!((one[0].x, one[0].y, one[0].w, one[0].h), (8., 8., 984., 684.));
+        let two = tile(2, 1000., 700.);
+        assert_eq!((two[0].w, two[1].x, two[1].x + two[1].w), (488., 504., 992.));
+        let three = tile(3, 1000., 700.);
+        assert_eq!((three[1].x, three[1].h, three[2].y, three[2].y + three[2].h), (504., 338., 354., 692.));
     }
 
     #[test]
