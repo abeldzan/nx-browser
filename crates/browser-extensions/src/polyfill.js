@@ -144,22 +144,41 @@
     g.WebSocket = UnavailableWebSocket;
   }
 
-  // Chrome keeps the service worker alive while an extension page has it open; WebKit unloads it
-  // after 30 idle seconds, dropping its in-memory state and leaving the page's ports unanswered.
-  // A message every 20 s counts as activity and keeps it loaded.
-  if (typeof window !== "undefined" && g === window && chrome.runtime && chrome.runtime.sendMessage) {
-    let isBackground = false;
+  // Chrome keeps the background alive while extension pages use it. WebKit unloads it after 30 idle
+  // seconds, and after 2 minutes even with ports open unless the background itself posts on one; the
+  // ports it drops stay dead (Phantom's window holds one and never reconnects: a black window). So each
+  // extension page, and a hidden `nx-keepalive.html` the engine keeps per extension, holds a port the
+  // background pings, which keeps it loaded and already listening when a page connects.
+  const KEEPALIVE = "nx-keepalive";
+  const isServiceWorker = typeof ServiceWorkerGlobalScope !== "undefined" && g instanceof ServiceWorkerGlobalScope;
+  let isBackgroundPage = false;
+  if (typeof window !== "undefined" && g === window) {
     try {
-      isBackground = chrome.extension && chrome.extension.getBackgroundPage && chrome.extension.getBackgroundPage() === window;
+      isBackgroundPage = !!(chrome.extension && chrome.extension.getBackgroundPage && chrome.extension.getBackgroundPage() === window);
     } catch (_) {}
-    if (!isBackground) {
-      setInterval(() => {
+  }
+  if ((isServiceWorker || isBackgroundPage) && chrome.runtime && chrome.runtime.onConnect) {
+    chrome.runtime.onConnect.addListener((port) => {
+      if (port.name !== KEEPALIVE) return;
+      const timer = setInterval(() => {
         try {
-          const sent = chrome.runtime.sendMessage({ nxKeepAlive: true });
-          if (sent && sent.catch) sent.catch(() => {});
+          port.postMessage(0);
         } catch (_) {}
       }, 20000);
-    }
+      port.onDisconnect.addListener(() => clearInterval(timer));
+    });
+  } else if (typeof window !== "undefined" && g === window && chrome.runtime && chrome.runtime.connect) {
+    const hold = () => {
+      try {
+        chrome.runtime.connect({ name: KEEPALIVE }).onDisconnect.addListener(() => {
+          void chrome.runtime.lastError;
+          setTimeout(hold, 1000);
+        });
+      } catch (_) {
+        setTimeout(hold, 5000);
+      }
+    };
+    hold();
   }
 
   // No `chrome.offscreen` stub: extensions route core features through it once it exists
@@ -212,6 +231,87 @@
     g.nxPermissions = new Proxy(permissions, {
       get: (target, key) => {
         if (key === "contains" || key === "request" || key === "remove") return guarded(key);
+        const value = target[key];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  // Registered content scripts, as Chrome runs them. WebKit gets two things wrong:
+  // - it records a script's ID only once it has saved it, so overlapping `registerContentScripts`
+  //   calls both pass its duplicate check; calls here run one at a time instead.
+  // - it injects a newly registered script into pages already open, where Chrome waits for the next
+  //   load. Extensions re-register on every start (Phantom: unregister all, register again), so open
+  //   pages got a second copy ("Attempting to change value of a readonly property"). An unregister
+  //   is held back briefly here, and re-registering the same script in that time keeps the old one.
+  // `patch_pages` points the extension's calls here.
+  const scripting = chrome["scripting"];
+  if (scripting) {
+    const UNREGISTER_DELAY = 1500;
+    let queue = Promise.resolve();
+    const later = new Map(); // id -> timer for a held-back unregister
+    const enqueue = (task) => {
+      const result = queue.then(task);
+      queue = result.catch(() => {});
+      return result;
+    };
+    const defaults = { js: [], css: [], excludeMatches: [], allFrames: false, runAt: "document_idle", world: "isolated", matchOriginAsFallback: false };
+    const same = (a, b) => {
+      const norm = (script) => JSON.stringify(Object.keys(defaults).concat("matches").map((key) => {
+        const value = script[key] === undefined ? defaults[key] : script[key];
+        return typeof value === "string" ? value.toLowerCase() : value;
+      }));
+      return norm(a) === norm(b);
+    };
+    const live = async (filter) => (await scripting.getRegisteredContentScripts(filter || {})).filter((script) => !later.has(script.id));
+    const flush = (ids) => {
+      ids = ids.filter((id) => later.has(id));
+      ids.forEach((id) => {
+        clearTimeout(later.get(id));
+        later.delete(id);
+      });
+      return ids.length ? scripting.unregisterContentScripts({ ids }) : Promise.resolve();
+    };
+    const ops = {
+      getRegisteredContentScripts: (filter) => live(filter),
+      unregisterContentScripts: async (filter) => {
+        const registered = (await live()).map((script) => script.id);
+        const ids = filter && filter.ids ? filter.ids : registered;
+        const missing = ids.find((id) => !registered.includes(id));
+        if (missing !== undefined) throw new Error(`Invalid call to scripting.unregisterContentScripts(). No script with ID '${missing}'.`);
+        ids.forEach((id) => later.set(id, setTimeout(() => enqueue(() => flush([id])), UNREGISTER_DELAY)));
+      },
+      registerContentScripts: async (scripts) => {
+        const current = await scripting.getRegisteredContentScripts({});
+        const fresh = [];
+        for (const script of scripts) {
+          const held = later.has(script.id);
+          const existing = current.find((registered) => registered.id === script.id);
+          if (held && existing && same(existing, script)) {
+            clearTimeout(later.get(script.id));
+            later.delete(script.id);
+            continue;
+          }
+          if (held) await flush([script.id]);
+          fresh.push(script);
+        }
+        if (fresh.length) await scripting.registerContentScripts(fresh);
+      },
+      updateContentScripts: async (scripts) => {
+        await flush([...later.keys()]);
+        return scripting.updateContentScripts(scripts);
+      },
+    };
+    g.nxScripting = new Proxy(scripting, {
+      get: (target, key) => {
+        if (Object.prototype.hasOwnProperty.call(ops, key)) {
+          return (...args) => {
+            const callback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+            const result = enqueue(() => ops[key](...args));
+            if (!callback) return result;
+            result.then((value) => callback(value), () => callback());
+          };
+        }
         const value = target[key];
         return typeof value === "function" ? value.bind(target) : value;
       },

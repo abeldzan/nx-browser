@@ -4,11 +4,14 @@ use std::path::Path;
 const POLYFILL: &str = include_str!("polyfill.js");
 const POLYFILL_FILE: &str = "nx-polyfill.js";
 const WORKER_FILE: &str = "nx-background.js";
+/// A page that only runs the polyfill; the engine keeps one open per extension so its background stays loaded.
+pub const KEEPALIVE_FILE: &str = "nx-keepalive.html";
 
 /// Makes a store-installed extension load the polyfill for Chrome-only APIs WebKit lacks, ahead
 /// of its background and pages. Idempotent; only for copies we unpacked, never a user's folder.
 pub fn patch_missing_apis(dir: &Path) -> anyhow::Result<()> {
     std::fs::write(dir.join(POLYFILL_FILE), POLYFILL)?;
+    std::fs::write(dir.join(KEEPALIVE_FILE), format!("<!doctype html><script src=\"/{POLYFILL_FILE}\"></script>"))?;
     let manifest_path = dir.join("manifest.json");
     let text = std::fs::read_to_string(&manifest_path)?;
     let mut manifest: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
@@ -46,19 +49,27 @@ const CONSTANTS: [(&str, &str); 3] = [
     ("chrome-extension://", "webkit-extension://"),
 ];
 
-/// Points `chrome.permissions.`/`browser.permissions.` at the polyfill's `nxPermissions`, falling back
-/// to the real object where the polyfill isn't loaded (content scripts). Leaves `window.chrome.permissions.`
-/// and the like alone, where wrapping would break the expression.
-fn guard_permissions(js: &str) -> String {
+/// APIs WebKit gets wrong whose objects can't be patched, with the polyfill global that wraps each.
+const GUARDED: [(&str, &str); 4] = [
+    ("chrome.permissions.", "nxPermissions"),
+    ("browser.permissions.", "nxPermissions"),
+    ("chrome.scripting.", "nxScripting"),
+    ("browser.scripting.", "nxScripting"),
+];
+
+/// Points calls on the `GUARDED` APIs at the polyfill's wrappers, falling back to the real object where
+/// the polyfill isn't loaded (content scripts). Leaves `window.chrome.permissions.` and the like
+/// alone, where wrapping would break the expression.
+fn guard_apis(js: &str) -> String {
     let mut out = String::with_capacity(js.len());
     let mut rest = js;
-    while let Some((at, pattern)) = ["chrome.permissions.", "browser.permissions."].into_iter().filter_map(|pattern| Some((rest.find(pattern)?, pattern))).min() {
+    while let Some((at, (pattern, wrapper))) = GUARDED.into_iter().filter_map(|guarded| Some((rest.find(guarded.0)?, guarded))).min() {
         out.push_str(&rest[..at]);
         let member = out.chars().next_back().is_some_and(|c| c == '.' || c == '_' || c == '$' || c.is_alphanumeric());
         if member {
             out.push_str(pattern);
         } else {
-            out.push_str(&format!("(globalThis.nxPermissions||{}).", &pattern[..pattern.len() - 1]));
+            out.push_str(&format!("(globalThis.{wrapper}||{}).", &pattern[..pattern.len() - 1]));
         }
         rest = &rest[at + pattern.len()..];
     }
@@ -81,7 +92,7 @@ fn patch_pages(dir: &Path) -> anyhow::Result<()> {
             let Ok(js) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let patched = guard_permissions(&CONSTANTS.iter().fold(js.clone(), |js, (from, to)| js.replace(from, to)));
+            let patched = guard_apis(&CONSTANTS.iter().fold(js.clone(), |js, (from, to)| js.replace(from, to)));
             if patched != js {
                 std::fs::write(&path, patched)?;
             }
@@ -115,7 +126,7 @@ mod tests {
         std::fs::write(dir.join("src/panel.html"), "<html><head><title>x</title></head></html>").unwrap();
         std::fs::write(dir.join("src/inject.js"), "run({world:chrome.scripting.ExecutionWorld.MAIN})").unwrap();
         std::fs::write(dir.join("src/senders.js"), "u.startsWith(`chrome-extension://${id}/`)").unwrap();
-        std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p)").unwrap();
+        std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p);chrome.scripting.registerContentScripts(s)").unwrap();
         patch_missing_apis(&dir).unwrap();
         patch_missing_apis(&dir).unwrap();
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -127,7 +138,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("src/senders.js")).unwrap(), "u.startsWith(`webkit-extension://${id}/`)");
         assert_eq!(
             std::fs::read_to_string(dir.join("src/perms.js")).unwrap(),
-            "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p)"
+            "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p);(globalThis.nxScripting||chrome.scripting).registerContentScripts(s)"
         );
         assert!(!std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap().contains("nxPermissions||"), "the polyfill itself is left alone");
         let _ = std::fs::remove_dir_all(dir);

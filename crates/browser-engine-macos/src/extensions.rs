@@ -43,6 +43,8 @@ struct Profile {
     _delegate: Retained<NxExtDelegate>,
     window: Retained<NxExtWindow>,
     contexts: HashMap<String, Retained<WKWebExtensionContext>>,
+    /// Hidden `KEEPALIVE_PAGE` per extension, which holds its background loaded.
+    keepalive: HashMap<String, Retained<WKWebView>>,
 }
 
 struct State {
@@ -50,6 +52,8 @@ struct State {
     inspectable: bool,
     /// Enabled extensions by id with the data stores (profiles) they run in, and their parsed form once WebKit has read them.
     wanted: HashMap<String, Vec<String>>,
+    /// Extensions whose folder has the polyfill's `KEEPALIVE_PAGE` (store installs).
+    keep_alive: std::collections::HashSet<String>,
     parsed: HashMap<String, Retained<WKWebExtension>>,
     /// One controller per website data store, so extension storage stays per profile.
     profiles: HashMap<String, Profile>,
@@ -78,6 +82,7 @@ impl Extensions {
             events,
             inspectable: true,
             wanted: HashMap::new(),
+            keep_alive: Default::default(),
             parsed: HashMap::new(),
             profiles: HashMap::new(),
             tabs: Vec::new(),
@@ -128,7 +133,7 @@ impl Extensions {
         }
         self.0.borrow_mut().profiles.insert(
             store_id.to_string(),
-            Profile { controller: controller.clone(), _delegate: delegate, window, contexts: HashMap::new() },
+            Profile { controller: controller.clone(), _delegate: delegate, window, contexts: HashMap::new(), keepalive: HashMap::new() },
         );
         let ids = self.0.borrow().parsed.keys().cloned().collect::<Vec<_>>();
         for id in ids {
@@ -145,6 +150,9 @@ impl Extensions {
             return;
         };
         self.0.borrow_mut().wanted.insert(id.to_string(), stores);
+        if path.join(KEEPALIVE_PAGE).is_file() {
+            self.0.borrow_mut().keep_alive.insert(id.to_string());
+        }
         let Some(url) = NSURL::from_directory_path(path) else {
             return;
         };
@@ -179,10 +187,14 @@ impl Extensions {
             let mut state = self.0.borrow_mut();
             state.wanted.remove(id);
             state.parsed.remove(id);
+            state.keep_alive.remove(id);
             state
                 .profiles
                 .values_mut()
-                .filter_map(|profile| Some((profile.controller.clone(), profile.contexts.remove(id)?)))
+                .filter_map(|profile| {
+                    profile.keepalive.remove(id);
+                    Some((profile.controller.clone(), profile.contexts.remove(id)?))
+                })
                 .collect::<Vec<_>>()
         };
         for (controller, context) in removed {
@@ -506,9 +518,27 @@ fn load_context(shared: &Rc<RefCell<State>>, store_id: &str, id: &str) {
         eprintln!("extension {id} did not start: {}", error_text(&error));
         return;
     }
+    let keepalive = shared.borrow().keep_alive.contains(id).then(|| keepalive_page(&context, id)).flatten();
     if let Some(profile) = shared.borrow_mut().profiles.get_mut(store_id) {
         profile.contexts.insert(id.to_string(), context);
+        if let Some(view) = keepalive {
+            profile.keepalive.insert(id.to_string(), view);
+        }
     }
+}
+
+/// Written next to the polyfill by `browser_extensions::patch_missing_apis`.
+const KEEPALIVE_PAGE: &str = "nx-keepalive.html";
+
+/// Loads the extension's keep-alive page in a view no window shows. The polyfill in it holds a port
+/// the background pings, so WebKit keeps the background loaded as Chrome does while pages use it.
+fn keepalive_page(context: &WKWebExtensionContext, id: &str) -> Option<Retained<WKWebView>> {
+    let mtm = MainThreadMarker::new()?;
+    let url = NSURL::URLWithString(&NSString::from_str(&format!("{SCHEME}{id}/{KEEPALIVE_PAGE}")))?;
+    let configuration = unsafe { context.webViewConfiguration() }?;
+    let view = unsafe { WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)), &configuration) };
+    unsafe { view.loadRequest(&NSURLRequest::requestWithURL(&url)) };
+    Some(view)
 }
 
 fn grants_key(store: &str, id: &str) -> Retained<NSString> {
