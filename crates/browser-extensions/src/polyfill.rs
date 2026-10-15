@@ -46,6 +46,26 @@ const CONSTANTS: [(&str, &str); 3] = [
     ("chrome-extension://", "webkit-extension://"),
 ];
 
+/// Points `chrome.permissions.`/`browser.permissions.` at the polyfill's `nxPermissions`, falling back
+/// to the real object where the polyfill isn't loaded (content scripts). Leaves `window.chrome.permissions.`
+/// and the like alone, where wrapping would break the expression.
+fn guard_permissions(js: &str) -> String {
+    let mut out = String::with_capacity(js.len());
+    let mut rest = js;
+    while let Some((at, pattern)) = ["chrome.permissions.", "browser.permissions."].into_iter().filter_map(|pattern| Some((rest.find(pattern)?, pattern))).min() {
+        out.push_str(&rest[..at]);
+        let member = out.chars().next_back().is_some_and(|c| c == '.' || c == '_' || c == '$' || c.is_alphanumeric());
+        if member {
+            out.push_str(pattern);
+        } else {
+            out.push_str(&format!("(globalThis.nxPermissions||{}).", &pattern[..pattern.len() - 1]));
+        }
+        rest = &rest[at + pattern.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Adds the polyfill as the first script of every extension page (popup, options, side panel,
 /// background page) and inlines the `CONSTANTS` in its scripts.
 fn patch_pages(dir: &Path) -> anyhow::Result<()> {
@@ -61,8 +81,9 @@ fn patch_pages(dir: &Path) -> anyhow::Result<()> {
             let Ok(js) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if CONSTANTS.iter().any(|(from, _)| js.contains(from)) {
-                std::fs::write(&path, CONSTANTS.iter().fold(js, |js, (from, to)| js.replace(from, to)))?;
+            let patched = guard_permissions(&CONSTANTS.iter().fold(js.clone(), |js, (from, to)| js.replace(from, to)));
+            if patched != js {
+                std::fs::write(&path, patched)?;
             }
             continue;
         }
@@ -94,6 +115,7 @@ mod tests {
         std::fs::write(dir.join("src/panel.html"), "<html><head><title>x</title></head></html>").unwrap();
         std::fs::write(dir.join("src/inject.js"), "run({world:chrome.scripting.ExecutionWorld.MAIN})").unwrap();
         std::fs::write(dir.join("src/senders.js"), "u.startsWith(`chrome-extension://${id}/`)").unwrap();
+        std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p)").unwrap();
         patch_missing_apis(&dir).unwrap();
         patch_missing_apis(&dir).unwrap();
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -103,6 +125,11 @@ mod tests {
         assert_eq!(html, "<html><head><script src=\"/nx-polyfill.js\"></script><title>x</title></head></html>");
         assert_eq!(std::fs::read_to_string(dir.join("src/inject.js")).unwrap(), "run({world:\"MAIN\"})");
         assert_eq!(std::fs::read_to_string(dir.join("src/senders.js")).unwrap(), "u.startsWith(`webkit-extension://${id}/`)");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/perms.js")).unwrap(),
+            "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p)"
+        );
+        assert!(!std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap().contains("nxPermissions||"), "the polyfill itself is left alone");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

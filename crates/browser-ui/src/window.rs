@@ -106,6 +106,14 @@ pub struct BrowserWindow {
     dock: Tween,
     /// Pointer over the dock; it stays shut while a window drag is in progress.
     dock_hovered: bool,
+    /// A window carried up to the spaces bar shrinks under the pointer (open = small).
+    lift: Tween,
+    /// Space chips laid out this frame, so a carried window can be dropped on one.
+    space_chips: Vec<(String, gpui::Bounds<Pixels>)>,
+    /// A dropped carried window growing back into place: (tab id, rect it was dropped at, started).
+    landing: Option<(String, Frame, Instant)>,
+    /// Tab pill being dragged and the pointer; drawn here so pages can be cut out beneath it.
+    tab_drag: Option<(browser_core::Tab, gpui::Point<Pixels>)>,
     find: Tween,
     panel_tween: Tween,
     /// Sidebar page still drawn while its panel slides shut.
@@ -115,9 +123,8 @@ pub struct BrowserWindow {
     /// Load bar width for the active tab, and when its load finished (the bar then fades).
     load_bar: f32,
     load_done: Option<Instant>,
-    /// New windows growing in, and windows shrinking away before their tabs close.
+    /// New windows growing in.
     opened: HashMap<String, Instant>,
-    closing: HashMap<String, Instant>,
     /// Address bar matches (url, title) and the one picked with the arrow keys.
     suggestions: Vec<(String, String)>,
     suggestion: Option<usize>,
@@ -346,6 +353,10 @@ impl BrowserWindow {
             cookies_saved: Instant::now(),
             dock: Tween::new(false),
             dock_hovered: false,
+            lift: Tween::new(false),
+            space_chips: Vec::new(),
+            landing: None,
+            tab_drag: None,
             find: Tween::new(false),
             panel_tween: Tween::new(false),
             shown_panel: None,
@@ -353,7 +364,6 @@ impl BrowserWindow {
             load_bar: 0.0,
             load_done: None,
             opened: HashMap::new(),
-            closing: HashMap::new(),
             suggestions: Vec::new(),
             suggestion: None,
             address_bounds: None,
@@ -753,6 +763,7 @@ impl BrowserWindow {
         let record = self.model.lock().expect("model").extensions.iter().find(|extension| extension.id == id).cloned();
         let last = self.model.lock().expect("model").remove_extension(id).unwrap_or(false);
         self.sync_extension(id);
+        self.engine.extensions().remove_data(id, &self.active_store());
         // Only folders we unpacked ourselves are deleted, once no profile uses them; picked folders and examples stay.
         let root = app_support_dir().join("extensions");
         if let Some(record) = record.filter(|record| last && record.source == "store" && record.path.starts_with(&root)) {
@@ -881,30 +892,35 @@ impl BrowserWindow {
             return;
         };
         let group = self.group_id(first);
-        let whole = self.chrome.keys().filter(|id| self.group_id(id) == group).all(|id| ids.contains(id));
-        if whole && !self.reduce_motion && self.self_test.is_none() {
-            for id in ids {
-                self.closing.entry(id).or_insert_with(Instant::now);
+        // The model would activate the space's first tab; focus the rest of this window, else the window on top.
+        let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let open = |id: &&String| current.contains(id) && !ids.contains(id);
+        let survivor = self.order.iter().rev().filter(open).find(|id| self.group_id(id) == group).cloned().or_else(|| {
+            self.order
+                .iter()
+                .rev()
+                .filter(open)
+                .find(|id| self.is_front(id) && !self.chrome.get(*id).is_some_and(|chrome| chrome.minimized))
+                .cloned()
+        });
+        self.with_model(|model| {
+            for id in &ids {
+                let _ = model.close_tab(id);
             }
-        } else {
-            self.with_model(|model| {
-                for id in &ids {
-                    let _ = model.close_tab(id);
-                }
-            });
-            self.refresh_url(cx);
+        });
+        self.refresh_url(cx);
+        if let Some(survivor) = survivor {
+            self.focus_window(&survivor, cx);
         }
         cx.notify();
     }
 
-    /// Scale and opacity for a window opening or closing; (1, 1) when at rest.
+    /// Scale and opacity for a window opening; (1, 1) when at rest.
     fn window_motion(&self, id: &str) -> (f32, f32) {
-        let t = |at: &Instant| ease(at.elapsed().as_secs_f32() / WINDOW_ANIM.as_secs_f32());
-        let p = match (self.closing.get(id), self.opened.get(id)) {
-            (Some(at), _) => 1.0 - t(at),
-            (None, Some(at)) => t(at),
-            _ => return (1.0, 1.0),
+        let Some(at) = self.opened.get(id) else {
+            return (1.0, 1.0);
         };
+        let p = ease(at.elapsed().as_secs_f32() / WINDOW_ANIM.as_secs_f32());
         (WINDOW_FROM_SCALE + (1.0 - WINDOW_FROM_SCALE) * p, p)
     }
 
@@ -1269,6 +1285,7 @@ impl Render for BrowserWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.attach(window);
         self.overlay_rects.clear();
+        self.space_chips.clear();
         self.apply_theme(window, cx);
         self.request_address_focus(window, cx);
         let _subscriptions = &self.subscriptions;
@@ -1282,6 +1299,9 @@ impl Render for BrowserWindow {
         let history = self.model.lock().expect("model").history().unwrap_or_default();
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
         let colors = paint(cx);
+        if !cx.has_active_drag() {
+            self.tab_drag = None;
+        }
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
         let live_ids = self.model.lock().expect("model").tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         self.chrome.retain(|id, _| live_ids.iter().any(|live| live == id));
@@ -1290,7 +1310,7 @@ impl Render for BrowserWindow {
         self.prepare_frames(&tabs);
         self.sync_groups();
         self.save_layouts(&tabs);
-        self.step_motion(cx);
+        self.step_motion();
         if self.animating() {
             window.request_animation_frame();
         }
@@ -1342,6 +1362,12 @@ impl Render for BrowserWindow {
             ),
             )
             .child(self.dock(&tabs, cx))
+            .children(self.carried_view(&tabs, cx))
+            .children(self.tab_drag_view(cx))
+            .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                this.tab_drag = Some((event.drag(cx).0.clone(), event.event.position));
+                cx.notify();
+            }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
@@ -1355,7 +1381,7 @@ impl Render for BrowserWindow {
 
 impl BrowserWindow {
     /// Moves every animation one frame along: tweens follow their targets, finished closes run.
-    fn step_motion(&mut self, cx: &mut Context<Self>) {
+    fn step_motion(&mut self) {
         let (find, panel) = (self.anim(PANEL_ANIM), self.anim(PANEL_ANIM));
         self.find.set(self.find_open, find);
         if self.panel.is_some() {
@@ -1386,15 +1412,8 @@ impl BrowserWindow {
             None => {}
         }
         self.opened.retain(|_, at| at.elapsed() < WINDOW_ANIM);
-        let done = self.closing.iter().filter(|(_, at)| at.elapsed() >= WINDOW_ANIM).map(|(id, _)| id.clone()).collect::<Vec<_>>();
-        if !done.is_empty() {
-            self.closing.retain(|id, _| !done.contains(id));
-            self.with_model(|model| {
-                for id in &done {
-                    let _ = model.close_tab(id);
-                }
-            });
-            self.refresh_url(cx);
+        if self.landing.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= LAND_ANIM) {
+            self.landing = None;
         }
     }
 
@@ -1427,6 +1446,7 @@ impl BrowserWindow {
                 .border_color(paint.border)
                 .shadow_md()
                 .text_size(px(12.))
+                .occlude()
                 .child(measure_overlay(10., cx))
                 .child(div().opacity(p).truncate().child(self.toast.0.clone())),
         )
@@ -1697,6 +1717,7 @@ impl BrowserWindow {
         let sh = f64::from(bounds.size.height) as f32;
         let dx = f64::from(position.x) as f32 - gesture.origin_x;
         let dy = f64::from(position.y) as f32 - gesture.origin_y;
+        gesture.pointer = (f64::from(position.x) as f32, f64::from(position.y) as f32);
         if let Some(restore) = gesture.restore {
             // A click on a snapped title bar must not unsnap it; only a real drag does.
             if dx.abs() + dy.abs() < RESTORE_DRAG {
@@ -1752,6 +1773,25 @@ impl BrowserWindow {
                 let x = f64::from(position.x - bounds.origin.x) as f32;
                 let y = f64::from(position.y - bounds.origin.y) as f32;
                 gesture.snap = snap_zone(x, y, sw, sh);
+                // Up on the spaces bar the window is carried to another space instead of snapped.
+                let over_bar = y < 0.0 && self.space_chips.len() > 1;
+                self.lift.set(over_bar, self.anim(LIFT_ANIM));
+                if over_bar {
+                    gesture.snap = None;
+                    let space = self.space_chips.iter().find(|(_, chip)| chip.contains(&position)).map(|(id, _)| id.clone());
+                    let active = self.model.lock().expect("model").active_session_id.clone();
+                    // Hovering a space opens it, taking the window along to be dragged down into it.
+                    if let Some(space) = space.filter(|space| *space != active) {
+                        let group = self.group_id(&gesture.tab_id);
+                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        self.with_model(|model| {
+                            let _ = model.move_tabs_to_session(&ids, &space);
+                            let _ = model.switch_session(&space);
+                        });
+                        self.focus_window(&gesture.tab_id, cx);
+                        self.refresh_url(cx);
+                    }
+                }
             }
             GestureKind::Resize(edges) => {
                 frame = magnet(frame, edges, &others, sw, sh);
@@ -1760,6 +1800,10 @@ impl BrowserWindow {
             }
         }
         frame = keep_on_stage(frame, sw, sh);
+        if gesture.kind == GestureKind::Move {
+            // The title bar is the only handle, so it must never be dragged above the stage.
+            frame.y = frame.y.max(0.0);
+        }
         if let GestureKind::Resize(edges) = gesture.kind {
             let starts = gesture.partners.iter().map(|(_, start)| *start).collect::<Vec<_>>();
             let (linked, followers) = link_resize(gesture.start, frame, edges, &starts);
@@ -1780,9 +1824,15 @@ impl BrowserWindow {
     }
 
     fn finish_gesture(&mut self, cx: &mut Context<Self>) {
+        let carried = self.carried();
         let Some(gesture) = self.gesture.take() else {
             return;
         };
+        self.lift = Tween::new(false);
+        // Released still small: grow into its frame in whichever space is open now.
+        if let Some((id, from)) = carried {
+            self.landing = (!self.reduce_motion).then(|| (id, from, Instant::now()));
+        }
         self.update_dock(cx);
         if let (Some(snap), Some(stage)) = (gesture.snap, self.stage_bounds) {
             let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
@@ -1827,6 +1877,7 @@ impl BrowserWindow {
         let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
         let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
+        let carried = self.carried().map(|(id, _)| id);
         for id in ids {
             let Some(entry) = self.chrome.get(&id).cloned() else {
                 continue;
@@ -1842,7 +1893,7 @@ impl BrowserWindow {
                 };
                 stack.push((String::new(), shell, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }));
             }
-            if entry.minimized || !self.is_front(&id) || !current.contains(&id) {
+            if entry.minimized || !self.is_front(&id) || !current.contains(&id) || carried.as_deref() == Some(id.as_str()) {
                 self.engine.place_tab(&id, None);
                 continue;
             }
@@ -1898,6 +1949,7 @@ impl BrowserWindow {
             }
         }
         self.focus_window(id, cx);
+        self.landing = None;
         let Some(start) = self.visual_frame(id) else {
             return;
         };
@@ -1912,6 +1964,7 @@ impl BrowserWindow {
             restore,
             snap: None,
             partners: Vec::new(),
+            pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
         });
         self.engine.focus_chrome();
         cx.notify();
@@ -1947,6 +2000,7 @@ impl BrowserWindow {
             restore: None,
             snap: None,
             partners,
+            pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
         });
         self.engine.focus_chrome();
         cx.notify();
@@ -1985,9 +2039,15 @@ impl BrowserWindow {
         let mut ordered = shown;
         ordered.sort_by_key(|tab| self.order.iter().position(|id| id == &tab.id).unwrap_or(0));
         let preview = self.gesture.as_ref().and_then(|gesture| Some((gesture.tab_id.clone(), gesture.snap?)));
+        let carried = self.carried().map(|(id, _)| id);
+        // Windows occlude, so only a tab dropped on empty stage lands here.
+        stage = stage.on_drop(cx.listener(|this, drag: &TabDrag, window, cx| this.detach_tab(&drag.0.id, window.mouse_position(), cx)));
         for tab in ordered {
             if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
                 stage = stage.child(self.snap_preview(*snap, cx));
+            }
+            if carried.as_deref() == Some(tab.id.as_str()) {
+                continue;
             }
             let group = self.group_id(&tab.id);
             let members = tabs.iter().filter(|other| self.group_id(&other.id) == group).collect::<Vec<_>>();
@@ -2078,12 +2138,16 @@ impl BrowserWindow {
             let frame = scaled(frame, scale);
             shell.left(px(frame.x)).top(px(frame.y)).w(px(frame.w)).h(px(frame.h))
         };
+        let target = tab.id.clone();
         let mut body = div().relative().size_full().child(
             v_stack()
+                .id(SharedString::from(format!("window-{}", tab.id)))
                 .size_full()
                 .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
                 .border_color(if active { paint.accent } else { paint.border })
+                .drag_over::<TabDrag>(move |style, _, _, _| style.border_color(paint.accent).bg(paint.accent.opacity(0.12)))
+                .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_tab_to_window(&drag.0.id, &target, cx)))
                 .shadow_md()
                 .bg(paint.secondary)
                 .overflow_hidden()
@@ -2217,6 +2281,7 @@ impl BrowserWindow {
                     .when(shown, |pill| pill.bg(paint.secondary).text_color(paint.fg))
                     .when(!shown, |pill| pill.text_color(paint.muted).hover(|style| style.bg(paint.secondary.opacity(0.6)).text_color(paint.fg)))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.suppress_window_drag = true))
+                    .on_drag(TabDrag((*tab).clone()), |_, _, _, cx| cx.new(|_| TabDragPreview))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         // Safari compact: a click selects a tab, a click on the selected one edits its address.
                         let edit = this.is_front(&id) && this.active_tab_id().as_deref() == Some(id.as_str());
@@ -2466,6 +2531,8 @@ impl BrowserWindow {
             let hover_group = SharedString::from(format!("space-{id}"));
             let active = session.id == active_session;
             let members = all_tabs.iter().filter(|tab| tab.session_id == session.id).collect::<Vec<_>>();
+            let watch = cx.entity();
+            let chip_id = id.clone();
             spaces = spaces.child(
                 h_stack()
                     .id(SharedString::from(format!("space-{id}")))
@@ -2480,6 +2547,7 @@ impl BrowserWindow {
                     .text_color(if active { paint.fg } else { paint.muted })
                     .when(active, |chip| chip.bg(paint.secondary))
                     .when(!active, |chip| chip.hover(|style| style.bg(paint.secondary.opacity(0.5)).text_color(paint.fg)))
+                    .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.space_chips.push((chip_id, bounds))), |_, _, _, _| {}).absolute().size_full())
                     .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
                     .child(session.name.clone())
                     .when(closable, |chip| {
@@ -2664,6 +2732,9 @@ impl BrowserWindow {
                             .overflow_hidden()
                             .rounded(px(radius))
                             .bg(island)
+                            // The island floats over window title bars: a press on it must not reach the buttons beneath.
+                            // Not `occlude`, which would also unhover the hover zone around it and shut the dock.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(measure_overlay(f64::from(radius), cx))
                             .child(
                                 // Laid out at full height and slid down into view, so items never squash while the island grows.
@@ -2695,6 +2766,120 @@ impl BrowserWindow {
         self.chrome.insert(new.clone(), chrome);
         self.focus_window(&new, cx);
         self.focus_address = url.is_none();
+    }
+
+    /// Moves a tab into the window holding `target`, in front, sharing its frame.
+    fn move_tab_to_window(&mut self, id: &str, target: &str, cx: &mut Context<Self>) {
+        let group = self.group_id(target);
+        if self.group_id(id) == group {
+            return;
+        }
+        let mut chrome = self.chrome.get(target).cloned().unwrap_or_default();
+        chrome.window = Some(group);
+        self.chrome.insert(id.to_string(), chrome);
+        self.focus_window(id, cx);
+    }
+
+    /// Pulls a tab out of its window into one of its own, under the pointer.
+    fn detach_tab(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        if self.group_len(id) < 2 {
+            return;
+        }
+        let (Some(stage), Some(start), Some(mut chrome)) = (self.stage_bounds, self.visual_frame(id), self.chrome.get(id).cloned()) else {
+            return;
+        };
+        let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
+        let x = f64::from(at.x - stage.origin.x) as f32 - 60.0;
+        let y = f64::from(at.y - stage.origin.y) as f32 - TITLEBAR_H / 2.0;
+        // A fresh key: the tabs left behind may still be keyed by this tab's id.
+        chrome.window = Some(Uuid::new_v4().to_string());
+        chrome.snap = None;
+        chrome.restore = None;
+        chrome.maximized = false;
+        chrome.minimized = false;
+        chrome.frame = Some(keep_on_stage(Frame { x, y, w: start.w, h: start.h }, sw, sh));
+        self.chrome.insert(id.to_string(), chrome);
+        if !self.reduce_motion {
+            self.opened.insert(id.to_string(), Instant::now());
+        }
+        self.focus_window(id, cx);
+    }
+
+    /// The window being carried to another space and where it is drawn, in window coordinates:
+    /// shrinking under the pointer over the spaces bar, or growing back into place after the drop.
+    fn carried(&self) -> Option<(String, Frame)> {
+        let stage = self.stage_bounds?;
+        let (ox, oy) = (f64::from(stage.origin.x) as f32, f64::from(stage.origin.y) as f32);
+        if let Some((id, from, at)) = &self.landing {
+            let to = self.visual_frame(id)?;
+            let to = Frame { x: to.x + ox, y: to.y + oy, ..to };
+            return Some((id.clone(), lerp_frame(*from, to, ease(at.elapsed().as_secs_f32() / LAND_ANIM.as_secs_f32()))));
+        }
+        let gesture = self.gesture.as_ref().filter(|gesture| gesture.kind == GestureKind::Move)?;
+        let p = self.lift.progress();
+        if p <= 0.0 {
+            return None;
+        }
+        let (px, py) = gesture.pointer;
+        let start = gesture.start;
+        let full = Frame { x: start.x + px - gesture.origin_x + ox, y: start.y + py - gesture.origin_y + oy, ..start };
+        let small = (LIFT_W / full.w).min(1.0);
+        Some((gesture.tab_id.clone(), shrink_toward(full, gesture.pointer, 1.0 + (small - 1.0) * p)))
+    }
+
+    /// A stand-in for the carried window: its page is hidden while it is too small to read.
+    fn carried_view(&self, tabs: &[browser_core::Tab], cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let (id, frame) = self.carried()?;
+        let paint = paint(cx);
+        let group = self.group_id(&id);
+        let members = tabs.iter().filter(|tab| self.group_id(&tab.id) == group).collect::<Vec<_>>();
+        let title = (self.title_h() as f32).min(frame.h * 0.2);
+        Some(
+            div()
+                .absolute()
+                .left(px(frame.x))
+                .top(px(frame.y))
+                .w(px(frame.w))
+                .h(px(frame.h))
+                .rounded(px(WINDOW_RADIUS as f32))
+                .border_1()
+                .border_color(paint.accent)
+                .bg(paint.secondary)
+                .overflow_hidden()
+                .child(measure_overlay(WINDOW_RADIUS, cx))
+                .child(
+                    v_stack()
+                        .size_full()
+                        .child(div().h(px(title)).flex_none().bg(paint.surface).border_b_1().border_color(paint.border))
+                        .child(div().flex_1().flex().items_center().justify_center().child(favicon_stack(&members, paint.secondary))),
+                ),
+        )
+    }
+
+    /// The tab pill following the pointer while it is dragged.
+    fn tab_drag_view(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        let (tab, at) = self.tab_drag.as_ref()?;
+        let paint = paint(cx);
+        Some(
+            h_stack()
+                .absolute()
+                .left(at.x - px(20.))
+                .top(at.y - px(14.))
+                .h(px(28.))
+                .max_w(px(180.))
+                .px(px(8.))
+                .gap(px(6.))
+                .items_center()
+                .rounded(px(8.))
+                .bg(paint.secondary)
+                .border_1()
+                .border_color(paint.accent)
+                .text_size(px(12.))
+                .text_color(paint.fg)
+                .child(measure_overlay(8.0, cx))
+                .child(favicon(tab, false))
+                .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
+        )
     }
 
     /// The window a tab belongs to; a tab never added to another window is its own.
@@ -2755,7 +2940,8 @@ impl BrowserWindow {
             || self.toast.1.elapsed() < TOAST_LIFE
             || self.load_bar > 0.0
             || !self.opened.is_empty()
-            || !self.closing.is_empty()
+            || self.lift.running()
+            || self.landing.is_some()
     }
 
     fn panel_icon(
@@ -3047,6 +3233,8 @@ struct Gesture {
     snap: Option<Snap>,
     /// Other snapped windows and their frames when a resize began; the adjacent ones follow the shared border.
     partners: Vec<(String, Frame)>,
+    /// Pointer in window coordinates.
+    pointer: (f32, f32),
 }
 
 /// The address as shown when not editing: no scheme, no trailing slash on a bare host.
@@ -3327,6 +3515,10 @@ fn resize_cursor(edges: Edges) -> CursorStyle {
 
 const TITLEBAR_H: f32 = 38.0;
 const DOCK_ANIM: Duration = Duration::from_millis(260);
+const LIFT_ANIM: Duration = Duration::from_millis(220);
+const LAND_ANIM: Duration = Duration::from_millis(280);
+/// Width a window shrinks to while carried over the spaces bar.
+const LIFT_W: f32 = 140.0;
 const PANEL_ANIM: Duration = Duration::from_millis(180);
 const WINDOW_ANIM: Duration = Duration::from_millis(170);
 const WINDOW_FROM_SCALE: f32 = 0.94;
@@ -3352,6 +3544,21 @@ fn scaled(frame: Frame, scale: f32) -> Frame {
     }
     let (w, h) = (frame.w * scale, frame.h * scale);
     Frame { x: frame.x + (frame.w - w) / 2.0, y: frame.y + (frame.h - h) / 2.0, w, h }
+}
+
+/// Scales a frame about `point`, so whatever sat under it stays there.
+fn shrink_toward(frame: Frame, point: (f32, f32), scale: f32) -> Frame {
+    Frame {
+        x: point.0 - (point.0 - frame.x) * scale,
+        y: point.1 - (point.1 - frame.y) * scale,
+        w: frame.w * scale,
+        h: frame.h * scale,
+    }
+}
+
+fn lerp_frame(a: Frame, b: Frame, t: f32) -> Frame {
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    Frame { x: lerp(a.x, b.x), y: lerp(a.y, b.y), w: lerp(a.w, b.w), h: lerp(a.h, b.h) }
 }
 
 /// Ease-out cubic over t in 0..=1: quick start, soft landing.
@@ -3598,6 +3805,18 @@ pub(crate) fn site_color(host: &str) -> gpui::Hsla {
     gpui::hsla((hash % 360) as f32 / 360.0, 0.62, 0.38, 1.)
 }
 
+/// Drag payload for moving a tab to another window, or out into one of its own.
+struct TabDrag(browser_core::Tab);
+
+/// Draws nothing: the window draws the dragged pill itself, so pages are cut out beneath it.
+struct TabDragPreview;
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 /// Drag payload for reordering profiles in the rail.
 struct RailDrag(browser_core::Profile);
 
@@ -3680,6 +3899,17 @@ mod tests {
         // A tab not yet stacked only shows when nothing else in its window is.
         assert!(!raised_last(&order, "c", |id| id == "c" || id == "a"));
         assert!(raised_last(&order, "c", |id| id == "c"));
+    }
+
+    #[test]
+    fn shrinking_keeps_the_grab_point_under_the_pointer() {
+        let frame = Frame { x: 100.0, y: 50.0, w: 800.0, h: 600.0 };
+        let small = shrink_toward(frame, (300.0, 60.0), 0.25);
+        assert_eq!((small.w, small.h), (200.0, 150.0));
+        // The grab point was a quarter across and 10px down; at a quarter scale it is 2.5px down.
+        assert_eq!((small.x + small.w * 0.25, small.y + 2.5), (300.0, 60.0));
+        let back = lerp_frame(small, frame, 1.0);
+        assert_eq!((back.x, back.y, back.w, back.h), (frame.x, frame.y, frame.w, frame.h));
     }
 
     #[test]

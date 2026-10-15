@@ -10,6 +10,21 @@
       Object.defineProperty(Symbol, name, { value: Symbol(`Symbol.${name}`) });
     }
   }
+  // WebKit's extension error list keeps only the first argument of `console.error`, so
+  // "Unhandled error in angular" arrives without the error; fold the rest into one line.
+  if (g.console && g.console.error) {
+    const consoleError = g.console.error.bind(g.console);
+    const describe = (value) => {
+      if (value instanceof Error) return `${value.name}: ${value.message}${value.stack ? `\n${value.stack}` : ""}`;
+      if (value && typeof value === "object") {
+        try {
+          return JSON.stringify(value);
+        } catch (_) {}
+      }
+      return String(value);
+    };
+    g.console.error = (...args) => consoleError(args.length > 1 || args[0] instanceof Error ? args.map(describe).join(" ") : args[0]);
+  }
   if (!g.chrome && !g.browser) return;
   const chrome = g.chrome || g.browser;
   const event = () => {
@@ -165,6 +180,42 @@
   if (chrome.tabs) {
     define(chrome.tabs, "group", unsupported("chrome.tabs.group"));
     define(chrome.tabs, "ungroup", method(() => undefined));
+  }
+
+  // Phantom reads the redirect URL when its background loads; without it the background (and so the popup) never starts.
+  define(chrome, "identity", {
+    getRedirectURL: (path = "") => `https://${chrome.runtime.id}.chromiumapp.org/${String(path).replace(/^\//, "")}`,
+    launchWebAuthFlow: unsupported("chrome.identity.launchWebAuthFlow"),
+    getAuthToken: unsupported("chrome.identity.getAuthToken"),
+    removeCachedAuthToken: method(() => undefined),
+    clearAllCachedAuthTokens: method(() => undefined),
+    getProfileUserInfo: method(() => ({ email: "", id: "" })),
+    onSignInChanged: event(),
+  });
+
+  // WebKit throws on permissions it doesn't know ("'privacy' is not a valid permission") where Chrome
+  // answers, which crashes Bitwarden's popup. Those can't be granted here, so the answer is "no".
+  // `patch_pages` points the extension's permissions calls here; WebKit's object can't be patched.
+  // (Written without a dot after `permissions`, so that rewrite leaves this file alone.)
+  const permissions = chrome["permissions"];
+  if (permissions) {
+    const guarded = (name) => (...args) => {
+      try {
+        return permissions[name](...args);
+      } catch (error) {
+        if (!/is not a valid permission/.test(String(error && error.message))) throw error;
+        const callback = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+        if (!callback) return Promise.resolve(false);
+        setTimeout(() => callback(false), 0);
+      }
+    };
+    g.nxPermissions = new Proxy(permissions, {
+      get: (target, key) => {
+        if (key === "contains" || key === "request" || key === "remove") return guarded(key);
+        const value = target[key];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
 
   define(chrome, "debugger", {

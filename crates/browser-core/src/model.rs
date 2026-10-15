@@ -422,6 +422,27 @@ impl Model {
         self.reload()
     }
 
+    /// Moves tabs of the active space into another space of this profile; an emptied space keeps a home tab.
+    pub fn move_tabs_to_session(&mut self, ids: &[String], session_id: &str) -> anyhow::Result<()> {
+        let from = self.active_session_id.clone();
+        if session_id == from || !self.profile_sessions().iter().any(|session| session.id == session_id) {
+            return Ok(());
+        }
+        let base = self.tabs.iter().filter(|tab| tab.session_id == session_id).count() as i32;
+        for (index, id) in ids.iter().enumerate() {
+            self.storage.execute(
+                "UPDATE tabs SET session_id = ?1, active = 0, position = ?2 WHERE id = ?3 AND session_id = ?4",
+                params![session_id, base + index as i32, id, from],
+            )?;
+        }
+        self.reload()?;
+        if !self.tabs.iter().any(|tab| tab.session_id == from) {
+            self.insert_tab(&from, "nxbrowser://home", "New Tab", true, 0, TabState::Suspended)?;
+            self.reload()?;
+        }
+        Ok(())
+    }
+
     pub fn create_tab(&mut self, url: &str) -> anyhow::Result<String> {
         let session_id = self.active_session_id.clone();
         let position = self.session_tabs().len() as i32;
@@ -1175,6 +1196,21 @@ mod tests {
         loaded.switch_profile(&profile_id).unwrap();
         assert_eq!(loaded.active_tab().unwrap().url, url);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn moved_tabs_change_space_and_leave_a_home_tab() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let from = model.active_session_id.clone();
+        let ids = model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        model.create_session().unwrap();
+        let to = model.active_session_id.clone();
+        model.switch_session(&from).unwrap();
+        model.move_tabs_to_session(&ids, &to).unwrap();
+        assert!(ids.iter().all(|id| model.tabs.iter().any(|tab| tab.id == *id && tab.session_id == to)));
+        let left = model.tabs.iter().filter(|tab| tab.session_id == from).collect::<Vec<_>>();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].url, "nxbrowser://home");
     }
 
     #[test]

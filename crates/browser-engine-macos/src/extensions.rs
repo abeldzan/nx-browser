@@ -17,14 +17,15 @@ use browser_engine::EngineEvent;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSApplication, NSEvent, NSImage};
+use objc2_app_kit::{NSApplication, NSEvent, NSImage, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSViewController};
 use objc2_foundation::{NSArray, NSDate, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSet, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults, NSNotification, NSNotificationCenter};
 use objc2_web_kit::{
     WKWebExtension, WKWebExtensionAction, WKWebExtensionContext, WKWebExtensionContextPermissionStatus,
     WKWebExtensionController, WKWebExtensionControllerConfiguration, WKWebExtensionControllerDelegate,
     WKWebExtensionMatchPattern, WKWebExtensionPermission, WKWebExtensionTab, WKWebExtensionTabChangedProperties,
     WKWebExtensionTabConfiguration, WKWebExtensionWindow, WKWebExtensionWindowConfiguration, WKWebExtensionWindowState,
-    WKWebExtensionWindowType, WKWebExtensionContextErrorsDidUpdateNotification, WKNavigationAction, WKSnapshotConfiguration, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore, WKWindowFeatures,
+    WKWebExtensionWindowType, WKWebExtensionContextErrorsDidUpdateNotification, WKNavigationAction, WKSnapshotConfiguration, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore, WKWebsiteDataRecord, WKWindowFeatures,
+    WKWebExtensionDataRecord, WKWebExtensionDataTypeLocal, WKWebExtensionDataTypeSession, WKWebExtensionDataTypeSynchronized,
 };
 
 pub const SCHEME: &str = "webkit-extension://";
@@ -63,6 +64,8 @@ struct State {
     anchor: [f64; 4],
     /// UI delegate of the open popup's page; WebKit holds delegates weakly.
     popup_ui: Option<Retained<NxPopupUI>>,
+    /// The popup shown on the last click before WebKit asked for it; see `presentPopupForAction`.
+    early_popup: Option<Retained<WKWebExtensionAction>>,
     /// Prints each new extension error to stderr; the extensions panel only shows the first, truncated.
     _errors_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
 }
@@ -84,6 +87,7 @@ impl Extensions {
             pending_tabs: Vec::new(),
             anchor: [0.0; 4],
             popup_ui: None,
+            early_popup: None,
             _errors_observer: observe_errors(),
         }));
         CURRENT.with(|current| *current.borrow_mut() = Rc::downgrade(&shared));
@@ -202,6 +206,42 @@ impl Extensions {
         messages
     }
 
+    /// Deletes what the extension kept in this profile: its `chrome.storage`, its pages' site data
+    /// (IndexedDB, localStorage, caches) and the permissions the user granted it when asked.
+    pub fn remove_data(&self, id: &str, store_id: &str) {
+        unsafe { NSUserDefaults::standardUserDefaults().removeObjectForKey(&grants_key(store_id, id)) };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        // shortcut: a profile no page has opened this run has no controller, so its data stays; create one here if that bites.
+        let Some(controller) = self.0.borrow().profiles.get(store_id).map(|profile| profile.controller.clone()) else {
+            return;
+        };
+        let types = unsafe { [WKWebExtensionDataTypeLocal, WKWebExtensionDataTypeSession, WKWebExtensionDataTypeSynchronized] };
+        let types = NSSet::from_slice(&types.into_iter().flatten().collect::<Vec<_>>());
+        let (wanted, target, kinds) = (id.to_string(), controller.clone(), types.clone());
+        let block = RcBlock::new(move |records: NonNull<NSArray<WKWebExtensionDataRecord>>| {
+            let records = unsafe { records.as_ref() }.iter().filter(|record| unsafe { record.uniqueIdentifier() }.to_string() == wanted).collect::<Vec<_>>();
+            if !records.is_empty() {
+                unsafe { target.removeDataOfTypes_fromDataRecords_completionHandler(&kinds, &NSArray::from_retained_slice(&records), &RcBlock::new(|| {})) };
+            }
+        });
+        unsafe { controller.fetchDataRecordsOfTypes_completionHandler(&types, &block) };
+
+        // Extension pages store site data under their `webkit-extension://<id>` origin, named by that host.
+        let Some(store) = (unsafe { controller.configuration().defaultWebsiteDataStore() }) else {
+            return;
+        };
+        let (wanted, target, kinds) = (id.to_string(), store.clone(), unsafe { WKWebsiteDataStore::allWebsiteDataTypes(mtm) });
+        let block = RcBlock::new(move |records: NonNull<NSArray<WKWebsiteDataRecord>>| {
+            let records = unsafe { records.as_ref() }.iter().filter(|record| unsafe { record.displayName() }.to_string().eq_ignore_ascii_case(&wanted)).collect::<Vec<_>>();
+            if !records.is_empty() {
+                unsafe { target.removeDataOfTypes_forDataRecords_completionHandler(&kinds, &NSArray::from_retained_slice(&records), &RcBlock::new(|| {})) };
+            }
+        });
+        unsafe { store.fetchDataRecordsOfTypes_completionHandler(&WKWebsiteDataStore::allWebsiteDataTypes(mtm), &block) };
+    }
+
     pub fn is_loaded(&self, id: &str) -> bool {
         self.0.borrow().parsed.contains_key(id)
     }
@@ -222,7 +262,9 @@ impl Extensions {
         unsafe { context.performActionForTab(tab.as_deref()) };
         // WebKit loads the popup but may never call `presentPopupForAction` (Bitwarden's never comes), so show it now.
         if let Some(action) = unsafe { context.actionForTab(tab.as_deref()) }.filter(|action| unsafe { action.presentsPopup() }) {
-            present_popup(&self.0, &action);
+            if present_popup(&self.0, &action, &context) {
+                self.0.borrow_mut().early_popup = Some(action);
+            }
         }
     }
 
@@ -507,22 +549,32 @@ fn observe_errors() -> Retained<ProtocolObject<dyn NSObjectProtocol>> {
 }
 
 /// Shows the action's popup as a popover under the clicked button; WebKit sizes it to the page.
-fn present_popup(shared: &Rc<RefCell<State>>, action: &WKWebExtensionAction) {
+/// False when it can't be shown, so WebKit drops the popup instead of counting it as open.
+fn present_popup(shared: &Rc<RefCell<State>>, action: &WKWebExtensionAction, context: &WKWebExtensionContext) -> bool {
     let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let (Some(popover), Some(view)) = (unsafe { action.popupPopover() }, unsafe { action.popupWebView() }) else {
-        return;
+        return false;
     };
     let app = NSApplication::sharedApplication(mtm);
     let Some(content) = app.keyWindow().or_else(|| app.mainWindow()).or_else(|| app.windows().firstObject()).and_then(|window| window.contentView()) else {
-        return;
+        return false;
+    };
+    let (popover, view, own) = match (unsafe { action.popupPopover() }, unsafe { action.popupWebView() }) {
+        (Some(popover), Some(view)) => (popover, view, false),
+        // The extension cleared its popup right after `action.openPopup()` (Phantom does), so WebKit has no page left to give.
+        _ => match manifest_popup(context, mtm) {
+            Some((popover, view)) => (popover, view, true),
+            None => return false,
+        },
     };
     if popover.isShown() {
-        return;
+        return true;
     }
-    let ui = NxPopupUI::new(mtm, PopupIvars { original: unsafe { view.UIDelegate() }, events: shared.borrow().events.clone(), action: action.retain() });
+    let original = if own { None } else { unsafe { view.UIDelegate() } };
+    let own_popover = own.then(|| popover.clone());
+    let ui = NxPopupUI::new(mtm, PopupIvars { original, events: shared.borrow().events.clone(), action: action.retain(), own_popover });
     unsafe { view.setUIDelegate(Some(ProtocolObject::from_ref(&*ui))) };
+    // WebKit only hears of its popover closing once; a popover shown again would close unnoticed.
+    popover.setDelegate(Some(ProtocolObject::from_ref(&*ui)));
     let [x, y, w, h] = shared.borrow().anchor;
     shared.borrow_mut().popup_ui = Some(ui);
     let (rect, edge) = if content.isFlipped() {
@@ -531,6 +583,29 @@ fn present_popup(shared: &Rc<RefCell<State>>, action: &WKWebExtensionAction) {
         (NSRect::new(NSPoint::new(x, content.bounds().size.height - y - h), NSSize::new(w, h)), NSRectEdge::MinY)
     };
     popover.showRelativeToRect_ofView_preferredEdge(rect, &content, edge);
+    true
+}
+
+/// The popup page the manifest names, in a popover of our own.
+fn manifest_popup(context: &WKWebExtensionContext, mtm: MainThreadMarker) -> Option<(Retained<NSPopover>, Retained<WKWebView>)> {
+    let manifest = unsafe { context.webExtension().manifest() };
+    let path = ["action.default_popup", "browser_action.default_popup"].into_iter().find_map(|key| {
+        let value: Option<Retained<AnyObject>> = unsafe { msg_send![&*manifest, valueForKeyPath: &*NSString::from_str(key)] };
+        value?.downcast::<NSString>().ok().filter(|path| path.length() > 0)
+    })?;
+    let url = NSURL::URLWithString_relativeToURL(&path, Some(&*unsafe { context.baseURL() }))?;
+    let configuration = unsafe { context.webViewConfiguration() }?;
+    // shortcut: a fixed size where WebKit sizes its own popover to the page; measure the page if a popup looks cramped.
+    let size = NSSize::new(360.0, 600.0);
+    let view = unsafe { WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), size), &configuration) };
+    unsafe { view.loadRequest(&NSURLRequest::requestWithURL(&url)) };
+    let controller = NSViewController::new(mtm);
+    controller.setView(&view);
+    let popover = NSPopover::new(mtm);
+    popover.setBehavior(NSPopoverBehavior::Semitransient);
+    popover.setContentViewController(Some(&controller));
+    popover.setContentSize(size);
+    Some((popover, view))
 }
 
 /// WebKit hands back `WKNSError`s that forward `NSError` methods, which objc2's debug method check rejects.
@@ -912,10 +987,19 @@ define_class!(
             context: &WKWebExtensionContext,
             reply: &DynBlock<dyn Fn(*mut NSError)>,
         ) {
-            if let Some(shared) = self.ivars().shared.upgrade() {
-                present_popup(&shared, action);
+            let Some(shared) = self.ivars().shared.upgrade() else {
+                return done(reply);
+            };
+            // We showed it on the click and the user has closed it since: WebKit's close came before WebKit
+            // counted it as open, so refuse, or it stays "open" and blocks every later popup in the profile.
+            let early = shared.borrow_mut().early_popup.take().is_some_and(|early| std::ptr::eq(&*early, action));
+            let dismissed = early && unsafe { action.popupPopover() }.is_none_or(|popover| !popover.isShown());
+            if !dismissed && present_popup(&shared, action, context) {
+                done(reply);
+            } else {
+                let error = NSError::new(1, &NSString::from_str("NxBrowser"));
+                reply.call((Retained::as_ptr(&error) as *mut _,));
             }
-            done(reply);
         }
     }
 );
@@ -932,6 +1016,8 @@ pub struct PopupIvars {
     original: Option<Retained<ProtocolObject<dyn WKUIDelegate>>>,
     events: Sender<EngineEvent>,
     action: Retained<WKWebExtensionAction>,
+    /// Set when the popup is our `manifest_popup`, which WebKit doesn't know to close.
+    own_popover: Option<Retained<NSPopover>>,
 }
 
 define_class!(
@@ -968,13 +1054,21 @@ define_class!(
         ) -> Option<Retained<WKWebView>> {
             if let Some(url) = url_string(unsafe { navigation_action.request() }.URL()) {
                 let _ = self.ivars().events.send(EngineEvent::OpenInNewTab { url, from: None });
-                unsafe { self.ivars().action.closePopup() };
+                self.close();
             }
             None
         }
 
         #[unsafe(method(webViewDidClose:))]
         unsafe fn did_close(&self, _web_view: &WKWebView) {
+            self.close();
+        }
+    }
+
+    unsafe impl NSPopoverDelegate for NxPopupUI {
+        // Tell WebKit, which may still count the popup as open; closing twice is harmless.
+        #[unsafe(method(popoverDidClose:))]
+        fn popover_did_close(&self, _notification: &NSNotification) {
             unsafe { self.ivars().action.closePopup() };
         }
     }
@@ -984,5 +1078,12 @@ impl NxPopupUI {
     fn new(mtm: MainThreadMarker, ivars: PopupIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn close(&self) {
+        if let Some(popover) = &self.ivars().own_popover {
+            popover.close();
+        }
+        unsafe { self.ivars().action.closePopup() };
     }
 }
