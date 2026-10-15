@@ -1,5 +1,9 @@
 pub fn tab_label(title: &str, url: &str) -> String {
-    let label = if title.is_empty() || title == "New Tab" { url } else { title };
+    let label = match title {
+        "" | "New Tab" if crate::terminal::is_terminal(url) => "Terminal",
+        "" | "New Tab" => url,
+        _ => title,
+    };
     // A tab with neither (an older blank-URL row) would collapse to an icon-only pill.
     let label = if label.is_empty() { "New Tab" } else { label };
     if label.chars().count() > 28 {

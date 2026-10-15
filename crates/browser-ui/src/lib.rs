@@ -6,6 +6,7 @@ mod profiles;
 mod settings;
 mod sidebar;
 mod tabs;
+mod terminal;
 mod ui;
 mod window;
 
@@ -45,6 +46,9 @@ pub fn run() {
             s.detached_windows.retain(|id| live.contains(id) && *id != main);
         });
         model.request_show_active();
+        terminal::set_prefs(&model.settings, cx);
+        // Listing fonts takes over a second; done now, the settings font list opens instantly.
+        std::thread::spawn(|| terminal::monospace_fonts().len());
         let model: SharedModel = Arc::new(Mutex::new(model));
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, self_test, started, cx));

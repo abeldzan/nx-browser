@@ -36,13 +36,14 @@ pub enum SettingsSection {
     Privacy,
     Content,
     Downloads,
+    Terminal,
     Performance,
     Developer,
     About,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Profiles,
         Self::General,
         Self::Appearance,
@@ -50,6 +51,7 @@ impl SettingsSection {
         Self::Privacy,
         Self::Content,
         Self::Downloads,
+        Self::Terminal,
         Self::Performance,
         Self::Developer,
         Self::About,
@@ -64,6 +66,7 @@ impl SettingsSection {
             Self::Privacy => "Privacy & security",
             Self::Content => "Site content",
             Self::Downloads => "Downloads",
+            Self::Terminal => "Terminal",
             Self::Performance => "Performance",
             Self::Developer => "Developer",
             Self::About => "About",
@@ -84,6 +87,9 @@ impl BrowserWindow {
             };
             self.home_input.update(cx, |input, cx| input.set_content_silent(settings.home_page, cx));
             self.ua_input.update(cx, |input, cx| input.set_content_silent(settings.user_agent, cx));
+            // Rebuilt on show, so it lists fonts installed since and selects the saved one.
+            self.term_font_picker = None;
+            self.term_shell_input.update(cx, |input, cx| input.set_content_silent(settings.terminal_shell, cx));
             self.select_settings_profile(active, cx);
         }
         cx.notify();
@@ -336,6 +342,8 @@ impl BrowserWindow {
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
         let _ = self.model.lock().update_settings(f);
         self.apply_settings();
+        let settings = self.model.lock().settings.clone();
+        crate::terminal::set_prefs(&settings, cx);
         cx.notify();
     }
 
@@ -575,6 +583,69 @@ impl BrowserWindow {
                     "Ask where to save each file",
                     None,
                     switch("ask-download", settings.ask_download_path, |s, v| s.ask_download_path = v, paint, cx),
+                    paint,
+                )),
+            SettingsSection::Terminal => page
+                .child(row(
+                    "Font",
+                    Some("Installed monospace fonts. Type to search, or type any font name."),
+                    div().w(px(260.)).children(self.term_font_picker.clone()),
+                    paint,
+                ))
+                .child(row(
+                    "Font size",
+                    None,
+                    stepper(
+                        "term-size",
+                        format!("{:.0} pt", settings.terminal_font_size),
+                        |s| s.terminal_font_size = (s.terminal_font_size - 1.0).max(8.0),
+                        |s| s.terminal_font_size = (s.terminal_font_size + 1.0).min(32.0),
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Line height",
+                    Some("Row height as a multiple of the font size."),
+                    stepper(
+                        "term-line",
+                        format!("{:.2}", settings.terminal_line_height),
+                        |s| s.terminal_line_height = ((s.terminal_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
+                        |s| s.terminal_line_height = ((s.terminal_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Cursor",
+                    Some("Programs like vim may still change it while they run."),
+                    choice(
+                        "term-cursor",
+                        vec![("Block", "block".to_string()), ("Bar", "beam".into()), ("Underline", "underline".into())],
+                        settings.terminal_cursor.clone(),
+                        |s, v| s.terminal_cursor = v,
+                        paint,
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Scrollback",
+                    Some("Lines of history kept per terminal."),
+                    choice(
+                        "term-scrollback",
+                        vec![("1,000", 1_000), ("10,000", 10_000), ("50,000", 50_000), ("100,000", 100_000)],
+                        settings.terminal_scrollback,
+                        |s, v| s.terminal_scrollback = v,
+                        paint,
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Shell",
+                    Some("Program started in new terminals. Leave empty for your login shell. Press Return to save."),
+                    div().w(px(260.)).child(text_field(&self.term_shell_input, cx).placeholder(std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())).full_width(true)),
                     paint,
                 )),
             SettingsSection::Performance => page

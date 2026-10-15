@@ -109,6 +109,7 @@ pub enum Shortcut {
     Print,
     CommandPalette,
     Inspect,
+    NewTerminal,
 }
 
 pub trait WebEngine {

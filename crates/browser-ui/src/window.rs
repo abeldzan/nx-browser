@@ -2,6 +2,7 @@ use crate::profiles::profile_label;
 use crate::settings::SettingsSection;
 use crate::sidebar::SidebarPage;
 use crate::tabs::tab_label;
+use crate::terminal::{self, is_terminal, TERMINAL_URL};
 use crate::SharedModel;
 use browser_core::{
     app_support_dir, downloads_dir, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
@@ -20,6 +21,7 @@ use crate::settings::measure_overlay;
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
+use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
@@ -63,6 +65,9 @@ pub struct BrowserWindow {
     rename_input: Entity<InputState>,
     pub(crate) home_input: Entity<InputState>,
     pub(crate) ua_input: Entity<InputState>,
+    /// Searchable font list in the Terminal settings; built on first show since it needs a `Window`.
+    pub(crate) term_font_picker: Option<Entity<ComboboxState<String>>>,
+    pub(crate) term_shell_input: Entity<InputState>,
     pub(crate) name_input: Entity<InputState>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
@@ -94,6 +99,8 @@ pub struct BrowserWindow {
     blur_address: bool,
     find_open: bool,
     focus_find: bool,
+    /// Give keys to the active terminal on the next render.
+    focus_terminal: bool,
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_index: usize,
@@ -256,6 +263,7 @@ impl BrowserWindow {
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let history_query = cx.new(|cx| InputState::new_singleline(cx));
@@ -337,6 +345,14 @@ impl BrowserWindow {
                 }
                 _ => {}
             }),
+            cx.subscribe(&term_shell_input, |this, input, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit | InputStateEvent::Blur => {
+                    let value = input.read(cx).content().trim().to_string();
+                    this.set_pref(cx, |s| s.terminal_shell = value);
+                }
+                _ => {}
+            }),
             cx.subscribe(&new_profile_input, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::Submit => this.create_new_profile(cx),
@@ -384,6 +400,8 @@ impl BrowserWindow {
             rename_input,
             home_input,
             ua_input,
+            term_font_picker: None,
+            term_shell_input,
             name_input,
             settings_open: false,
             settings_section: SettingsSection::Profiles,
@@ -407,6 +425,7 @@ impl BrowserWindow {
             blur_address: false,
             find_open: false,
             focus_find: false,
+            focus_terminal: false,
             palette_open: false,
             palette_input,
             palette_index: 0,
@@ -513,6 +532,7 @@ impl BrowserWindow {
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.drain(cx);
         self.warm_tabs();
+        changed |= self.sync_terminals(cx);
         while let Ok((id, result)) = self.installs_rx.try_recv() {
             changed = true;
             self.installing.retain(|pending| pending != &id);
@@ -568,6 +588,41 @@ impl BrowserWindow {
         if changed || self.self_test.is_some() || self.ticks.is_multiple_of(4) {
             cx.notify();
         }
+    }
+
+    /// Copies each terminal's title and folder into its tab, closes tabs whose shell exited,
+    /// and ends shells whose tab is gone; true if anything changed.
+    fn sync_terminals(&mut self, cx: &mut Context<Self>) -> bool {
+        let tabs = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).cloned().collect::<Vec<_>>();
+        let mut changed = false;
+        let mut exited = Vec::new();
+        for tab in tabs {
+            let Some(view) = terminal::get(&tab.id, cx) else {
+                continue;
+            };
+            let view = view.read(cx);
+            if view.exited {
+                exited.push(tab.id.clone());
+                continue;
+            }
+            let title = view.title();
+            let url = view.cwd().map(|dir| terminal::terminal_url(&dir));
+            let mut model = self.model.lock();
+            if tab.title != title {
+                changed = true;
+                let _ = model.set_loading_title(&tab.id, &title);
+            }
+            if let Some(url) = url.filter(|url| *url != tab.url) {
+                let _ = model.set_tab_url(&tab.id, &url);
+            }
+        }
+        if !exited.is_empty() {
+            changed = true;
+            self.close_tabs(exited, cx);
+        }
+        let live = self.model.lock().tabs.iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        terminal::retain(|id| live.iter().any(|live| live == id), cx);
+        changed
     }
 
     fn save_cookies(&mut self) {
@@ -704,7 +759,20 @@ impl BrowserWindow {
                     self.close_tabs(vec![id], cx);
                 }
             }
-            Shortcut::FocusUrl => self.focus_address = true,
+            // A terminal's address pill is not editable.
+            Shortcut::FocusUrl => self.focus_address = !self.model.lock().active_tab().is_some_and(|tab| is_terminal(&tab.url)),
+            Shortcut::NewTerminal => {
+                // Opens beside the active tab, in the active terminal's folder if there is one.
+                let url = self.model.lock().active_tab().map(|tab| tab.url.clone()).filter(|url| is_terminal(url)).unwrap_or_else(|| TERMINAL_URL.into());
+                match self.active_tab_id() {
+                    Some(id) => self.new_tab_in(&id, Some(&url), cx),
+                    None => {
+                        if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
+                            self.focus_window(&id, cx);
+                        }
+                    }
+                }
+            }
             Shortcut::Reload => self.reload(),
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
@@ -765,6 +833,7 @@ impl BrowserWindow {
     fn apply(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
+                Effect::EnsureTab { url, .. } if is_terminal(&url) => {}
                 Effect::EnsureTab { tab_id, data_store_id, url } => {
                     let _ = self.engine.ensure_tab(&tab_id, &data_store_id, &url);
                 }
@@ -775,6 +844,7 @@ impl BrowserWindow {
                         self.engine.show_tab(tab_id.as_deref());
                     }
                 }
+                Effect::Navigate { url, .. } if is_terminal(&url) => {}
                 Effect::Navigate { tab_id, url } => {
                     let _ = self.engine.navigate(&tab_id, &url);
                 }
@@ -799,7 +869,7 @@ impl BrowserWindow {
             let entry = self.chrome.get(&tab.id);
             let minimized = entry.is_some_and(|chrome| chrome.minimized);
             let covered = maximized && !entry.is_some_and(|chrome| chrome.maximized);
-            if minimized || covered {
+            if minimized || covered || is_terminal(&tab.url) {
                 continue;
             }
             let _ = self.engine.ensure_tab(&tab.id, &store, &tab.url);
@@ -1146,7 +1216,19 @@ impl BrowserWindow {
         self.with_model(|model| {
             let _ = model.navigate_active(&url);
         });
-        self.engine.focus_page();
+        self.focus_active_content();
+    }
+
+    /// Gives keys to the active tab's content: its web page, or its terminal on the next render.
+    pub(crate) fn focus_active_content(&mut self) {
+        let Some(tab) = self.model.lock().active_tab().cloned() else {
+            return;
+        };
+        if is_terminal(&tab.url) {
+            self.focus_terminal = true;
+        } else {
+            self.engine.focus_page(&tab.id);
+        }
     }
 
     pub(crate) fn open_history_url(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -1411,6 +1493,50 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&palette.focus_handle(cx), cx));
     }
 
+    fn request_terminal_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_terminal) {
+            return;
+        }
+        let Some(tab) = self.model.lock().active_tab().filter(|tab| is_terminal(&tab.url)).cloned() else {
+            return;
+        };
+        // A brand-new terminal is created here rather than later in this render, so it can take focus now.
+        let view = terminal::terminal_for(&tab.id, &tab.url, cx);
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&view.focus_handle(cx), cx));
+    }
+
+    fn build_font_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open || self.settings_section != SettingsSection::Terminal || self.term_font_picker.is_some() {
+            return;
+        }
+        let current = self.model.lock().settings.terminal_font.clone();
+        let mut fonts = terminal::monospace_fonts().to_vec();
+        if !fonts.contains(&current) {
+            // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
+            fonts.insert(0, current.clone());
+        }
+        let options = fonts.into_iter().map(|name| (name.clone(), name)).collect::<Vec<_>>();
+        let (pick, create) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let picker = combobox("terminal-font", "Terminal font", options)
+            .selected(current)
+            .placeholder("Search fonts…")
+            .full_width(true)
+            .on_change(move |font: Option<String>, _, cx| {
+                if let Some(font) = font {
+                    let _ = pick.update(cx, |this, cx| this.set_pref(cx, |s| s.terminal_font = font));
+                }
+            })
+            // A name not in the list is kept as typed, so fonts CoreText doesn't flag as monospace still work.
+            .on_create(move |font, _, cx| {
+                let font = font.trim().to_string();
+                if !font.is_empty() {
+                    let _ = create.update(cx, |this, cx| this.set_pref(cx, |s| s.terminal_font = font));
+                }
+            });
+        self.term_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
+    }
+
     fn request_find_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.focus_find) {
             return;
@@ -1537,6 +1663,8 @@ impl Render for BrowserWindow {
         self.request_palette_focus(window, cx);
         self.request_history_focus(window, cx);
         self.request_find_focus(window, cx);
+        self.request_terminal_focus(window, cx);
+        self.build_font_picker(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
@@ -2283,6 +2411,7 @@ impl BrowserWindow {
         let ids = self.order.clone();
         // `order` spans every space; only this space's windows are on the stage.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let terminals = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
         let preview = self.drop_preview();
         let carried = self.carried().map(|(id, _)| id);
@@ -2315,6 +2444,13 @@ impl BrowserWindow {
             let find = if active.as_deref() == Some(id.as_str()) { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
             let (scale, alpha) = self.window_motion(&id);
             let frame = scaled(frame, scale);
+            if terminals.contains(&id) {
+                // Drawn by GPUI inside the shell: it hides pages behind it but needs no hole of its own.
+                self.engine.place_tab(&id, None);
+                let shell = LogicalRect { x: origin_x + f64::from(frame.x), y: origin_y + f64::from(frame.y), width: f64::from(frame.w), height: f64::from(frame.h) };
+                stack.push((String::new(), shell, LogicalRect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }));
+                continue;
+            }
             // A torn-off window's page fills it edge to edge: no title bar, no border.
             let (title_h, inset) = if self.tab_window { (0.0, 0.0) } else { (self.title_h(), PAGE_INSET) };
             let rect = LogicalRect {
@@ -2539,7 +2675,9 @@ impl BrowserWindow {
             self.with_model(|model| { let _ = model.activate_tab(id); });
             self.refresh_url(cx);
         }
+        // After placing: a page un-minimized just now is hidden until placed, and AppKit won't focus a hidden view.
         self.place_windows();
+        self.focus_active_content();
         cx.notify();
     }
 
@@ -2599,7 +2737,27 @@ impl BrowserWindow {
                 .when(active && self.find.progress() > 0.0, |column| {
                     column.child(div().h(px(FIND_H as f32 * self.find.progress())).flex_none().overflow_hidden().child(self.find_bar(cx)))
                 })
-                .child(div().flex_1().min_h(px(0.))),
+                .child(match is_terminal(&tab.url) {
+                    true => div()
+                        // The shell occludes the root's capture handler, so a click here must itself take keys back
+                        // from a page that had them, and make this the active tab (else ⌘W closes the other one).
+                        .capture_any_mouse_down({
+                            let id = tab.id.clone();
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                this.engine.focus_chrome();
+                                this.focus_window(&id, cx);
+                            })
+                        })
+                        .flex_1()
+                        .min_h(px(0.))
+                        .mx(px(PAGE_INSET as f32))
+                        .mb(px(PAGE_INSET as f32))
+                        .rounded_b(px(PAGE_RADIUS as f32))
+                        .overflow_hidden()
+                        .bg(paint.bg)
+                        .child(terminal::terminal_for(&tab.id, &tab.url, cx)),
+                    false => div().flex_1().min_h(px(0.)),
+                }),
         );
         if maximized {
             return Some(shell.child(body));
@@ -2893,6 +3051,13 @@ impl BrowserWindow {
             );
         }
         let id = tab.id.clone();
+        if is_terminal(&tab.url) {
+            return div().w_full().child(
+                pill.border_color(gpui::transparent_black())
+                    .text_color(if tab.active { paint.fg } else { paint.muted })
+                    .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(terminal::location(&tab.url))),
+            );
+        }
         let (label, color) = if tab.url.is_empty() || tab.url == "nxbrowser://home" {
             ("Search or enter an address".to_string(), paint.muted)
         } else {
@@ -2913,6 +3078,9 @@ impl BrowserWindow {
     }
 
     fn nav_controls(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
+        if self.model.lock().tabs.iter().any(|tab| tab.id == tab_id && is_terminal(&tab.url)) {
+            return h_stack();
+        }
         let back_id = tab_id.to_string();
         let forward_id = tab_id.to_string();
         h_stack()
@@ -4770,6 +4938,9 @@ fn keep_on_stage(frame: Frame, sw: f32, sh: f32) -> Frame {
 }
 
 fn site_glyph(url: &str) -> (String, String) {
+    if is_terminal(url) {
+        return (">_".into(), "terminal".into());
+    }
     let rest = url.split("://").nth(1).unwrap_or(url);
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest).trim_start_matches("www.");
     let host = if host.is_empty() { "new tab" } else { host };

@@ -42,6 +42,17 @@ pub struct Settings {
     pub detached_spaces: Vec<String>,
     /// Hidden spaces each holding one window torn off into an OS window of its own; never shown as spaces.
     pub detached_windows: Vec<String>,
+    /// Monospace font family for terminal tabs.
+    pub terminal_font: String,
+    pub terminal_font_size: f64,
+    /// Row height as a multiple of the font size.
+    pub terminal_line_height: f64,
+    /// "block", "beam" or "underline"; programs may still change it while they run.
+    pub terminal_cursor: String,
+    /// Program run in new terminals; empty means the login shell (`$SHELL`).
+    pub terminal_shell: String,
+    /// Lines of history kept per terminal.
+    pub terminal_scrollback: usize,
 }
 
 impl Default for Settings {
@@ -69,6 +80,12 @@ impl Default for Settings {
             site_zoom: BTreeMap::new(),
             detached_spaces: Vec::new(),
             detached_windows: Vec::new(),
+            terminal_font: "Menlo".into(),
+            terminal_font_size: 12.0,
+            terminal_line_height: 1.35,
+            terminal_cursor: "block".into(),
+            terminal_shell: String::new(),
+            terminal_scrollback: 10_000,
         }
     }
 }
@@ -108,6 +125,7 @@ mod tests {
         assert!(parsed.search_template().starts_with("https://www.google.com/"));
         assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
+        assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));
         let round: Settings = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(round, parsed);
     }

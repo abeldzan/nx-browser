@@ -21,8 +21,9 @@ const SCOPES: [(&str, &str, &str); 5] = [
     ("@spaces", "", "Spaces"),
 ];
 
-const ACTIONS: [(&str, &str, Shortcut); 18] = [
+const ACTIONS: [(&str, &str, Shortcut); 19] = [
     ("New tab", "⌘T", Shortcut::NewTab),
+    ("New terminal", "⌥⌘T", Shortcut::NewTerminal),
     ("Close tab", "⌘W", Shortcut::CloseTab),
     ("Reopen closed tab", "⇧⌘T", Shortcut::ReopenTab),
     ("Reload page", "⌘R", Shortcut::Reload),
@@ -134,7 +135,7 @@ impl BrowserWindow {
                 }
             }
         } else {
-            self.engine.focus_page();
+            self.focus_active_content();
         }
         cx.notify();
     }
@@ -375,7 +376,7 @@ impl BrowserWindow {
             }
         }
         if !keep_focus {
-            self.engine.focus_page();
+            self.focus_active_content();
         }
         self.refresh_url(cx);
         cx.notify();

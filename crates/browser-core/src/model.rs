@@ -366,6 +366,15 @@ impl Model {
         Ok(())
     }
 
+    /// Rewrites a tab's URL without a navigation or history entry (a terminal tab saving its folder).
+    pub fn set_tab_url(&mut self, id: &str, url: &str) -> anyhow::Result<()> {
+        self.storage.execute("UPDATE tabs SET url = ?1 WHERE id = ?2", params![url, id])?;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.url = url.to_string();
+        }
+        Ok(())
+    }
+
     pub fn switch_profile(&mut self, id: &str) -> anyhow::Result<()> {
         let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
             return Ok(());

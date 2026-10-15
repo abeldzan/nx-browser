@@ -66,13 +66,25 @@ define_class!(
 
         /// WebKit re-sends Cmd keys the page ignored down the responder chain, which ends in the system beep;
         /// the page-first ones are run by the key script instead, so stop them here.
+        /// Plain keys the page ignored (arrows on YouTube, which seeks without preventDefault) come back the
+        /// same way as the same NSEvent object; nothing past the page wants them, so drop them too.
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
+            thread_local! {
+                // Retained so a fresh event can't reuse the address and pass for a resend.
+                static LAST_KEY_DOWN: RefCell<Option<Retained<NSEvent>>> = const { RefCell::new(None) };
+            }
+            let resent = LAST_KEY_DOWN.with_borrow_mut(|last| {
+                let resent = last.as_deref().is_some_and(|last| std::ptr::eq(last, event));
+                *last = Some(objc2::Message::retain(event));
+                resent
+            });
             let flags = event.modifierFlags();
             let page_first = flags.contains(NSEventModifierFlags::Command)
                 && !flags.contains(NSEventModifierFlags::Control)
                 && event.charactersIgnoringModifiers().is_some_and(|chars| PAGE_FIRST_KEYS.contains(&ns_string(&chars).to_ascii_lowercase().as_str()));
-            if !page_first {
+            let ignored_plain_key = resent && !flags.contains(NSEventModifierFlags::Command);
+            if !page_first && !ignored_plain_key {
                 let _: () = unsafe { msg_send![super(self), keyDown: event] };
             }
         }
@@ -507,11 +519,9 @@ impl MacEngine {
         with_window(self.window_no, |state| state.click.take()).flatten()
     }
 
-    pub fn focus_page(&mut self) {
-        let Some(tab_id) = self.visible.clone() else {
-            return;
-        };
-        let Some(live) = self.tabs.get(&tab_id) else {
+    /// Makes the tab's page first responder, so keys and page shortcuts reach it without a click.
+    pub fn focus_page(&mut self, tab_id: &str) {
+        let Some(live) = self.tabs.get(tab_id) else {
             return;
         };
         if let Some(window) = live.view.window() {
@@ -1290,6 +1300,10 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
                 // A focused page gets these first; the key script reports them back if it ignores them.
                 if key == "i" && flags.contains(NSEventModifierFlags::Option) {
                     let _ = events.send(EngineEvent::Shortcut(Shortcut::Inspect));
+                    return std::ptr::null_mut();
+                }
+                if key == "t" && flags.contains(NSEventModifierFlags::Option) {
+                    let _ = events.send(EngineEvent::Shortcut(Shortcut::NewTerminal));
                     return std::ptr::null_mut();
                 }
                 let page_first = PAGE_FIRST_KEYS.contains(&key.as_str()) && page_has_focus(event_ref);
