@@ -107,6 +107,7 @@ pub enum Shortcut {
     NextTab,
     PrevTab,
     Print,
+    CommandPalette,
 }
 
 pub trait WebEngine {

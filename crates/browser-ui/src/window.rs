@@ -69,6 +69,10 @@ pub struct BrowserWindow {
     /// Right-click menu on a rail profile: (profile id, index, click position).
     pub(crate) downloads_open: bool,
     pub(crate) extensions_open: bool,
+    pub(crate) history_open: bool,
+    pub(crate) history_modal: bool,
+    pub(crate) history_query: Entity<InputState>,
+    pub(crate) focus_history: bool,
     /// Icon and color picked in the new-profile modal while it is open.
     pub(crate) new_profile: Option<(String, String)>,
     pub(crate) new_profile_input: Entity<InputState>,
@@ -82,11 +86,17 @@ pub struct BrowserWindow {
     /// A page was clicked while the address was being edited; end the edit on the next render.
     blur_address: bool,
     find_open: bool,
+    pub(crate) palette_open: bool,
+    pub(crate) palette_input: Entity<InputState>,
+    pub(crate) palette_index: usize,
+    /// The bang shown as a pill in the palette; the input then holds only the query.
+    pub(crate) palette_bang: Option<&'static (&'static str, &'static str, &'static str)>,
+    pub(crate) focus_palette: bool,
     panel: Option<SidebarPage>,
     chrome: HashMap<String, TabChrome>,
     gesture: Option<Gesture>,
     suppress_window_drag: bool,
-    stage_bounds: Option<gpui::Bounds<Pixels>>,
+    pub(crate) stage_bounds: Option<gpui::Bounds<Pixels>>,
     layout_stage: Option<(i32, i32)>,
     order: Vec<String>,
     subscriptions: Vec<Subscription>,
@@ -205,11 +215,13 @@ impl BrowserWindow {
         let (downloads_tx, downloads_rx) = mpsc::channel();
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let rename_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let history_query = cx.new(|cx| InputState::new_singleline(cx));
         let subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -232,6 +244,13 @@ impl BrowserWindow {
                     cx.notify();
                 }
                 _ => {}
+            }),
+            cx.subscribe(&palette_input, |this, _, event, cx| {
+                if let InputStateEvent::TextChanged = event {
+                    this.palette_index = 0;
+                    this.absorb_bang(cx);
+                    cx.notify();
+                }
             }),
             cx.subscribe(&find_input, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -284,6 +303,11 @@ impl BrowserWindow {
                 }
                 _ => {}
             }),
+            cx.subscribe(&history_query, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::TextChanged => cx.notify(),
+                _ => {}
+            }),
             cx.subscribe(&name_input, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::Submit => this.save_profile_name(cx),
@@ -315,6 +339,10 @@ impl BrowserWindow {
             rail_menu: None,
             downloads_open: false,
             extensions_open: false,
+            history_open: false,
+            history_modal: false,
+            history_query,
+            focus_history: false,
             new_profile: None,
             new_profile_input,
             download_progress: HashMap::new(),
@@ -323,6 +351,11 @@ impl BrowserWindow {
             address_editing: false,
             blur_address: false,
             find_open: false,
+            palette_open: false,
+            palette_input,
+            palette_index: 0,
+            palette_bang: None,
+            focus_palette: false,
             panel: None,
             chrome: HashMap::new(),
             gesture: None,
@@ -426,6 +459,7 @@ impl BrowserWindow {
                 self.blur_address = true;
                 cx.notify();
             }
+            self.close_palette(cx);
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
             if !already {
@@ -579,7 +613,7 @@ impl BrowserWindow {
         }
     }
 
-    fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
+    pub(crate) fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
         match shortcut {
             Shortcut::NewTab => match self.active_tab_id() {
                 Some(id) => self.new_tab_in(&id, None, cx),
@@ -624,6 +658,7 @@ impl BrowserWindow {
                     self.engine.print(&id);
                 }
             }
+            Shortcut::CommandPalette => self.open_palette(cx),
         }
         self.refresh_url(cx);
     }
@@ -1012,6 +1047,13 @@ impl BrowserWindow {
         self.engine.focus_page();
     }
 
+    pub(crate) fn open_history_url(&mut self, url: &str, cx: &mut Context<Self>) {
+        let url = url.to_string();
+        self.history_open = false;
+        self.history_modal = false;
+        self.commit_navigation(&url, cx);
+    }
+
     fn back(&mut self) {
         if let Some(id) = self.active_tab_id() {
             self.engine.back(&id);
@@ -1233,6 +1275,24 @@ impl BrowserWindow {
         cx.notify();
     }
 
+    fn request_palette_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_palette) {
+            return;
+        }
+        let palette = self.palette_input.clone();
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&palette.focus_handle(cx), cx));
+    }
+
+    fn request_history_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_history) {
+            return;
+        }
+        let query = self.history_query.clone();
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&query.focus_handle(cx), cx));
+    }
+
     fn request_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.blur_address) && !self.focus_address {
             self.end_address_edit(window, cx);
@@ -1329,6 +1389,8 @@ impl Render for BrowserWindow {
         self.space_chips.clear();
         self.apply_theme(window, cx);
         self.request_address_focus(window, cx);
+        self.request_palette_focus(window, cx);
+        self.request_history_focus(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
         let tabs = self.model.lock().expect("model").session_tabs().into_iter().cloned().collect::<Vec<_>>();
@@ -1337,7 +1399,6 @@ impl Render for BrowserWindow {
         let sessions = self.model.lock().expect("model").profile_sessions().into_iter().cloned().collect::<Vec<_>>();
         let active_session = self.model.lock().expect("model").active_session_id.clone();
         let all_tabs = self.model.lock().expect("model").tabs.clone();
-        let history = self.model.lock().expect("model").history().unwrap_or_default();
         let bookmarks = self.model.lock().expect("model").bookmarks().unwrap_or_default();
         let colors = paint(cx);
         if !cx.has_active_drag() {
@@ -1395,7 +1456,6 @@ impl Render for BrowserWindow {
                             &profiles,
                             &active_profile,
                             &sessions,
-                            &history,
                             &bookmarks,
                             cx,
                         ))
@@ -1411,11 +1471,14 @@ impl Render for BrowserWindow {
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
+            .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
             .when(self.downloads_open, |root| root.child(self.downloads_popover(cx)))
             .when(self.extensions_open, |root| root.child(self.extensions_popover(cx)))
+            .when(self.history_open, |root| root.child(self.history_popover(cx)))
+            .when(self.history_modal, |root| root.child(self.history_modal(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
 }
@@ -1883,6 +1946,7 @@ impl BrowserWindow {
                     chrome.maximized = false;
                 }
             }
+            let fitted = self.snap_frame(snap, &gesture.tab_id, sw, sh);
             if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
                 if snap == Snap::Maximize {
                     entry.maximized = true;
@@ -1892,7 +1956,7 @@ impl BrowserWindow {
                 } else {
                     entry.snap = Some(snap);
                     entry.restore = Some(gesture.start);
-                    entry.frame = Some(snap.frame(sw, sh));
+                    entry.frame = Some(fitted);
                 }
             }
         }
@@ -1903,7 +1967,7 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some();
+        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal;
         self.engine.set_modal(modal);
         let Some(stage) = self.stage_bounds else {
             return;
@@ -1925,7 +1989,7 @@ impl BrowserWindow {
             };
             if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == id) {
                 // The preview hides pages behind it but has no page of its own.
-                let frame = snap.frame(stage_w as f32, stage_h as f32);
+                let frame = self.snap_frame(*snap, &id, stage_w as f32, stage_h as f32);
                 let shell = LogicalRect {
                     x: origin_x + f64::from(frame.x),
                     y: origin_y + f64::from(frame.y),
@@ -2028,6 +2092,8 @@ impl BrowserWindow {
                 .iter()
                 .filter(|(other, entry)| current.contains(other) && self.group_id(other) != self.group_id(id) && entry.snap.is_some() && !entry.minimized && !entry.maximized)
                 .filter_map(|(other, entry)| Some((other.clone(), entry.frame?)))
+                // Only neighbours on a dragged border follow it; the rest stay magnetic.
+                .filter(|(_, frame)| shared_edges(start, edges, frame) != Edges { left: false, right: false, top: false, bottom: false })
                 .collect()
         } else {
             Vec::new()
@@ -2085,7 +2151,7 @@ impl BrowserWindow {
         stage = stage.on_drop(cx.listener(|this, drag: &TabDrag, window, cx| this.detach_tab(&drag.0.id, window.mouse_position(), cx)));
         for tab in ordered {
             if let Some((_, snap)) = preview.as_ref().filter(|(dragged, _)| *dragged == tab.id) {
-                stage = stage.child(self.snap_preview(*snap, cx));
+                stage = stage.child(self.snap_preview(*snap, &tab.id, cx));
             }
             if carried.as_deref() == Some(tab.id.as_str()) {
                 continue;
@@ -2099,12 +2165,25 @@ impl BrowserWindow {
         stage
     }
 
-    fn snap_preview(&self, snap: Snap, cx: &mut Context<Self>) -> gpui::Div {
+    /// Where `snap` puts window `id`, fitted beside this space's other snapped windows.
+    fn snap_frame(&self, snap: Snap, id: &str, sw: f32, sh: f32) -> Frame {
+        let current = self.model.lock().expect("model").session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let group = self.group_id(id);
+        let others = self
+            .chrome
+            .iter()
+            .filter(|(other, entry)| current.contains(other) && self.group_id(other) != group && self.is_front(other) && !entry.minimized && !entry.maximized)
+            .filter_map(|(_, entry)| Some((entry.snap?, entry.frame?)))
+            .collect::<Vec<_>>();
+        fit_snap(snap, sw, sh, &others)
+    }
+
+    fn snap_preview(&self, snap: Snap, id: &str, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let Some(stage) = self.stage_bounds else {
             return div();
         };
-        let frame = snap.frame(f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
+        let frame = self.snap_frame(snap, id, f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
         div()
             .absolute()
             .left(px(frame.x))
@@ -2649,7 +2728,16 @@ impl BrowserWindow {
                     .child(drag_area().flex_1())
                     .child(self.pinned_extensions(cx))
                     .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
-                    .child(self.panel_icon("history-toggle", Icons::file_text(), Some(SidebarPage::History), cx))
+                    .child(
+                        icon_button("history-toggle", Icons::file_text())
+                            .box_size(rems(1.625))
+                            .icon_size(rems(1.0))
+                            .selected(self.history_open || self.history_modal)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.history_open = true;
+                                cx.notify();
+                            })),
+                    )
                     .child(self.panel_icon("bookmarks-toggle", Icons::bookmark(), Some(SidebarPage::Bookmarks), cx))
                     .child(
                         icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
@@ -2796,7 +2884,7 @@ impl BrowserWindow {
 
     /// Opens a new tab inside the window holding `id`, sharing its frame. `None` opens the new-tab page
     /// with the address field focused.
-    fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
+    pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
         chrome.window = Some(group.clone());
@@ -3012,7 +3100,6 @@ impl BrowserWindow {
         profiles: &[browser_core::Profile],
         active_profile: &str,
         sessions: &[browser_core::Session],
-        history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -3033,15 +3120,7 @@ impl BrowserWindow {
                 scroll_area("library-panel")
                     .vertical()
                     .full_height(true)
-                    .child(self.library_page(
-                        page,
-                        profiles,
-                        active_profile,
-                        sessions,
-                        history,
-                        bookmarks,
-                        cx,
-                    )),
+                    .child(self.library_page(page, profiles, active_profile, sessions, bookmarks, cx)),
             )
     }
 
@@ -3080,13 +3159,11 @@ impl BrowserWindow {
         profiles: &[browser_core::Profile],
         active_profile: &str,
         sessions: &[browser_core::Session],
-        history: &[browser_core::HistoryEntry],
         bookmarks: &[browser_core::Bookmark],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         match page {
             SidebarPage::Profiles => self.profile_page(profiles, active_profile, sessions, cx),
-            SidebarPage::History => self.link_list("No history yet", history.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
             SidebarPage::Bookmarks => self.link_list("No bookmarks yet", bookmarks.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
         }
     }
@@ -3310,6 +3387,19 @@ enum Snap {
 }
 
 impl Snap {
+    /// (column, row): -1 left/top, 1 right/bottom, 0 spanning.
+    fn place(self) -> (i8, i8) {
+        match self {
+            Snap::Maximize => (0, 0),
+            Snap::Left => (-1, 0),
+            Snap::Right => (1, 0),
+            Snap::TopLeft => (-1, -1),
+            Snap::TopRight => (1, -1),
+            Snap::BottomLeft => (-1, 1),
+            Snap::BottomRight => (1, 1),
+        }
+    }
+
     /// Stage-local frame for this snap, laid out with the same inset as a maximized window.
     fn frame(self, sw: f32, sh: f32) -> Frame {
         let full_w = (sw - SNAP_INSET * 2.0).max(1.0);
@@ -3347,13 +3437,10 @@ const MIN_H: f32 = 120.0;
 /// Adjacency is judged on the frames as they were when the resize began; returns the dragged frame,
 /// held back so no neighbour shrinks below the minimum, and each neighbour's new frame if it follows.
 fn link_resize(start: Frame, frame: Frame, edges: Edges, partners: &[Frame]) -> (Frame, Vec<Option<Frame>>) {
-    let touches = |a: f32, b: f32| (b - a - SNAP_INSET).abs() <= 2.0;
-    let beside_y = |o: &Frame| o.y < start.y + start.h && start.y < o.y + o.h;
-    let beside_x = |o: &Frame| o.x < start.x + start.w && start.x < o.x + o.w;
-    let left = |o: &Frame| edges.left && beside_y(o) && touches(o.x + o.w, start.x);
-    let right = |o: &Frame| edges.right && beside_y(o) && touches(start.x + start.w, o.x);
-    let top = |o: &Frame| edges.top && beside_x(o) && touches(o.y + o.h, start.y);
-    let bottom = |o: &Frame| edges.bottom && beside_x(o) && touches(start.y + start.h, o.y);
+    let left = |o: &Frame| shared_edges(start, edges, o).left;
+    let right = |o: &Frame| shared_edges(start, edges, o).right;
+    let top = |o: &Frame| shared_edges(start, edges, o).top;
+    let bottom = |o: &Frame| shared_edges(start, edges, o).bottom;
     let mut frame = frame;
     for o in partners {
         if left(o) {
@@ -3395,6 +3482,54 @@ fn link_resize(start: Frame, frame: Frame, edges: Edges, partners: &[Frame]) -> 
         })
         .collect();
     (frame, followers)
+}
+
+/// Which of the dragged `edges` of `start` border `o` across one inset gap.
+fn shared_edges(start: Frame, edges: Edges, o: &Frame) -> Edges {
+    let touches = |a: f32, b: f32| (b - a - SNAP_INSET).abs() <= 2.0;
+    let beside_y = o.y < start.y + start.h && start.y < o.y + o.h;
+    let beside_x = o.x < start.x + start.w && start.x < o.x + o.w;
+    Edges {
+        left: edges.left && beside_y && touches(o.x + o.w, start.x),
+        right: edges.right && beside_y && touches(start.x + start.w, o.x),
+        top: edges.top && beside_x && touches(o.y + o.h, start.y),
+        bottom: edges.bottom && beside_x && touches(start.y + start.h, o.y),
+    }
+}
+
+/// The frame for `snap`, fitted to the space windows already snapped opposite leave free,
+/// so snapping beside a resized half fills the rest instead of overlapping it or leaving a gap.
+/// Falls back to the plain snap frame when that space would be smaller than a window may be.
+fn fit_snap(snap: Snap, sw: f32, sh: f32, others: &[(Snap, Frame)]) -> Frame {
+    let base = snap.frame(sw, sh);
+    let (column, row) = snap.place();
+    if column == 0 {
+        return base;
+    }
+    let (mut lead_x, mut trail_x, mut lead_y, mut trail_y) = (None::<f32>, None::<f32>, None::<f32>, None::<f32>);
+    for (other, o) in others {
+        let (o_column, o_row) = other.place();
+        let beside_y = o.y < base.y + base.h && base.y < o.y + o.h;
+        let beside_x = o.x < base.x + base.w && base.x < o.x + o.w;
+        if o_column == -column && beside_y {
+            if column > 0 {
+                lead_x = Some(lead_x.map_or(o.x + o.w + SNAP_INSET, |x| x.max(o.x + o.w + SNAP_INSET)));
+            } else {
+                trail_x = Some(trail_x.map_or(o.x - SNAP_INSET, |x| x.min(o.x - SNAP_INSET)));
+            }
+        }
+        if row != 0 && o_column == column && o_row == -row && beside_x {
+            if row > 0 {
+                lead_y = Some(lead_y.map_or(o.y + o.h + SNAP_INSET, |y| y.max(o.y + o.h + SNAP_INSET)));
+            } else {
+                trail_y = Some(trail_y.map_or(o.y - SNAP_INSET, |y| y.min(o.y - SNAP_INSET)));
+            }
+        }
+    }
+    let (x, y) = (lead_x.unwrap_or(base.x), lead_y.unwrap_or(base.y));
+    let (r, b) = (trail_x.unwrap_or(base.x + base.w), trail_y.unwrap_or(base.y + base.h));
+    let fitted = Frame { x, y, w: r - x, h: b - y };
+    if fitted.w < MIN_W || fitted.h < MIN_H { base } else { fitted }
 }
 
 /// Fits a snapped frame to a resized stage. Borders on the stage inset stay there; inner borders keep
@@ -3658,7 +3793,10 @@ const WINDOW_RADIUS: f64 = 10.0;
 /// Page URL and its icon URL, newline separated.
 const FAVICON_JS: &str = r#"(() => { const l = document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]'); return location.href + "\n" + (l ? l.href : location.origin + "/favicon.ico"); })()"#;
 const TITLE_H: f64 = 26.0;
-const PAGE_INSET: f64 = 6.0;
+/// Window border beside and below the page; PAGE_RADIUS in the macOS engine is WINDOW_RADIUS minus this.
+const PAGE_INSET: f64 = 1.0;
+/// Must match PAGE_RADIUS in the macOS engine, which rounds the page's bottom corners.
+const PAGE_RADIUS: f64 = WINDOW_RADIUS - PAGE_INSET;
 const FIND_H: f64 = 36.0;
 
 /// Visible parts of each page, as disjoint rects: a page is hidden wherever a window in front of it sits.
@@ -3671,7 +3809,8 @@ fn visible_pages(
 ) -> (Vec<(String, LogicalRect)>, Vec<((f64, f64), (f64, f64))>) {
     let mut holes = Vec::new();
     let mut notches = Vec::new();
-    for (index, (id, _, page)) in stack.iter().enumerate() {
+    for (index, (id, _, full)) in stack.iter().enumerate() {
+        let page = full;
         let x = page.x.max(stage.x);
         let y = page.y.max(stage.y);
         let width = (page.x + page.width).min(stage.x + stage.width) - x;
@@ -3700,6 +3839,15 @@ fn visible_pages(
                 if contains(&page, &square) && !covered {
                     notches.push((corner, center));
                 }
+            }
+        }
+        // The page's own bottom corners are rounded (PAGE_RADIUS in the engine), so the square hole
+        // would show nothing outside the curve; these wedges put the window border back there.
+        let (r, bottom) = (PAGE_RADIUS, full.y + full.height);
+        for (corner, center) in [((full.x, bottom), (full.x + r, bottom - r)), ((full.x + full.width, bottom), (full.x + full.width - r, bottom - r))] {
+            let square = LogicalRect { x: corner.0.min(center.0), y: center.1, width: r, height: r };
+            if contains(&page, &square) && !above.iter().any(|(_, shell, _)| overlaps(&square, shell)) {
+                notches.push((corner, center));
             }
         }
         let mut parts = vec![page];
@@ -3790,13 +3938,22 @@ fn site_glyph(url: &str) -> (String, String) {
     (glyph, host.to_string())
 }
 
+pub(crate) fn site_host(url: &str) -> String {
+    site_glyph(url).1
+}
+
 /// The site's icon once cached, otherwise a coloured initial.
 fn favicon(tab: &browser_core::Tab, round: bool) -> gpui::AnyElement {
-    let (glyph, host) = site_glyph(&tab.url);
-    let radius = if round { 8. } else { 4. };
+    site_icon(&tab.url, 16., round)
+}
+
+pub(crate) fn site_icon(url: &str, size: f32, round: bool) -> gpui::AnyElement {
+    let (glyph, host) = site_glyph(url);
+    let radius = if round { size / 2. } else { (size / 4.).max(4.) };
+    let path = favicon_path(&host);
     let tile = move || {
         div()
-            .size(px(16.))
+            .size(px(size))
             .flex_none()
             .rounded(px(radius))
             .flex()
@@ -3804,19 +3961,18 @@ fn favicon(tab: &browser_core::Tab, round: bool) -> gpui::AnyElement {
             .justify_center()
             .bg(site_color(&host))
             .text_color(gpui::rgb(0xFFFFFF))
-            .text_size(px(10.))
+            .text_size(px((size * 0.55).max(10.)))
             .child(glyph.clone())
             .into_any_element()
     };
-    let path = favicon_path(&site_glyph(&tab.url).1);
-    if is_web(&tab.url) && path.exists() {
-        img(path).size(px(16.)).flex_none().rounded(px(radius)).with_fallback(tile).into_any_element()
+    if is_web(url) && path.exists() {
+        img(path).size(px(size)).flex_none().rounded(px(radius)).with_fallback(tile).into_any_element()
     } else {
         tile()
     }
 }
 
-fn favicon_path(host: &str) -> std::path::PathBuf {
+pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {
     let name: String = host.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
     app_support_dir().join("favicons").join(format!("icon-{name}"))
 }
@@ -3898,7 +4054,19 @@ mod tests {
         let (holes, notches) = visible_pages(&stack, &r(0., 0., 1000., 1000.));
         assert_eq!(visible_pages(&stack, &r(20., 0., 1000., 50.)).0[0].1, r(20., 10., 40., 40.));
         // Front window's bottom-left corner sits on the back page; its top corners are above it.
-        assert_eq!(notches, vec![((60., 100.), (70., 90.))]);
+        // Each page's own rounded bottom corners get a wedge too, unless a front window covers them.
+        assert_eq!(notches, vec![
+            ((60., 100.), (70., 90.)),
+            ((0., 120.), (9., 111.)),
+            ((100., 120.), (91., 111.)),
+            ((60., 100.), (69., 91.)),
+            ((160., 100.), (151., 91.)),
+        ]);
+        let covered = vec![
+            ("back".to_string(), r(0., 0., 100., 120.), r(0., 10., 100., 110.)),
+            ("front".to_string(), r(-5., 100., 50., 40.), r(-5., 110., 50., 30.)),
+        ];
+        assert!(!visible_pages(&covered, &r(0., 0., 1000., 1000.)).1.contains(&((0., 120.), (9., 111.))));
         let back: Vec<_> = holes.iter().filter(|(id, _)| id == "back").map(|(_, rect)| rect.clone()).collect();
         assert_eq!(back, vec![r(0., 100., 100., 20.), r(0., 10., 60., 90.)]);
         assert!(holes.contains(&("front".to_string(), r(60., 10., 100., 90.))));
@@ -3995,6 +4163,34 @@ mod tests {
         let (_, followers) = link_resize(tl, Frame { h: tl.h + 50., ..tl }, Edges::bottom(), &[bl, r]);
         assert_eq!(followers[0].map(|f| (f.y, f.h)), Some((bl.y + 50., bl.h - 50.)));
         assert!(followers[1].is_none());
+    }
+
+    #[test]
+    fn snap_fills_space_beside_a_resized_neighbour() {
+        let mut left = Snap::Left.frame(1000., 700.);
+        left.w = 300.;
+        let right = fit_snap(Snap::Right, 1000., 700., &[(Snap::Left, left)]);
+        assert_eq!((right.x, right.x + right.w), (left.x + left.w + SNAP_INSET, 992.));
+        // A quarter under a shortened quarter in the same column takes the rest of the height.
+        let mut top = Snap::TopRight.frame(1000., 700.);
+        top.h = 200.;
+        let bottom = fit_snap(Snap::BottomRight, 1000., 700., &[(Snap::TopRight, top), (Snap::Left, left)]);
+        assert_eq!((bottom.x, bottom.y, bottom.y + bottom.h), (right.x, top.y + top.h + SNAP_INSET, 692.));
+        // No room left for a window: fall back to the plain half.
+        left.w = 900.;
+        assert_eq!(fit_snap(Snap::Right, 1000., 700., &[(Snap::Left, left)]).x, Snap::Right.frame(1000., 700.).x);
+        // Neighbours on the same side don't change it.
+        assert_eq!(fit_snap(Snap::Left, 1000., 700., &[(Snap::TopLeft, left)]).w, Snap::Left.frame(1000., 700.).w);
+    }
+
+    #[test]
+    fn only_bordering_snapped_windows_follow_a_resize() {
+        let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
+        assert!(shared_edges(l, Edges::right(), &r).right);
+        assert_eq!(shared_edges(l, Edges::left(), &r), Edges { left: false, right: false, top: false, bottom: false });
+        let mut narrow = l;
+        narrow.w = 300.;
+        assert!(!shared_edges(narrow, Edges::right(), &r).right);
     }
 
     #[test]

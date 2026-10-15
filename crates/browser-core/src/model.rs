@@ -491,7 +491,19 @@ impl Model {
 
     /// Reopens this session's most recently closed tab, returning its new id.
     pub fn reopen_closed(&mut self) -> anyhow::Result<Option<String>> {
-        let Some(index) = self.closed.iter().rposition(|(session, ..)| *session == self.active_session_id) else {
+        self.reopen_closed_url(None)
+    }
+
+    /// This session's recently closed tab URLs, newest first.
+    pub fn closed_urls(&self) -> Vec<String> {
+        self.closed.iter().rev().filter(|(session, ..)| *session == self.active_session_id).map(|(_, url, _)| url.clone()).collect()
+    }
+
+    /// Like `reopen_closed`, limited to the newest closed tab with `url` when given.
+    pub fn reopen_closed_url(&mut self, url: Option<&str>) -> anyhow::Result<Option<String>> {
+        let Some(index) = self.closed.iter().rposition(|(session, closed, _)| {
+            *session == self.active_session_id && url.is_none_or(|url| url == closed)
+        }) else {
             return Ok(None);
         };
         let (_, url, layout) = self.closed.remove(index);
@@ -539,6 +551,11 @@ impl Model {
     }
 
     pub fn note_navigation(&mut self, tab_id: &str, url: &str, title: &str) -> anyhow::Result<()> {
+        // WebKit reports a nil URL while a page is torn down (e.g. at quit) or after some failed loads;
+        // saving that would restore the tab blank.
+        if url.is_empty() {
+            return Ok(());
+        }
         // Title updates and in-page URL events re-report the current URL; they refresh the entry instead of adding one.
         let same_url = self.tabs.iter().any(|tab| tab.id == tab_id && tab.url == url);
         self.storage.execute(
@@ -671,19 +688,28 @@ impl Model {
     }
 
     pub fn history(&self) -> anyhow::Result<Vec<HistoryEntry>> {
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 ORDER BY visited_at DESC LIMIT 40",
-        )?;
-        let rows = stmt.query_map(params![self.active_profile_id], |row| {
-            Ok(HistoryEntry {
-                id: row.get(0)?,
-                profile_id: row.get(1)?,
-                url: row.get(2)?,
-                title: row.get(3)?,
-                visited_at: row.get(4)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.search_history("", 40)
+    }
+
+    /// Recent visits, or those whose title or URL contains `query`. Blank query skips the filter.
+    pub fn search_history(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
+        let query = query.trim();
+        let limit = limit as i64;
+        let rows = if query.is_empty() {
+            let mut stmt = self.storage.conn().prepare(
+                "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 ORDER BY visited_at DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![self.active_profile_id, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
+            rows
+        } else {
+            let pattern = like_pattern(query);
+            let mut stmt = self.storage.conn().prepare(
+                "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 AND (url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\') ORDER BY visited_at DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![self.active_profile_id, pattern, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        Ok(rows)
     }
 
     /// Address bar matches as (url, title): bookmarks first, then history by recency, one row per url.
@@ -692,7 +718,7 @@ impl Model {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let pattern = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let pattern = like_pattern(query);
         let mut stmt = self.storage.conn().prepare(
             "SELECT url, title, MIN(rank), MAX(at) FROM (
                 SELECT url, title, 0 AS rank, created_at AS at FROM bookmarks WHERE profile_id = ?1
@@ -1110,6 +1136,20 @@ impl Model {
     }
 }
 
+fn like_pattern(query: &str) -> String {
+    format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+fn read_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+    Ok(HistoryEntry {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        url: row.get(2)?,
+        title: row.get(3)?,
+        visited_at: row.get(4)?,
+    })
+}
+
 fn query_extensions(storage: &Storage, profile_id: &str) -> anyhow::Result<Vec<ExtensionRecord>> {
     let mut stmt = storage.conn().prepare(
         "SELECT e.id, e.path, l.enabled, e.manifest_json, e.source, l.pinned
@@ -1227,6 +1267,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_navigation_url_keeps_the_tab() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let id = model.active_tab().unwrap().id.clone();
+        model.note_navigation(&id, "https://www.google.com/search?q=x", "x - Google Search").unwrap();
+        model.note_navigation(&id, "", "").unwrap();
+        model.reload().unwrap();
+        let tab = model.active_tab().unwrap();
+        assert_eq!((tab.url.as_str(), tab.title.as_str()), ("https://www.google.com/search?q=x", "x - Google Search"));
+    }
+
+    #[test]
     fn closed_tab_reopens_with_its_layout() {
         let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
         let id = model.create_tab("https://example.com/").unwrap();
@@ -1264,6 +1315,20 @@ mod tests {
         let urls: Vec<String> = model.suggest("rust", 5).unwrap().into_iter().map(|(url, _)| url).collect();
         assert_eq!(urls, ["https://rust-lang.org/", "https://docs.rs/"]);
         assert!(model.suggest("100%", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_history_filters_title_and_url() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let tab = model.active_tab().unwrap().id.clone();
+        model.note_navigation(&tab, "https://example.com/docs", "Example Docs").unwrap();
+        model.note_navigation(&tab, "https://rust-lang.org/", "Rust").unwrap();
+        model.note_navigation(&tab, "https://docs.rs/percent", "Crate").unwrap();
+        let urls: Vec<String> = model.search_history("rust", 10).unwrap().into_iter().map(|entry| entry.url).collect();
+        assert_eq!(urls, ["https://rust-lang.org/"]);
+        assert_eq!(model.search_history("docs", 10).unwrap().len(), 2);
+        assert!(model.search_history("100%", 10).unwrap().is_empty());
+        assert_eq!(model.search_history("", 1).unwrap()[0].url, "https://docs.rs/percent");
     }
 
     #[test]

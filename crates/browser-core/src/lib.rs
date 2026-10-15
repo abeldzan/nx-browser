@@ -1,3 +1,4 @@
+mod calc;
 mod download;
 mod lifecycle;
 mod metrics;
@@ -14,7 +15,8 @@ pub use model::{
     Session, Tab,
 };
 pub use settings::{Settings, SEARCH_ENGINES};
-pub use url::normalize_url;
+pub use calc::calc;
+pub use url::{bang_home, find_bang, normalize_url, BANGS};
 
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()

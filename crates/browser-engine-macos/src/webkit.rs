@@ -17,7 +17,7 @@ use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Se
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
-use objc2_quartz_core::{kCAFillRuleEvenOdd, CAShapeLayer, CATransaction};
+use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
     NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSUUID,
@@ -836,6 +836,7 @@ impl WebEngine for MacEngine {
             }
             let detached = live.view.superview().is_none();
             if detached {
+                round_bottom_corners(&live.view);
                 self.insert_below_chrome(&live.view);
             }
             detached
@@ -1124,6 +1125,26 @@ fn unify_data_root(webkit: &std::path::Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(&canonical, &legacy)
 }
 
+/// The window's corner radius less the page inset in browser-ui, so the page's corners follow the window's.
+const PAGE_RADIUS: f64 = 9.0;
+
+/// Rounds a page's bottom corners; the top ones meet the title bar and stay square.
+fn round_bottom_corners(view: &NSView) {
+    view.setWantsLayer(true);
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    // In a flipped layer (WKWebView draws top-down) the bottom is max Y.
+    let bottom = if layer.contentsAreFlipped() {
+        CACornerMask::LayerMinXMaxYCorner | CACornerMask::LayerMaxXMaxYCorner
+    } else {
+        CACornerMask::LayerMinXMinYCorner | CACornerMask::LayerMaxXMinYCorner
+    };
+    layer.setCornerRadius(PAGE_RADIUS);
+    layer.setMaskedCorners(bottom);
+    layer.setMasksToBounds(true);
+}
+
 fn data_store(id: &str, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebsiteDataStore>> {
     let uuid = parse_uuid(id)?;
     Ok(unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) })
@@ -1297,6 +1318,7 @@ fn shortcut_for(key: &str, shift: bool) -> Option<Shortcut> {
         "]" => Some(Shortcut::Forward),
         "," => Some(Shortcut::Settings),
         "p" => Some(Shortcut::Print),
+        "k" => Some(Shortcut::CommandPalette),
         "=" | "+" => Some(Shortcut::ZoomIn),
         "-" => Some(Shortcut::ZoomOut),
         "0" => Some(Shortcut::ZoomReset),
@@ -1304,12 +1326,12 @@ fn shortcut_for(key: &str, shift: bool) -> Option<Shortcut> {
     }
 }
 
-const PAGE_FIRST_KEYS: [&str; 10] = ["d", "f", "r", "[", "]", "p", "=", "+", "-", "0"];
+const PAGE_FIRST_KEYS: [&str; 11] = ["d", "f", "r", "[", "]", "p", "=", "+", "-", "0", "k"];
 
 /// Runs in its own world; reports page-first shortcuts the page did not `preventDefault`.
 const KEY_FALLBACK_JS: &str = r#"addEventListener('keydown', (e) => {
   const key = (e.key || '').toLowerCase();
-  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']', 'p', '=', '+', '-', '0'].includes(key)) return;
+  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']', 'p', '=', '+', '-', '0', 'k'].includes(key)) return;
   setTimeout(() => { if (!e.defaultPrevented) webkit.messageHandlers.nxShortcut.postMessage(key); }, 0);
 }, true);"#;
 

@@ -1,5 +1,7 @@
 mod downloads;
 mod extensions;
+mod history;
+mod palette;
 mod profiles;
 mod settings;
 mod sidebar;
