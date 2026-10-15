@@ -83,14 +83,15 @@
     PermissionLevel: names,
   });
 
-  // Side panels open as their own window, via a tab at the panel page.
+  // Side panels open as their own window, via a tab at the panel page. Only for extensions without a
+  // popup (Kluff calls `sidePanel` unguarded): ones with a popup take `sidePanel` as a cue to move their
+  // UI into a panel we can't attach, and Phantom then clears its popup and reopens it by script.
+  const manifest = chrome.runtime && chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
+  const hasPopup = !!((manifest.action || manifest.browser_action || {}).default_popup);
   let panelBehavior = { openPanelOnActionClick: false };
   let panelOptions = {};
-  const panelPath = () => {
-    const manifest = chrome.runtime && chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
-    return panelOptions.path || (manifest.side_panel && manifest.side_panel.default_path) || "";
-  };
-  define(chrome, "sidePanel", {
+  const panelPath = () => panelOptions.path || (manifest.side_panel && manifest.side_panel.default_path) || "";
+  if (!hasPopup) define(chrome, "sidePanel", {
     setPanelBehavior: method((behavior) => {
       panelBehavior = { ...panelBehavior, ...behavior };
     }),

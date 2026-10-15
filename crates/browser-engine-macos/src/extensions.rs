@@ -327,11 +327,9 @@ impl Extensions {
         unsafe { self.context(id, store_id)?.webViewConfiguration() }
     }
 
-    /// A web page tab came to life, or a suspended one woke up; extension pages are not tabs to extensions.
+    /// A tab came to life, or a suspended one woke up. Extension pages in tabs are tabs too, as in
+    /// Chrome: Phantom's connect window only gets its request when its port's `sender.tab` is set.
     pub fn opened(&self, tab_id: &str, store_id: &str, url: &str, view: &WKWebView, mtm: MainThreadMarker) {
-        if url.starts_with(SCHEME) {
-            return;
-        }
         if let Some(tab) = self.tab(tab_id) {
             *tab.ivars().view.borrow_mut() = Some(view.retain());
             self.handle().changed(tab_id);
@@ -930,8 +928,8 @@ define_class!(
             let Some(shared) = self.ivars().shared.upgrade() else {
                 return;
             };
-            // Extension and built-in pages are not tabs to extensions, so no tab will ever answer.
-            if url.starts_with(SCHEME) || url.starts_with("nxbrowser://") {
+            // Built-in pages are not tabs to extensions, so no tab will ever answer.
+            if url.starts_with("nxbrowser://") {
                 reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
             } else {
                 shared.borrow_mut().pending_tabs.push((url.clone(), reply.copy()));
