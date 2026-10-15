@@ -4,7 +4,6 @@ mod profiles;
 mod settings;
 mod sidebar;
 mod tabs;
-mod toolbar;
 mod ui;
 mod window;
 

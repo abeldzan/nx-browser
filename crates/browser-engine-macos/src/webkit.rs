@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::ffi::{c_void, CStr};
+use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -586,7 +586,7 @@ impl MacEngine {
         let Some(content) = &self.content else {
             return;
         };
-        let size = unsafe { content.bounds() }.size;
+        let size = content.bounds().size;
         if self
             .placed_holes
             .as_ref()
@@ -594,10 +594,8 @@ impl MacEngine {
         {
             return;
         }
-        let Some(host) = (unsafe {
-            chrome.setWantsLayer(true);
-            chrome.layer()
-        }) else {
+        chrome.setWantsLayer(true);
+        let Some(host) = chrome.layer() else {
             return;
         };
         self.placed_holes = Some((holes.to_vec(), notches.to_vec(), size));
@@ -651,7 +649,7 @@ impl MacEngine {
                 CGMutablePath::close_subpath(Some(&path));
             }
             shape.setPath(Some(&path));
-            shape.setFillRule(unsafe { kCAFillRuleEvenOdd });
+            shape.setFillRule(kCAFillRuleEvenOdd);
             shape.setFrame(bounds);
             host.setMask(Some(&shape));
         }
@@ -675,11 +673,9 @@ impl MacEngine {
         let Some(content) = &self.content else {
             return;
         };
-        unsafe {
-            match &self.chrome {
-                Some(chrome) => content.addSubview_positioned_relativeTo(view, NSWindowOrderingMode::Below, Some(chrome)),
-                None => content.addSubview(view),
-            }
+        match &self.chrome {
+            Some(chrome) => content.addSubview_positioned_relativeTo(view, NSWindowOrderingMode::Below, Some(chrome)),
+            None => content.addSubview(view),
         }
     }
 }
@@ -771,7 +767,7 @@ impl WebEngine for MacEngine {
         if !held {
             self.navigate(tab_id, url)?;
         }
-        unsafe { self.tabs.get(tab_id).unwrap().view.setHidden(true) };
+        self.tabs.get(tab_id).unwrap().view.setHidden(true);
         Ok(())
     }
 
@@ -790,7 +786,7 @@ impl WebEngine for MacEngine {
         let mut inserted = false;
         for (id, live) in &self.tabs {
             let visible = Some(id.as_str()) == tab_id;
-            unsafe { live.view.setHidden(!visible) };
+            live.view.setHidden(!visible);
             if visible && unsafe { live.view.superview() }.is_none() {
                 self.insert_below_chrome(&live.view);
                 inserted = true;
@@ -808,14 +804,14 @@ impl WebEngine for MacEngine {
             return;
         };
         let Some(bounds) = bounds else {
-            unsafe { live.view.setHidden(true) };
+            live.view.setHidden(true);
             return;
         };
         let Some(content) = self.content.clone() else {
             return;
         };
         let live = self.tabs.get(tab_id).unwrap();
-        let height = unsafe { content.bounds() }.size.height;
+        let height = content.bounds().size.height;
         let frame = NSRect::new(
             NSPoint::new(bounds.x, height - bounds.y - bounds.height.max(1.0)),
             NSSize::new(bounds.width.max(1.0), bounds.height.max(1.0)),
@@ -946,7 +942,7 @@ impl WebEngine for MacEngine {
 
     fn frame(&self, tab_id: &str) -> Option<(f64, f64)> {
         let live = self.tabs.get(tab_id)?;
-        let size = unsafe { live.view.frame() }.size;
+        let size = live.view.frame().size;
         Some((size.width, size.height))
     }
 }
@@ -957,7 +953,7 @@ impl MacEngine {
             for key in OBSERVED_KEYS {
                 unsafe { NSObject::removeObserver_forKeyPath(&live.view, &live.delegate, &NSString::from_str(key)) };
             }
-            unsafe { live.view.removeFromSuperview() };
+            live.view.removeFromSuperview();
             self.stacked.clear();
         }
         if self.visible.as_deref() == Some(tab_id) {
@@ -989,14 +985,14 @@ impl MacEngine {
         let Some(live) = self.tabs.get(tab_id) else {
             return;
         };
-        let height = unsafe { content.bounds() }.size.height;
+        let height = content.bounds().size.height;
         let width = self.bounds.width.max(1.0);
         let view_height = self.bounds.height.max(1.0);
         let frame = NSRect::new(
             NSPoint::new(self.bounds.x, height - self.bounds.y - view_height),
             NSSize::new(width, view_height),
         );
-        unsafe { live.view.setFrame(frame) };
+        live.view.setFrame(frame);
     }
 }
 
@@ -1132,12 +1128,11 @@ fn install_shortcuts(events: Sender<EngineEvent>) -> Option<Retained<AnyObject>>
         let event_ref = unsafe { event.as_ref() };
         let flags = event_ref.modifierFlags();
         let shift = flags.contains(NSEventModifierFlags::Shift);
-        if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command) {
-            if event_ref.charactersIgnoringModifiers().is_some_and(|chars| ns_string(&chars) == "\t") {
+        if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command)
+            && event_ref.charactersIgnoringModifiers().is_some_and(|chars| ns_string(&chars) == "\t") {
                 let _ = events.send(EngineEvent::Shortcut(if shift { Shortcut::PrevTab } else { Shortcut::NextTab }));
                 return std::ptr::null_mut();
             }
-        }
         if flags.contains(NSEventModifierFlags::Command) && !flags.contains(NSEventModifierFlags::Control) {
             if let Some(chars) = event_ref.charactersIgnoringModifiers() {
                 let key = ns_string(&chars).to_ascii_lowercase();
@@ -1188,7 +1183,7 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
         let Some(content) = window.contentView() else {
             return event.as_ptr();
         };
-        let point = unsafe { content.convertPoint_fromView(event_ref.locationInWindow(), None) };
+        let point = content.convertPoint_fromView(event_ref.locationInWindow(), None);
         if MODAL.load(Ordering::Relaxed) {
             return event.as_ptr();
         }
@@ -1213,7 +1208,7 @@ fn track_mouse_moves(chrome: &NSView, mtm: MainThreadMarker) {
     let area = unsafe {
         NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(chrome), None)
     };
-    unsafe { chrome.addTrackingArea(&area) };
+    chrome.addTrackingArea(&area);
 }
 
 static CHROME_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
@@ -1222,7 +1217,7 @@ fn install_hit_proxy(chrome: &NSView) {
     static PROXY: OnceLock<&'static AnyClass> = OnceLock::new();
     let class = PROXY.get_or_init(|| {
         let original = *CHROME_CLASS.get_or_init(|| chrome.class());
-        let name = CStr::from_bytes_with_nul(b"NxPageHitProxy\0").unwrap();
+        let name = c"NxPageHitProxy";
         let mut builder = ClassBuilder::new(name, original).expect("NxPageHitProxy");
         unsafe {
             builder.add_method(sel!(hitTest:), hit_test as extern "C-unwind" fn(_, _, _) -> _);

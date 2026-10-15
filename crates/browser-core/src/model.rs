@@ -319,6 +319,7 @@ impl Model {
         for tab_id in tab_ids {
             self.effects.push(Effect::CloseTab { tab_id });
         }
+        let tx = self.storage.conn().unchecked_transaction()?;
         self.storage.execute("DELETE FROM tabs WHERE session_id IN (SELECT id FROM sessions WHERE profile_id = ?1)", params![id])?;
         self.storage.execute("DELETE FROM sessions WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
@@ -326,6 +327,7 @@ impl Model {
         self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", params![id])?;
+        tx.commit()?;
         self.reload()?;
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
@@ -411,8 +413,10 @@ impl Model {
         for tab in self.tabs.iter().filter(|tab| tab.session_id == session_id) {
             self.effects.push(Effect::CloseTab { tab_id: tab.id.clone() });
         }
+        let tx = self.storage.conn().unchecked_transaction()?;
         self.storage.execute("DELETE FROM tabs WHERE session_id = ?1", params![session_id])?;
         self.storage.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        tx.commit()?;
         if self.active_session_id == session_id {
             let index = siblings.iter().position(|id| id == session_id).unwrap_or(0);
             let next = siblings.iter().filter(|id| *id != session_id).nth(index.saturating_sub(1)).cloned().unwrap_or_default();
@@ -561,14 +565,24 @@ impl Model {
                 }
             }
         }
-        self.reload()?;
+        self.set_tab_text(tab_id, Some(url), title);
         Ok(())
+    }
+
+    /// Mirrors a tabs-row url/title write into memory; a full `reload` per title tick is wasted work.
+    fn set_tab_text(&mut self, tab_id: &str, url: Option<&str>, title: &str) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if let Some(url) = url {
+                tab.url = url.to_string();
+            }
+            tab.title = title.to_string();
+        }
     }
 
     pub fn set_loading_title(&mut self, tab_id: &str, title: &str) -> anyhow::Result<()> {
         if !title.is_empty() {
             self.storage.execute("UPDATE tabs SET title = ?1 WHERE id = ?2", params![title, tab_id])?;
-            self.reload()?;
+            self.set_tab_text(tab_id, None, title);
         }
         Ok(())
     }
@@ -895,6 +909,8 @@ impl Model {
 
     pub fn import_bundle(&mut self, bundle: ProfileBundle) -> anyhow::Result<String> {
         let id = self.create_profile(&bundle.profile.name)?;
+        // One transaction: a bundle can carry thousands of history rows.
+        let tx = self.storage.conn().unchecked_transaction()?;
         self.storage.execute(
             "UPDATE profiles SET data_store_id = ?1, icon = ?2, color = ?3 WHERE id = ?4",
             params![bundle.profile.data_store_id, bundle.profile.icon, bundle.profile.color, id],
@@ -929,6 +945,7 @@ impl Model {
         for permission in bundle.permissions {
             self.set_permission(&permission.origin, &permission.permission, &permission.decision)?;
         }
+        tx.commit()?;
         self.reload()?;
         self.queue_show_active();
         Ok(id)
@@ -1166,10 +1183,6 @@ fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-pub fn profile_dir(root: &Path, id: &str) -> PathBuf {
-    root.join("profiles").join(id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,6 +1236,19 @@ mod tests {
         let tab = model.tabs.iter().find(|tab| tab.id == again).unwrap();
         assert_eq!((tab.url.as_str(), tab.layout.as_str()), ("https://example.com/", "{\"x\":1}"));
         assert!(model.reopen_closed().unwrap().is_none());
+    }
+
+    #[test]
+    fn navigation_updates_memory_like_a_reload() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let tab = model.active_tab().unwrap().id.clone();
+        model.set_loading_title(&tab, "Loading").unwrap();
+        model.note_navigation(&tab, "https://example.com/", "Example").unwrap();
+        model.note_navigation(&tab, "https://example.com/", "Example 2").unwrap();
+        let live = model.active_tab().map(|tab| (tab.url.clone(), tab.title.clone()));
+        model.reload().unwrap();
+        assert_eq!(live, model.active_tab().map(|tab| (tab.url.clone(), tab.title.clone())));
+        assert_eq!(model.history().unwrap().len(), 1, "same url refreshes the entry");
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub struct BrowserWindow {
     metrics: SharedString,
     self_test: Option<SelfTest>,
     cookies_saved: Instant,
+    ticks: u32,
     /// Window dock under the title bar.
     dock: Tween,
     /// Pointer over the dock; it stays shut while a window drag is in progress.
@@ -351,6 +352,7 @@ impl BrowserWindow {
                 started: Instant::now(),
             }),
             cookies_saved: Instant::now(),
+            ticks: 0,
             dock: Tween::new(false),
             dock_hovered: false,
             lift: Tween::new(false),
@@ -402,9 +404,10 @@ impl BrowserWindow {
     }
 
     fn tick(&mut self, cx: &mut Context<Self>) {
-        self.drain(cx);
+        let mut changed = self.drain(cx);
         self.warm_tabs();
         while let Ok((id, result)) = self.installs_rx.try_recv() {
+            changed = true;
             self.installing.retain(|pending| pending != &id);
             match result {
                 Ok(path) => self.add_extension(&id, &path, "store"),
@@ -417,6 +420,7 @@ impl BrowserWindow {
             self.ext_active = active;
         }
         if let Some(id) = self.engine.take_page_click() {
+            changed = true;
             // Page clicks never reach GPUI, so the address input would stay focused and expanded.
             if self.address_editing || self.address_focused {
                 self.blur_address = true;
@@ -429,6 +433,7 @@ impl BrowserWindow {
             }
         }
         if self.started.elapsed() > Duration::from_secs(2) && self.metrics == "Measuring…" {
+            changed = true;
             let sample = snapshot(self.started);
             self.metrics = format!(
                 "startup {} ms · app {:.1} MB · WebKit {:.1} MB · cpu {:.2}s",
@@ -444,7 +449,11 @@ impl BrowserWindow {
             self.save_cookies();
         }
         self.run_self_test();
-        cx.notify();
+        self.ticks = self.ticks.wrapping_add(1);
+        // shortcut: extension badges/errors are polled in render with no change event, so idle windows still repaint once a second.
+        if changed || self.self_test.is_some() || self.ticks.is_multiple_of(4) {
+            cx.notify();
+        }
     }
 
     fn save_cookies(&mut self) {
@@ -452,10 +461,13 @@ impl BrowserWindow {
         self.engine.save_session_cookies();
     }
 
-    fn drain(&mut self, cx: &mut Context<Self>) {
+    /// Applies queued model effects, download updates and engine events; true if any arrived.
+    fn drain(&mut self, cx: &mut Context<Self>) -> bool {
         let effects = self.model.lock().expect("model").take_effects();
+        let mut changed = !effects.is_empty();
         self.apply(effects);
         while let Ok(update) = self.downloads_rx.try_recv() {
+            changed = true;
             self.download_progress.insert(update.id.clone(), (update.received, update.total));
             if update.status != "running" {
                 let _ = self.model.lock().expect("model").update_download(&update.id, &update.status, &update.path);
@@ -466,10 +478,14 @@ impl BrowserWindow {
         while let Ok(event) = self.engine.events().try_recv() {
             events.push(event);
         }
+        changed |= !events.is_empty();
         for event in events {
             self.on_event(event, cx);
         }
         let suspend = self.model.lock().expect("model").tabs_due_for_suspension();
+        if suspend.is_empty() {
+            return changed;
+        }
         let tabs = self.model.lock().expect("model").session_tabs().into_iter().cloned().collect::<Vec<_>>();
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         for tab_id in suspend {
@@ -485,6 +501,7 @@ impl BrowserWindow {
         }
         let effects = self.model.lock().expect("model").take_effects();
         self.apply(effects);
+        true
     }
 
     fn on_event(&mut self, event: EngineEvent, cx: &mut Context<Self>) {
@@ -1089,22 +1106,6 @@ impl BrowserWindow {
         }
     }
 
-    fn sync_tab_bounds(&mut self, tab_id: &str, bounds: gpui::Bounds<Pixels>, window: &mut Window) {
-        self.attach(window);
-        if self.self_test.is_some() {
-            return;
-        }
-        self.engine.place_tab(
-            tab_id,
-            Some(LogicalRect {
-                x: f64::from(bounds.origin.x),
-                y: f64::from(bounds.origin.y),
-                width: f64::from(bounds.size.width),
-                height: f64::from(bounds.size.height),
-            }),
-        );
-    }
-
     fn run_self_test(&mut self) {
         if self.self_test.is_none() || !self.attached {
             return;
@@ -1624,7 +1625,7 @@ impl BrowserWindow {
         }
         let count = tabs.len().max(1);
         let cols = if count == 1 { 1 } else { 2 };
-        let rows = (count + cols - 1) / cols;
+        let rows = count.div_ceil(cols);
         let gap = 10.0;
         let pad = 10.0;
         let cell_w = (sw - pad * 2.0 - gap * (cols as f32 - 1.0)) / cols as f32;
@@ -3738,19 +3739,6 @@ fn keep_on_stage(frame: Frame, sw: f32, sh: f32) -> Frame {
         y: frame.y.clamp(visible - frame.h, (sh - visible).max(visible - frame.h)),
         w: frame.w,
         h: frame.h,
-    }
-}
-
-fn clamp_frame(frame: Frame, sw: f32, sh: f32) -> Frame {
-    let min_w = 160.0_f32.min(sw.max(1.0));
-    let min_h = 96.0_f32.min(sh.max(1.0));
-    let w = frame.w.clamp(min_w, sw.max(min_w));
-    let h = frame.h.clamp(min_h, sh.max(min_h));
-    Frame {
-        x: frame.x.clamp(0.0, (sw - w).max(0.0)),
-        y: frame.y.clamp(0.0, (sh - h).max(0.0)),
-        w,
-        h,
     }
 }
 

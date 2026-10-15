@@ -1,5 +1,5 @@
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct MetricsSnapshot {
@@ -68,13 +68,6 @@ fn webkit_rss_bytes() -> u64 {
         .filter_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
         .sum::<u64>()
         * 1024
-}
-
-pub fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -221,7 +221,7 @@ impl Extensions {
     /// Deletes what the extension kept in this profile: its `chrome.storage`, its pages' site data
     /// (IndexedDB, localStorage, caches) and the permissions the user granted it when asked.
     pub fn remove_data(&self, id: &str, store_id: &str) {
-        unsafe { NSUserDefaults::standardUserDefaults().removeObjectForKey(&grants_key(store_id, id)) };
+        NSUserDefaults::standardUserDefaults().removeObjectForKey(&grants_key(store_id, id));
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -270,7 +270,7 @@ impl Extensions {
             return;
         };
         self.0.borrow_mut().anchor = anchor;
-        let tab = tab_id.and_then(|tab_id| self.tab(tab_id)).map(|tab| ProtocolObject::from_retained(tab));
+        let tab = tab_id.and_then(|tab_id| self.tab(tab_id)).map(ProtocolObject::from_retained);
         unsafe { context.performActionForTab(tab.as_deref()) };
         // WebKit loads the popup but may never call `presentPopupForAction` (Bitwarden's never comes), so show it now.
         if let Some(action) = unsafe { context.actionForTab(tab.as_deref()) }.filter(|action| unsafe { action.presentsPopup() }) {
@@ -451,7 +451,7 @@ impl TabNotifier {
 
 thread_local! {
     /// The engine's extension state, for AppKit key hooks that have no engine reference.
-    static CURRENT: RefCell<Weak<RefCell<State>>> = RefCell::new(Weak::new());
+    static CURRENT: RefCell<Weak<RefCell<State>>> = const { RefCell::new(Weak::new()) };
 }
 
 /// Runs the extension keyboard shortcut (manifest `commands`) for this key event, if there is one.

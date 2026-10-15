@@ -12,6 +12,8 @@ impl Storage {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // WAL + NORMAL: writes run on the UI thread, so skip the per-commit fsync of the rollback journal.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         let storage = Self { conn };
         storage.migrate()?;
         Ok(storage)
@@ -105,6 +107,10 @@ impl Storage {
                 profile_id TEXT NOT NULL,
                 session_id TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS history_profile_url ON history (profile_id, url);
+            CREATE INDEX IF NOT EXISTS history_profile_visited ON history (profile_id, visited_at);
+            CREATE INDEX IF NOT EXISTS tabs_session ON tabs (session_id);
+            CREATE INDEX IF NOT EXISTS bookmarks_profile ON bookmarks (profile_id);
             ",
         )?;
         // Columns added after the first release; older databases get them here.
@@ -162,7 +168,7 @@ impl Storage {
     }
 
     pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<usize> {
-        Ok(self.conn.execute(sql, params).context("sqlite execute")?)
+        self.conn.prepare_cached(sql)?.execute(params).context("sqlite execute")
     }
 }
 
@@ -190,5 +196,17 @@ mod tests {
         assert_eq!((icon.as_str(), color.as_str()), ("", ""));
         let layout: String = storage.conn().query_row("SELECT layout FROM tabs WHERE id = 't'", [], |row| row.get(0)).unwrap();
         assert_eq!(layout, "");
+    }
+
+    #[test]
+    fn file_database_uses_wal() {
+        let path = std::env::temp_dir().join(format!("nx-wal-{}.db", std::process::id()));
+        let storage = Storage::open(&path).unwrap();
+        let mode: String = storage.conn().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        drop(storage);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 }

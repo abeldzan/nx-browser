@@ -27,3 +27,8 @@ gpuikit = "0.9"
 # Synced Metal presents so embedded WKWebViews move in the same frame as the GPUI chrome.
 [patch.crates-io]
 gpui-apple-gpui-unofficial = { path = "vendor/gpui-apple" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

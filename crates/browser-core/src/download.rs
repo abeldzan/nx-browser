@@ -95,7 +95,9 @@ pub fn spawn_favicon(url: String, dest: PathBuf) {
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
+        // Only spawn_blocking is used; one async worker is enough.
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("tokio runtime")
