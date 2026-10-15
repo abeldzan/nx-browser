@@ -286,6 +286,21 @@ impl Model {
         Ok(())
     }
 
+    /// Moves a tab to `index` in its space's tab order.
+    pub fn move_tab(&mut self, id: &str, index: usize) -> anyhow::Result<()> {
+        let mut ids: Vec<String> = self.session_tabs().iter().map(|tab| tab.id.clone()).collect();
+        let Some(from) = ids.iter().position(|existing| existing == id) else {
+            return Ok(());
+        };
+        let moved = ids.remove(from);
+        ids.insert(index.min(ids.len()), moved);
+        for (position, id) in ids.iter().enumerate() {
+            self.storage.execute("UPDATE tabs SET position = ?1 WHERE id = ?2", params![position as i32, id])?;
+        }
+        self.reload()?;
+        Ok(())
+    }
+
     /// Clears the active profile's history and/or download list.
     pub fn clear_data(&self, history: bool, downloads: bool) -> anyhow::Result<()> {
         if history {
@@ -1264,6 +1279,17 @@ mod tests {
         let left = model.tabs.iter().filter(|tab| tab.session_id == from).collect::<Vec<_>>();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].url, "nxbrowser://home");
+    }
+
+    #[test]
+    fn moved_tab_takes_the_target_place() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.create_tab("https://a.com/").unwrap();
+        model.create_tab("https://b.com/").unwrap();
+        let ids = model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        model.move_tab(&ids[0], 2).unwrap();
+        let order = model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        assert_eq!(order, vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]);
     }
 
     #[test]

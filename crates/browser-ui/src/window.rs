@@ -30,7 +30,9 @@ use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, T
 use gpuikit::traits::control_sized::ControlSized;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,6 +127,16 @@ pub struct BrowserWindow {
     landing: Option<(String, Frame, Instant)>,
     /// Tab pill being dragged and the pointer; drawn here so pages can be cut out beneath it.
     tab_drag: Option<(browser_core::Tab, gpui::Point<Pixels>)>,
+    /// Where tab pills and rail badges were laid out last frame, before any slide offset.
+    slots: HashMap<String, gpui::Bounds<Pixels>>,
+    /// Items sliding into place after a reorder: the offset they start from, and when.
+    slides: HashMap<String, (gpui::Point<Pixels>, Instant)>,
+    /// Where the dragged rail badge was grabbed, so its drop starts from where its preview was drawn.
+    rail_grab: Rc<Cell<gpui::Point<Pixels>>>,
+    /// Where the dragged tab pill was grabbed, so it stays under the pointer at that spot.
+    tab_grab: Rc<Cell<gpui::Point<Pixels>>>,
+    /// A tab or profile being dragged and its row in the order shown while dragging; it is dropped into that order.
+    reorder: Option<(String, Vec<String>)>,
     find: Tween,
     panel_tween: Tween,
     /// Sidebar page still drawn while its panel slides shut.
@@ -392,6 +404,11 @@ impl BrowserWindow {
             space_chips: Vec::new(),
             landing: None,
             tab_drag: None,
+            slots: HashMap::new(),
+            slides: HashMap::new(),
+            rail_grab: Rc::default(),
+            tab_grab: Rc::default(),
+            reorder: None,
             find: Tween::new(false),
             panel_tween: Tween::new(false),
             shown_panel: None,
@@ -1403,6 +1420,7 @@ impl Render for BrowserWindow {
         let colors = paint(cx);
         if !cx.has_active_drag() {
             self.tab_drag = None;
+            self.reorder = None;
         }
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
         let live_ids = self.model.lock().expect("model").tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
@@ -1466,7 +1484,18 @@ impl Render for BrowserWindow {
             .children(self.carried_view(&tabs, cx))
             .children(self.tab_drag_view(cx))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                let id = event.drag(cx).0.id.clone();
                 this.tab_drag = Some((event.drag(cx).0.clone(), event.event.position));
+                let group = this.group_id(&id);
+                let row = this.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+                let row = row.into_iter().filter(|other| this.group_id(other) == group).collect();
+                this.preview_reorder(&id, row, event.event.position - this.tab_grab.get(), false, 2.0);
+                cx.notify();
+            }))
+            .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<RailDrag>, _, cx| {
+                let id = event.drag(cx).0.id.clone();
+                let row = this.model.lock().expect("model").profiles.iter().map(|profile| profile.id.clone()).collect();
+                this.preview_reorder(&id, row, event.event.position - this.rail_grab.get(), true, 6.0);
                 cx.notify();
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
@@ -1516,6 +1545,7 @@ impl BrowserWindow {
             None => {}
         }
         self.opened.retain(|_, at| at.elapsed() < WINDOW_ANIM);
+        self.slides.retain(|_, (_, at)| at.elapsed() < SLIDE_ANIM);
         if self.landing.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= LAND_ANIM) {
             self.landing = None;
         }
@@ -1613,11 +1643,18 @@ impl BrowserWindow {
     ) -> gpui::Div {
         let paint = paint(cx);
         let mut profile_list = v_stack().w_full().items_center().gap(px(6.)).py(px(4.));
-        for (index, profile) in profiles.iter().enumerate() {
+        for profile in self.previewed(profiles.iter().collect(), |profile| &profile.id) {
+            let index = profiles.iter().position(|other| other.id == profile.id).unwrap_or(0);
             let id = profile.id.clone();
             let active = profile.id == active_profile;
             let dragged = RailDrag(profile.clone());
+            let (grab, offset) = (self.rail_grab.clone(), self.slide_offset(&id));
             let badge = profile_badge(profile, active, 32., paint)
+                .relative()
+                .left(offset.x)
+                .top(offset.y)
+                .when(self.picked(&id, cx), |badge| badge.opacity(0.))
+                .child(self.measure_slot(&id, cx))
                 .id(SharedString::from(format!("rail-{id}")))
                 .cursor_pointer()
                 .on_click(cx.listener({
@@ -1628,12 +1665,11 @@ impl BrowserWindow {
                         this.confirm_delete = false;
                     }
                 }))
-                .on_drag(dragged, move |drag, _, _, cx| cx.new(|_| RailDragPreview(drag.0.clone(), paint)))
-                .drag_over::<RailDrag>(move |style, _, _, _| style.border_color(paint.accent))
-                .on_drop(cx.listener(move |this, drag: &RailDrag, _, cx| {
-                    this.with_model(|model| { let _ = model.move_profile(&drag.0.id, index); });
-                    cx.notify();
-                }));
+                .on_drag(dragged, move |drag, at, _, cx| {
+                    grab.set(at);
+                    cx.new(|_| RailDragPreview(drag.0.clone(), paint))
+                })
+                .on_drop(cx.listener(|this, drag: &RailDrag, window, cx| this.drop_profile(&drag.0.id, window.mouse_position(), cx)));
             let badge = badge.on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -1652,6 +1688,7 @@ impl BrowserWindow {
             .bg(paint.surface)
             .border_r_1()
             .border_color(paint.border)
+            .on_drop(cx.listener(|this, drag: &RailDrag, window, cx| this.drop_profile(&drag.0.id, window.mouse_position(), cx)))
             .child(
                 div().flex_1().w_full().overflow_hidden().child(
                     scroll_area("rail-profiles").vertical().full_height(true).child(profile_list),
@@ -2262,6 +2299,7 @@ impl BrowserWindow {
             shell.left(px(GRIP_OUT)).top(px(GRIP_OUT)).right(px(GRIP_OUT)).bottom(px(GRIP_OUT))
         };
         let target = tab.id.clone();
+        let own = members.iter().map(|member| member.id.clone()).collect::<Vec<_>>();
         let mut body = div().relative().size_full().child(
             v_stack()
                 .id(SharedString::from(format!("window-{}", tab.id)))
@@ -2269,8 +2307,10 @@ impl BrowserWindow {
                 .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
                 .border_color(if active { paint.accent } else { paint.border })
-                .drag_over::<TabDrag>(move |style, _, _, _| style.border_color(paint.accent).bg(paint.accent.opacity(0.12)))
-                .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_tab_to_window(&drag.0.id, &target, cx)))
+                .drag_over::<TabDrag>(move |style, drag, _, _| {
+                    if own.contains(&drag.0.id) { style } else { style.border_color(paint.accent).bg(paint.accent.opacity(0.12)) }
+                })
+                .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| this.drop_tab_on(&drag.0.id, &target, window.mouse_position(), cx)))
                 .shadow_md()
                 .bg(paint.secondary)
                 .overflow_hidden()
@@ -2383,12 +2423,15 @@ impl BrowserWindow {
     fn compact_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let mut row = h_stack().min_w(px(0.)).h_full().items_center().gap(px(2.)).text_size(px(12.));
-        for tab in members {
+        for tab in self.previewed(members.to_vec(), |tab| &tab.id) {
             let shown = tab.id == front;
             if shown && tab.active && (self.address_editing || self.address_focused) {
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("ctab-{}", tab.id)))
+                        .relative()
+                        .left(self.slide_offset(&tab.id).x)
+                        .child(self.measure_slot(&tab.id, cx))
                         .w(px(520.))
                         .min_w(px(120.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.suppress_window_drag = true))
@@ -2398,12 +2441,15 @@ impl BrowserWindow {
             }
             let id = tab.id.clone();
             let close_id = tab.id.clone();
+            let offset = self.slide_offset(&tab.id);
             let hover_group = SharedString::from(format!("ctab-{id}"));
             row = row.child(
                 h_stack()
                     .id(SharedString::from(format!("ctab-{id}")))
                     .group(hover_group.clone())
                     .relative()
+                    .left(offset.x)
+                    .top(offset.y)
                     // Shrinks to just the icon when the window is narrow.
                     .min_w(px(28.))
                     .max_w(px(160.))
@@ -2417,7 +2463,15 @@ impl BrowserWindow {
                     .when(shown, |pill| pill.bg(paint.secondary).text_color(paint.fg))
                     .when(!shown, |pill| pill.text_color(paint.muted).hover(|style| style.bg(paint.secondary.opacity(0.6)).text_color(paint.fg)))
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, _| this.suppress_window_drag = true))
-                    .on_drag(TabDrag((*tab).clone()), |_, _, _, cx| cx.new(|_| TabDragPreview))
+                    .on_drag(TabDrag((*tab).clone()), {
+                        let grab = self.tab_grab.clone();
+                        move |_, at, _, cx| {
+                            grab.set(at);
+                            cx.new(|_| TabDragPreview)
+                        }
+                    })
+                    .when(self.picked(&tab.id, cx), |pill| pill.opacity(0.))
+                    .child(self.measure_slot(&tab.id, cx))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         // Safari compact: a click selects a tab, a click on the selected one edits its address.
                         let edit = this.is_front(&id) && this.active_tab_id().as_deref() == Some(id.as_str());
@@ -2996,17 +3050,151 @@ impl BrowserWindow {
         )
     }
 
+    /// How far `id` is still drawn from its slot while it slides into place.
+    fn slide_offset(&self, id: &str) -> gpui::Point<Pixels> {
+        self.slides.get(id).map_or_else(gpui::Point::default, |(from, at)| {
+            let left = 1.0 - ease(at.elapsed().as_secs_f32() / SLIDE_ANIM.as_secs_f32());
+            gpui::point(from.x * left, from.y * left)
+        })
+    }
+
+    /// Records where `id` is laid out this frame, without its slide offset.
+    fn measure_slot(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let (watch, id, offset) = (cx.entity(), id.to_string(), self.slide_offset(id));
+        canvas(
+            move |bounds, _, cx| watch.update(cx, |view, _| { view.slots.insert(id, gpui::Bounds { origin: bounds.origin - offset, size: bounds.size }); }),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// Slides the items of a reordered row from where they are drawn now into their places in `order`, laid out `gap` apart.
+    fn slide_into(&mut self, order: &[String], gap: f32, vertical: bool) {
+        if self.reduce_motion {
+            return;
+        }
+        let Some(slots) = order.iter().map(|id| self.slots.get(id).copied()).collect::<Option<Vec<_>>>() else {
+            return;
+        };
+        let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
+        let Some(mut next) = slots.iter().map(|slot| along(slot.origin)).reduce(|a, b| if b < a { b } else { a }) else {
+            return;
+        };
+        let now = Instant::now();
+        for (id, slot) in order.iter().zip(&slots) {
+            let target = if vertical { gpui::point(slot.origin.x, next) } else { gpui::point(next, slot.origin.y) };
+            next += if vertical { slot.size.height } else { slot.size.width } + px(gap);
+            let from = slot.origin + self.slide_offset(id);
+            self.slides.insert(id.clone(), (from - target, now));
+        }
+    }
+
+    /// Whether `id` is lifted out of its row by a drag, leaving its gap behind.
+    fn picked(&self, id: &str, cx: &Context<Self>) -> bool {
+        cx.has_active_drag() && self.reorder.as_ref().is_some_and(|(dragged, _)| dragged == id)
+    }
+
+    /// `items` in the order the drag in progress shows them, if it is their row.
+    fn previewed<T>(&self, mut items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
+        if let Some((_, order)) = &self.reorder {
+            if items.iter().all(|item| order.iter().any(|other| other == id(item))) {
+                items.sort_by_key(|item| order.iter().position(|other| other == id(item)));
+            }
+        }
+        items
+    }
+
+    /// Opens a gap in `row` under the pointer for the dragged `id`, sliding the others aside;
+    /// with the pointer off the row it goes back to how it was.
+    /// `origin` is where the dragged item's top-left is drawn; its centre decides the gap.
+    fn preview_reorder(&mut self, id: &str, row: Vec<String>, origin: gpui::Point<Pixels>, vertical: bool, gap: f32) {
+        let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
+        let across = |p: gpui::Point<Pixels>| if vertical { p.x } else { p.y };
+        let slots = row.iter().filter_map(|other| self.slots.get(other).copied()).collect::<Vec<_>>();
+        let Some(own) = self.slots.get(id).copied().filter(|_| slots.len() == row.len()) else {
+            return;
+        };
+        let at = origin + gpui::point(own.size.width / 2., own.size.height / 2.);
+        let depth = if vertical { own.size.width } else { own.size.height };
+        let (first, last) = slots.iter().fold((along(own.origin), along(own.origin)), |(lo, hi), slot| {
+            let end = along(slot.origin) + if vertical { slot.size.height } else { slot.size.width };
+            (if along(slot.origin) < lo { along(slot.origin) } else { lo }, if end > hi { end } else { hi })
+        });
+        let over = (across(at) - across(own.center())).abs() < depth && along(at) > first - depth && along(at) < last + depth;
+        let mut order = row.clone();
+        if over {
+            order.retain(|other| other != id);
+            let index = order.iter().filter(|other| self.slots.get(*other).is_some_and(|slot| along(slot.center()) < along(at))).count();
+            order.insert(index, id.to_string());
+        }
+        let shown = self.reorder.as_ref().filter(|(dragged, _)| dragged == id).map_or(row, |(_, shown)| shown.clone());
+        if shown != order {
+            self.slide_into(&order, gap, vertical);
+        }
+        self.reorder = Some((id.to_string(), order));
+    }
+
+    /// The order the drag of `id` shows, once it is dropped.
+    fn dropped_order(&mut self, id: &str) -> Option<Vec<String>> {
+        self.reorder.take().filter(|(dragged, _)| dragged == id).map(|(_, order)| order)
+    }
+
+    /// A tab dropped on its own window lands where the drag showed it; on another window it joins that one.
+    fn drop_tab_on(&mut self, id: &str, target: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        if self.group_id(id) != self.group_id(target) {
+            return self.move_tab_to_window(id, target, cx);
+        }
+        let Some(order) = self.dropped_order(id) else {
+            return;
+        };
+        // The window's row is a slice of the space's tab order: land before the next tab in it, or after the one before.
+        let mut rest = self.model.lock().expect("model").session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        rest.retain(|other| other != id);
+        let at_row = order.iter().position(|other| other == id).unwrap_or(0);
+        let index = match (order.get(at_row + 1), at_row.checked_sub(1).and_then(|before| order.get(before))) {
+            (Some(next), _) => rest.iter().position(|other| other == next),
+            (None, Some(before)) => rest.iter().position(|other| other == before).map(|index| index + 1),
+            (None, None) => None,
+        };
+        if let Some(index) = index {
+            self.with_model(|model| { let _ = model.move_tab(id, index); });
+        }
+        self.land(id, at - self.tab_grab.get());
+        cx.notify();
+    }
+
+    /// Glides a dropped item from where its drag preview was into its slot; the others already sit in theirs.
+    fn land(&mut self, id: &str, from: gpui::Point<Pixels>) {
+        if let Some(slot) = self.slots.get(id).filter(|_| !self.reduce_motion) {
+            self.slides.insert(id.to_string(), (from - slot.origin, Instant::now()));
+        }
+    }
+
+    /// A profile dropped on the rail lands where the drag showed it.
+    fn drop_profile(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(order) = self.dropped_order(id) else {
+            return;
+        };
+        let index = order.iter().position(|other| other == id).unwrap_or(0);
+        self.with_model(|model| { let _ = model.move_profile(id, index); });
+        self.land(id, at - self.rail_grab.get());
+        cx.notify();
+    }
+
     /// The tab pill following the pointer while it is dragged.
     fn tab_drag_view(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let (tab, at) = self.tab_drag.as_ref()?;
         let paint = paint(cx);
+        let at = *at - self.tab_grab.get();
+        let width = self.slots.get(&tab.id).map_or(px(160.), |slot| slot.size.width);
         Some(
             h_stack()
                 .absolute()
-                .left(at.x - px(20.))
-                .top(at.y - px(14.))
-                .h(px(28.))
-                .max_w(px(180.))
+                .left(at.x)
+                .top(at.y)
+                .h(px(self.pill_h()))
+                .w(width)
                 .px(px(8.))
                 .gap(px(6.))
                 .items_center()
@@ -3080,6 +3268,7 @@ impl BrowserWindow {
             || self.toast.1.elapsed() < TOAST_LIFE
             || self.load_bar > 0.0
             || !self.opened.is_empty()
+            || !self.slides.is_empty()
             || self.lift.running()
             || self.landing.is_some()
     }
@@ -3713,6 +3902,7 @@ const LAND_ANIM: Duration = Duration::from_millis(280);
 const LIFT_W: f32 = 140.0;
 const PANEL_ANIM: Duration = Duration::from_millis(180);
 const WINDOW_ANIM: Duration = Duration::from_millis(170);
+const SLIDE_ANIM: Duration = Duration::from_millis(220);
 const WINDOW_FROM_SCALE: f32 = 0.94;
 const TOAST_IN: Duration = Duration::from_millis(180);
 const TOAST_LIFE: Duration = Duration::from_millis(2800);
