@@ -1,6 +1,10 @@
 /// Evaluates simple arithmetic (`+ - * / % ^`, parentheses, decimals) for the command palette.
 /// `None` unless the input is a whole expression with at least one operator.
 pub fn calc(input: &str) -> Option<f64> {
+    // The parser recurses per nesting level; a pasted wall of `(` would overflow the stack.
+    if input.len() > 512 {
+        return None;
+    }
     let tokens = input.chars().filter(|c| !c.is_whitespace()).collect::<Vec<_>>();
     if !tokens.iter().any(|c| "+-*/%^".contains(*c)) {
         return None;
@@ -97,6 +101,7 @@ mod tests {
         assert_eq!(calc("42"), None);
         assert_eq!(calc("1/0"), None);
         assert_eq!(calc("rust-lang"), None);
+        assert_eq!(calc(&"(".repeat(200_000)), None);
         assert_eq!(calc("(1+2"), None);
         assert_eq!(calc("1+"), None);
     }

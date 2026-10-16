@@ -541,7 +541,9 @@ fn load_context(shared: &Rc<RefCell<State>>, store_id: &str, id: &str) {
         eprintln!("extension {id} did not start: {}", error_text(&error));
         return;
     }
-    let keepalive = shared.borrow().keep_alive.contains(id).then(|| keepalive_page(&context, id)).flatten();
+    // Borrow released first: creating the page calls into WebKit, which may call back into the delegate.
+    let keep = shared.borrow().keep_alive.contains(id);
+    let keepalive = keep.then(|| keepalive_page(&context, id)).flatten();
     if let Some(profile) = shared.borrow_mut().profiles.get_mut(store_id) {
         profile.contexts.insert(id.to_string(), context);
         if let Some(view) = keepalive {
@@ -710,6 +712,8 @@ pub struct Ivars {
     store: String,
 }
 
+type Parked = (Option<Retained<NSURL>>, Option<Retained<NSString>>);
+
 pub struct TabIvars {
     shared: Weak<RefCell<State>>,
     store: String,
@@ -717,7 +721,7 @@ pub struct TabIvars {
     /// None while the tab is suspended.
     view: RefCell<Option<Retained<WKWebView>>>,
     /// URL and title from before the tab was suspended.
-    parked: RefCell<(Option<Retained<NSURL>>, Option<Retained<NSString>>)>,
+    parked: RefCell<Parked>,
 }
 
 fn done(reply: &DynBlock<dyn Fn(*mut NSError)>) {

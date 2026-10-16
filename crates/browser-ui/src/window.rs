@@ -8,9 +8,9 @@ use crate::terminal::{self, is_terminal, TERMINAL_URL};
 use crate::SharedModel;
 use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
-    Model,
+    Model, TabState,
 };
-use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
 use browser_engine_macos::{choose_folder_path, choose_open_path, choose_save_path, Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
 use gpui::{
@@ -107,6 +107,8 @@ pub struct BrowserWindow {
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
     address_editing: bool,
+    /// The edit was started from the new-tab page's big field, so the input is drawn there instead of the title bar.
+    address_in_page: bool,
     /// A page was clicked while the address was being edited; end the edit on the next render.
     blur_address: bool,
     find_open: bool,
@@ -148,7 +150,6 @@ pub struct BrowserWindow {
     /// suspending it would drop the page an OAuth popup reports back to.
     openers: HashMap<String, String>,
     started: Instant,
-    metrics: SharedString,
     self_test: Option<SelfTest>,
     cookies_saved: Instant,
     ticks: u32,
@@ -160,6 +161,8 @@ pub struct BrowserWindow {
     lift: Tween,
     /// Space chips laid out this frame, so a carried window can be dropped on one.
     space_chips: Vec<(String, gpui::Bounds<Pixels>)>,
+    /// Rail profiles laid out this frame, so a carried window can be dropped on one.
+    rail_badges: Vec<(String, gpui::Bounds<Pixels>)>,
     /// A dropped carried window growing back into place: (tab id, rect it was dropped at, started).
     landing: Option<(String, Frame, Instant)>,
     /// A window closed; re-tile the stage on the next layout pass.
@@ -185,6 +188,10 @@ pub struct BrowserWindow {
     /// Load bar width for the active tab, and when its load finished (the bar then fades).
     load_bar: f32,
     load_done: Option<Instant>,
+    /// The active tab's load progress at the last tick; a change repaints the bar.
+    load_seen: Option<f64>,
+    /// Each tab's last finished URL: later reports of the same URL are title changes.
+    finished_url: HashMap<String, String>,
     /// New windows growing in.
     opened: HashMap<String, Instant>,
     /// Address bar matches (url or search query, title, is a search) and the one picked with the arrow keys.
@@ -295,15 +302,7 @@ impl BrowserWindow {
                     let raw = input.read(cx).content().to_string();
                     this.commit_navigation(&raw, cx);
                 }
-                InputStateEvent::Focus => {
-                    this.address_focused = true;
-                    this.engine.focus_chrome();
-                }
-                InputStateEvent::Blur => {
-                    this.address_focused = false;
-                    this.address_editing = false;
-                    this.refresh_url(cx);
-                }
+                // Focus and Blur are left to `sync_address_focus`: the input sends them only while drawn.
                 InputStateEvent::TextChanged => {
                     let typed = input.read(cx).content().to_string();
                     this.update_suggestions(typed, cx);
@@ -457,6 +456,7 @@ impl BrowserWindow {
             download_progress: HashMap::new(),
             address_focused: false,
             focus_address: false,
+            address_in_page: false,
             address_editing: false,
             blur_address: false,
             find_open: false,
@@ -488,7 +488,6 @@ impl BrowserWindow {
             capturing: HashMap::new(),
             openers: HashMap::new(),
             started,
-            metrics: "Measuring…".into(),
             self_test: self_test.then(|| SelfTest {
                 stage: 0,
                 tab_a: String::new(),
@@ -505,6 +504,7 @@ impl BrowserWindow {
             dock_hovered: false,
             lift: Tween::new(false),
             space_chips: Vec::new(),
+            rail_badges: Vec::new(),
             landing: None,
             retile: false,
             tab_drag: None,
@@ -519,6 +519,8 @@ impl BrowserWindow {
             toast: ("Ready".into(), Instant::now() - TOAST_LIFE),
             load_bar: 0.0,
             load_done: None,
+            load_seen: None,
+            finished_url: HashMap::new(),
             opened: HashMap::new(),
             suggestions: Vec::new(),
             suggestion: None,
@@ -557,7 +559,7 @@ impl BrowserWindow {
         view.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
+                cx.background_executor().timer(TICK).await;
                 if this.update(cx, |view, cx| view.tick(cx)).is_err() {
                     break;
                 }
@@ -604,26 +606,18 @@ impl BrowserWindow {
                 self.focus_window(&id, cx);
             }
         }
-        if self.started.elapsed() > Duration::from_secs(2) && self.metrics == "Measuring…" {
-            changed = true;
-            let sample = snapshot(self.started);
-            self.metrics = format!(
-                "startup {} ms · app {:.1} MB · WebKit {:.1} MB · cpu {:.2}s",
-                sample.startup.as_millis(),
-                sample.rss_bytes as f64 / 1_048_576.0,
-                sample.webkit_rss_bytes as f64 / 1_048_576.0,
-                sample.cpu_seconds
-            )
-            .into();
-        }
         // Catches logins done without a page load (XHR); finished loads save right away.
         if self.cookies_saved.elapsed() > Duration::from_secs(10) {
             self.save_cookies();
         }
+        let load = self.active_tab_id().and_then(|id| self.engine.progress(&id));
+        changed |= std::mem::replace(&mut self.load_seen, load) != load;
+        // The frame loop is off while the toast sits still, so wake it in time for the fade-out.
+        changed |= self.toast_fading();
         self.run_self_test();
         self.ticks = self.ticks.wrapping_add(1);
-        // shortcut: extension badges/errors are polled in render with no change event, so idle windows still repaint once a second.
-        if changed || self.self_test.is_some() || self.ticks.is_multiple_of(4) {
+        // Extension errors have no change event; they only show in the popover, so poll them while it is open.
+        if changed || self.self_test.is_some() || (self.extensions_open && self.ticks.is_multiple_of(4)) {
             cx.notify();
         }
     }
@@ -699,19 +693,25 @@ impl BrowserWindow {
             let popup_in_front = self.openers.iter().any(|(child, opener)| opener == &tab_id && self.is_front(child));
             let mut model = self.model.lock();
             if hidden && !popup_in_front {
-                let _ = model.mark_suspended(&tab_id);
+                changed |= model.mark_suspended(&tab_id).is_ok();
             } else {
+                // Over the cap with every page on screen: candidates come back each tick, which is no change.
                 model.keep_alive(&tab_id);
             }
         }
         let effects = self.model.lock().take_effects();
         self.apply(effects);
-        true
+        changed
     }
 
     fn on_event(&mut self, event: EngineEvent, cx: &mut Context<Self>) {
         match event {
             EngineEvent::Navigated { tab_id, url, title, loading } => {
+                // Title-only reports (unread counters, timers) re-send the finished URL; they need no cookie save or icon probe.
+                let moved = !loading && self.finished_url.get(&tab_id) != Some(&url);
+                if moved {
+                    self.finished_url.insert(tab_id.clone(), url.clone());
+                }
                 if !loading {
                     let _ = self.model.lock().note_navigation(&tab_id, &url, &title);
                 } else if !title.is_empty() {
@@ -726,7 +726,7 @@ impl BrowserWindow {
                     let zoom = self.model.lock().settings.zoom_for(&site_glyph(&url).1);
                     self.engine.set_zoom(&tab_id, zoom);
                 }
-                if !loading {
+                if moved {
                     self.save_cookies();
                     let (_, host) = site_glyph(&url);
                     if self.self_test.is_none() && is_web(&url) && !favicon_path(&host).exists() {
@@ -791,7 +791,8 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
-            EngineEvent::ExtensionChanged { .. } => cx.notify(),
+            // Torn-off windows share the main window's extensions but not its event channel; repaint their badges too.
+            EngineEvent::ExtensionChanged { .. } => cx.refresh_windows(),
             EngineEvent::ExtensionPrompt { prompt, id, request } => {
                 self.ext_prompts.push((prompt, id, request));
                 self.extensions_open = true;
@@ -930,23 +931,25 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let (store, tabs) = {
+        let tabs = {
             let model = self.model.lock();
-            let Some(store) = model.active_profile().map(|profile| profile.data_store_id.clone()) else {
-                return;
-            };
-            let tabs = model.session_tabs().into_iter().cloned().collect::<Vec<_>>();
-            (store, tabs)
+            // A window moved in from another profile keeps that profile's site data.
+            let store = |tab: &browser_core::Tab| model.tab_profile(&tab.id).map(|profile| profile.data_store_id.clone());
+            model.session_tabs().into_iter().filter_map(|tab| Some((tab.clone(), store(tab)?))).collect::<Vec<_>>()
         };
-        let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
-        for tab in tabs {
+        let maximized = tabs.iter().any(|(tab, _)| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
+        for (tab, store) in tabs {
             let entry = self.chrome.get(&tab.id);
             let minimized = entry.is_some_and(|chrome| chrome.minimized);
             let covered = maximized && !entry.is_some_and(|chrome| chrome.maximized);
-            if minimized || covered || is_terminal(&tab.url) {
+            // A suspended tab stacked behind another stays unloaded until raised, or `drain` suspends it again each tick.
+            let suspended = tab.state == TabState::Suspended;
+            if minimized || covered || is_terminal(&tab.url) || (suspended && !self.is_front(&tab.id)) {
                 continue;
             }
-            let _ = self.engine.ensure_tab(&tab.id, &store, &tab.url);
+            if self.engine.ensure_tab(&tab.id, &store, &tab.url).is_ok() && suspended {
+                let _ = self.model.lock().mark_live(&tab.id);
+            }
         }
     }
 
@@ -1214,6 +1217,9 @@ impl BrowserWindow {
             return;
         }
         self.openers.retain(|child, _| !ids.contains(child));
+        self.playing.retain(|id| !ids.contains(id));
+        self.finished_url.retain(|id, _| !ids.contains(id));
+        self.capturing.retain(|id, _| !ids.contains(id));
         self.with_model(|model| {
             for id in &ids {
                 let _ = model.close_tab(id);
@@ -1341,9 +1347,12 @@ impl BrowserWindow {
         };
         self.address_focused = false;
         self.address_editing = false;
+        self.address_in_page = false;
         self.suggestions.clear();
         self.suggestion = None;
         self.suggest_task = None;
+        // Let go of the hidden input's GPUI focus, or a later click on the chrome would send keys to it.
+        self.blur_address = true;
         self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
         self.with_model(|model| {
             let _ = model.navigate_active(&url);
@@ -1618,6 +1627,7 @@ impl BrowserWindow {
         window.blur();
         self.address_focused = false;
         self.address_editing = false;
+        self.address_in_page = false;
         self.refresh_url(cx);
         cx.notify();
     }
@@ -1691,6 +1701,24 @@ impl BrowserWindow {
         let query = self.history_query.clone();
         self.engine.focus_chrome();
         window.defer(cx, move |window, cx| window.focus(&query.focus_handle(cx), cx));
+    }
+
+    /// Follows GPUI's focus on the address input. The input's own Focus/Blur events fire only while it is drawn,
+    /// so they went stale once the field collapsed to a pill, and a stale Blur closed the next edit as it opened.
+    fn sync_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.address_editing && self.address.focus_handle(cx).is_focused(window);
+        if focused == self.address_focused {
+            return;
+        }
+        self.address_focused = focused;
+        if focused {
+            self.engine.focus_chrome();
+        } else {
+            // Focus moved to another field mid-edit.
+            self.address_editing = false;
+            self.address_in_page = false;
+            self.refresh_url(cx);
+        }
     }
 
     fn request_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1788,6 +1816,7 @@ impl Render for BrowserWindow {
         self.attach(window, cx);
         self.overlay_rects.clear();
         self.space_chips.clear();
+        self.rail_badges.clear();
         if !cx.has_active_drag() {
             // A drag dropped nowhere puts its item back in its gap.
             if let Some(state) = self.reorder.take().filter(|state| state.row.is_none()) {
@@ -1797,6 +1826,7 @@ impl Render for BrowserWindow {
         // Only rows drawn this frame count as drop targets.
         self.slots.clear();
         self.apply_theme(window, cx);
+        self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
         self.request_palette_focus(window, cx);
         self.request_history_focus(window, cx);
@@ -2133,6 +2163,10 @@ impl BrowserWindow {
                 .when_some(activity.get(&profile.id).filter(|state| state.any()), |badge, state| badge.child(activity_chip(*state, paint)))
                 .when(self.picked(&id, cx), |badge| badge.opacity(0.))
                 .child(self.measure_slot(&id, cx))
+                .child({
+                    let (watch, id) = (cx.entity(), id.clone());
+                    canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.rail_badges.push((id, bounds))), |_, _, _, _| {}).absolute().size_full()
+                })
                 .id(SharedString::from(format!("rail-{id}")))
                 .cursor_pointer()
                 .on_click(cx.listener({
@@ -2604,10 +2638,34 @@ impl BrowserWindow {
                 let x = f64::from(position.x - bounds.origin.x) as f32;
                 let y = f64::from(position.y - bounds.origin.y) as f32;
                 gesture.snap = snap_zone(x, y, sw, sh);
-                // Up on the spaces bar the window is carried to another space instead of snapped.
-                let over_bar = y < 0.0 && self.space_chips.len() > 1;
+                // Up on the spaces bar the window is carried to another space instead of snapped;
+                // left over the profile rail, to another profile.
+                let over_rail = x < 0.0 && self.rail_badges.len() > 1;
+                let over_bar = (y < 0.0 && self.space_chips.len() > 1) || over_rail;
                 self.lift.set(over_bar, self.anim(LIFT_ANIM));
-                if over_bar {
+                if over_rail {
+                    gesture.snap = None;
+                    let profile = self.rail_badges.iter().find(|(_, badge)| badge.contains(&position)).map(|(id, _)| id.clone());
+                    let active = self.model.lock().active_profile_id.clone();
+                    // Hovering a profile opens it, taking the window along into its open space.
+                    if let Some(profile) = profile.filter(|profile| *profile != active) {
+                        let group = self.group_id(&gesture.tab_id);
+                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        let space = {
+                            let model = self.model.lock();
+                            let mut spaces = model.sessions.iter().filter(|session| session.profile_id == profile);
+                            spaces.clone().find(|session| session.active).or_else(|| spaces.next()).map(|session| session.id.clone())
+                        };
+                        if let Some(space) = space {
+                            self.with_model(|model| {
+                                let _ = model.move_tabs_to_session(&ids, &space);
+                                let _ = model.switch_profile(&profile);
+                            });
+                            self.focus_window(&gesture.tab_id, cx);
+                            self.refresh_url(cx);
+                        }
+                    }
+                } else if over_bar {
                     gesture.snap = None;
                     let space = self.space_chips.iter().find(|(_, chip)| chip.contains(&position)).map(|(id, _)| id.clone());
                     let active = self.model.lock().active_session_id.clone();
@@ -3056,10 +3114,15 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    /// The active profile's color for window decorations; the theme accent when it has none.
-    fn profile_accent(&self, paint: Paint) -> gpui::Hsla {
+    /// The color of the profile window `id` belongs to, for its decorations; the theme accent when it has none.
+    fn profile_accent(&self, id: &str, paint: Paint) -> gpui::Hsla {
+        self.model.lock().tab_profile(id).map_or(paint.accent, |profile| profile_tint(profile, paint))
+    }
+
+    /// The profile of window `id` when it was moved in from another profile than the open one.
+    fn guest_profile(&self, id: &str) -> Option<browser_core::Profile> {
         let model = self.model.lock();
-        model.active_profile().filter(|profile| !profile.color.is_empty()).map_or(paint.accent, |profile| parse_hex(&profile.color))
+        model.tab_profile(id).filter(|profile| profile.id != model.active_profile_id).cloned()
     }
 
     fn shown_tabs<'a>(&self, tabs: &'a [browser_core::Tab]) -> Vec<&'a browser_core::Tab> {
@@ -3076,7 +3139,7 @@ impl BrowserWindow {
 
     fn floating_window(&self, tab: &browser_core::Tab, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> Option<gpui::Div> {
         let paint = paint(cx);
-        let accent = self.profile_accent(paint);
+        let accent = self.profile_accent(&tab.id, paint);
         let active = tab.active;
         let maximized = self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized);
         let frame = self.chrome.get(&tab.id).and_then(|chrome| chrome.frame)?;
@@ -3126,7 +3189,8 @@ impl BrowserWindow {
                         .rounded_b(px(PAGE_RADIUS as f32))
                         .overflow_hidden()
                         .bg(paint.bg)
-                        .child(terminal::terminal_for(&tab.id, &tab.url, cx)),
+                        // Cached: the screen rebuilds only when the terminal itself notifies, not on every chrome repaint.
+                        .child(terminal::terminal_for(&tab.id, &tab.url, cx).cached(gpui::StyleRefinement::default().size_full())),
                     false if is_blank(&tab.url) => div()
                         .flex_1()
                         .min_h(px(0.))
@@ -3231,6 +3295,7 @@ impl BrowserWindow {
                 }))
                 // Buttons keep their size; the tabs shrink, and the empty space either side drags the window.
                 .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx).flex_none())
+                .children(self.guest_profile(&tab.id).map(|profile| profile_badge(&profile, true, 20., paint)))
                 .child(div().flex_1().min_w(px(8.)).h_full())
                 .child(self.compact_tabs(&tab.id, members, cx))
                 .child(self.hit_guard(format!("new-tab-guard-{}", tab.id), new_tab, cx).flex_none())
@@ -3387,8 +3452,8 @@ impl BrowserWindow {
 
     fn address_slot(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        // A blank tab's field is the new-tab page's big one; one input can only be drawn once.
-        let editing = tab.active && !is_blank(&tab.url) && (self.address_editing || self.address_focused);
+        // One input can only be drawn once: a blank tab's edit started from the page's big field is drawn there.
+        let editing = tab.active && !(is_blank(&tab.url) && self.address_in_page) && (self.address_editing || self.address_focused);
         let pill = div()
             .h(px(self.pill_h()))
             .w_full()
@@ -3469,8 +3534,8 @@ impl BrowserWindow {
             .border_1()
             .shadow_sm()
             .child(Icons::magnifying_glass().size(px(16.)).text_color(paint.muted));
-        let field = if tab.active {
-            self.address_field(pill.border_color(if self.address_focused { paint.accent.opacity(0.6) } else { paint.border }), 16., cx)
+        let field = if tab.active && self.address_in_page && (self.address_editing || self.address_focused) {
+            self.address_field(pill.border_color(paint.accent.opacity(0.6)), 16., cx)
         } else {
             let open = id.clone();
             div().w_full().child(
@@ -3483,6 +3548,7 @@ impl BrowserWindow {
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.focus_window(&open, cx);
                         this.focus_address = true;
+                        this.address_in_page = true;
                         cx.notify();
                     })),
             )
@@ -3502,7 +3568,7 @@ impl BrowserWindow {
             (bookmarks, recent)
         };
         let (pinned, saved): (Vec<_>, Vec<_>) = bookmarks.into_iter().partition(|b| b.pinned);
-        let action = |key: String, icon: gpui::Svg, run: Box<dyn Fn(&mut Self, &mut Context<Self>)>, cx: &mut Context<Self>| {
+        let action = |key: String, icon: gpui::Svg, run: WindowAction, cx: &mut Context<Self>| {
             div()
                 .id(SharedString::from(key))
                 .size(px(18.))
@@ -4201,7 +4267,7 @@ impl BrowserWindow {
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
         chrome.window = Some(group.clone());
-        let created = self.with_model(|model| model.create_tab(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string)));
+        let created = self.with_model(|model| model.create_tab_beside(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string), id));
         let Ok(new) = created else {
             return;
         };
@@ -4303,7 +4369,7 @@ impl BrowserWindow {
                 .h(px(frame.h))
                 .rounded(px(WINDOW_RADIUS as f32))
                 .border_1()
-                .border_color(self.profile_accent(paint))
+                .border_color(self.profile_accent(&id, paint))
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .child(measure_overlay(WINDOW_RADIUS, cx))
@@ -4625,12 +4691,25 @@ impl BrowserWindow {
         self.dock.running()
             || self.find.running()
             || self.panel_tween.running()
-            || self.toast.1.elapsed() < TOAST_LIFE
-            || self.load_bar > 0.0
+            || self.toast.1.elapsed() < TOAST_IN
+            || self.toast_fading()
+            || self.load_moving()
             || !self.opened.is_empty()
             || !self.slides.is_empty()
             || self.lift.running()
             || self.landing.is_some()
+    }
+
+    /// From one tick before the toast's fade-out until it is gone (the tick is longer than the fade).
+    fn toast_fading(&self) -> bool {
+        let age = self.toast.1.elapsed();
+        age + TICK > TOAST_LIFE - TOAST_IN && age < TOAST_LIFE
+    }
+
+    /// The load bar is still easing toward the page's progress, or fading out after it finished.
+    fn load_moving(&self) -> bool {
+        let target = self.load_seen.map_or(1.0, |progress| (progress as f32).max(0.08));
+        self.load_bar > 0.0 && (self.load_done.is_some() || (target - self.load_bar).abs() > 0.002)
     }
 
     fn panel_icon(
@@ -5042,6 +5121,10 @@ fn fit_snap(snap: Snap, sw: f32, sh: f32, others: &[(Snap, Frame)]) -> Frame {
 /// Fits a snapped frame to a resized stage. Borders on the stage inset stay there; inner borders keep
 /// their proportional place, measured at the middle of the gap so neighbours stay one inset apart.
 fn rescale_snapped(frame: Frame, ow: f32, oh: f32, sw: f32, sh: f32) -> Frame {
+    // A saved stage of size 0 would divide into NaN frames.
+    if ow <= 0.0 || oh <= 0.0 {
+        return frame;
+    }
     let lead = |v: f32, old: f32, new: f32| {
         if v <= SNAP_INSET + 0.5 { SNAP_INSET } else { (v - SNAP_INSET / 2.0) * new / old + SNAP_INSET / 2.0 }
     };
@@ -5211,6 +5294,8 @@ const PANEL_ANIM: Duration = Duration::from_millis(180);
 const WINDOW_ANIM: Duration = Duration::from_millis(170);
 const SLIDE_ANIM: Duration = Duration::from_millis(220);
 const WINDOW_FROM_SCALE: f32 = 0.94;
+/// How often each window polls the engine, model and terminals.
+const TICK: Duration = Duration::from_millis(250);
 const TOAST_IN: Duration = Duration::from_millis(180);
 const TOAST_LIFE: Duration = Duration::from_millis(2800);
 const LOAD_FADE: Duration = Duration::from_millis(300);
@@ -5319,7 +5404,7 @@ const FIND_H: f64 = 36.0;
 fn visible_pages(
     stack: &[(String, LogicalRect, LogicalRect)],
     stage: &LogicalRect,
-) -> (Vec<(String, LogicalRect)>, Vec<((f64, f64), (f64, f64))>) {
+) -> (Vec<Hole>, Vec<Notch>) {
     let mut holes = Vec::new();
     let mut notches = Vec::new();
     for (index, (id, _, full)) in stack.iter().enumerate() {
@@ -5398,7 +5483,7 @@ fn grab_zones(stack: &[(String, LogicalRect, LogicalRect)], resizable: &[String]
     zones
 }
 
-fn cut_overlay(holes: &mut Vec<(String, LogicalRect)>, notches: &mut Vec<((f64, f64), (f64, f64))>, rect: &LogicalRect, radius: f64) {
+fn cut_overlay(holes: &mut Vec<Hole>, notches: &mut Vec<Notch>, rect: &LogicalRect, radius: f64) {
     let (x2, y2) = (rect.x + rect.width, rect.y + rect.height);
     let corners = [
         ((rect.x, rect.y), (1.0, 1.0)),
@@ -5592,8 +5677,11 @@ pub(crate) struct Handoff {
 
 thread_local! {
     /// The main window, its handle and its title bar (window coordinates), where torn-off windows are dropped to merge back.
-    static MAIN_BAR: std::cell::RefCell<Option<(gpui::WeakEntity<BrowserWindow>, gpui::AnyWindowHandle, gpui::Bounds<Pixels>)>> = const { std::cell::RefCell::new(None) };
+    static MAIN_BAR: std::cell::RefCell<Option<MainBar>> = const { std::cell::RefCell::new(None) };
 }
+
+type MainBar = (gpui::WeakEntity<BrowserWindow>, gpui::AnyWindowHandle, gpui::Bounds<Pixels>);
+type WindowAction = Box<dyn Fn(&mut BrowserWindow, &mut Context<BrowserWindow>)>;
 
 /// A torn-off window closing: it no longer reopens at launch, and with `delete` its space and tabs go too.
 fn forget_detached(model: &mut Model, id: &str, delete: bool) {

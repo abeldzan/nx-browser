@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// Larger APC payloads are dropped rather than buffered.
 const MAX_COMMAND: usize = 64 << 20;
 /// Decoded images kept for later `a=p`; the oldest go first past this.
-const MAX_STORED: usize = 256 << 20;
+const MAX_STORED: usize = 64 << 20;
 
 pub enum Piece {
     Text(Vec<u8>),
@@ -202,6 +202,10 @@ impl Graphics {
         // Later chunks carry only `m` (and `q`); the first chunk's control applies to the whole image.
         let (control, payload) = match self.pending.take() {
             Some((first, mut data)) => {
+                // MAX_COMMAND caps each chunk; without this an endless `m=1` stream grows until OOM.
+                if data.len() + payload.len() > MAX_COMMAND {
+                    return Outcome::default();
+                }
                 data.extend_from_slice(payload);
                 (first, data)
             }
@@ -313,9 +317,14 @@ fn decode(control: &Control, payload: &[u8]) -> Result<RgbaImage, &'static str> 
             if banned || !path.is_file() {
                 return Err("EBADF:not a regular file");
             }
+            if std::fs::metadata(&path).map_or(true, |meta| meta.len() > MAX_COMMAND as u64) {
+                return Err("EFBIG:file too large");
+            }
             let bytes = std::fs::read(&path).map_err(|_| "EBADF:unreadable file")?;
-            // Temp files are the terminal's to delete, but only ones named for the protocol.
-            if control.medium == b't' && path.to_string_lossy().contains("tty-graphics-protocol") {
+            // Temp files are the terminal's to delete, but only protocol-named ones in a temp directory (per the spec).
+            let in_temp = [std::env::temp_dir(), "/tmp".into(), "/private/tmp".into()].iter().any(|dir| path.starts_with(dir));
+            let named = path.file_name().is_some_and(|name| name.to_string_lossy().contains("tty-graphics-protocol"));
+            if control.medium == b't' && in_temp && named {
                 let _ = std::fs::remove_file(&path);
             }
             bytes
@@ -432,5 +441,15 @@ mod tests {
         assert!(outcome.show.is_some());
         assert!(!path.exists());
         assert!(g.handle(format!("a=T,f=100,t=f,i=2;{}", b64(b"/dev/zero")).as_bytes()).reply.ends_with(b"EBADF:not a regular file\x1b\\"));
+    }
+
+    #[test]
+    fn temp_medium_never_deletes_outside_temp_dirs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tty-graphics-protocol-keep-{}.png", std::process::id()));
+        std::fs::write(&path, png(1, 1)).unwrap();
+        let outcome = Graphics::default().handle(format!("a=T,f=100,t=t;{}", b64(path.to_string_lossy().as_bytes())).as_bytes());
+        let kept = path.exists();
+        let _ = std::fs::remove_file(&path);
+        assert!(outcome.show.is_some() && kept);
     }
 }

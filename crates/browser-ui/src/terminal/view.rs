@@ -224,6 +224,9 @@ impl TerminalView {
             (0, r) => (r as f32 * cell.1 / aspect.max(0.001), r as f32 * cell.1),
             (c, r) => (c as f32 * cell.0, r as f32 * cell.1),
         };
+        // `c`/`r` come from program output: r=4000000000 would feed billions of newlines on the UI thread.
+        let (lines, columns) = self.emu.size();
+        let size = (size.0.min(f32::from(columns) * cell.0), size.1.min(f32::from(lines) * 4. * cell.1));
         let cols = ((size.0 / cell.0).ceil() as usize).max(1);
         let rows = ((size.1 / cell.1).ceil() as usize).max(1);
         let key = self.next_placement;

@@ -125,6 +125,7 @@ impl Storage {
             ("profiles", "color", "TEXT NOT NULL DEFAULT ''"),
             ("profiles", "position", "INTEGER NOT NULL DEFAULT 0"),
             ("tabs", "layout", "TEXT NOT NULL DEFAULT ''"),
+            ("tabs", "profile_id", "TEXT NOT NULL DEFAULT ''"),
             ("sessions", "free", "INTEGER NOT NULL DEFAULT 0"),
             ("extensions", "source", "TEXT NOT NULL DEFAULT 'bundled'"),
             ("extensions", "pinned", "INTEGER NOT NULL DEFAULT 0"),

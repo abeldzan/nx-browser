@@ -200,6 +200,10 @@ fn build(items: &[usize], frames: &[Frame], cells: &[(String, Frame)]) -> Tile {
         return Tile::Leaf(cells[*one].0.clone());
     }
     let (across, groups, clean) = split(items, frames);
+    // Only non-finite frames fail to split; tiling them would index past `bounds` or recurse on the same items.
+    if groups.len() < 2 {
+        return Tile::Leaf(cells[items[0]].0.clone());
+    }
     let bounds = groups.iter().map(|group| extent(group, frames, across)).collect::<Vec<_>>();
     // Borders sit halfway across the gap between neighbouring groups.
     let mut borders = vec![bounds[0].0];

@@ -82,7 +82,12 @@ fn guard_apis(js: &str) -> String {
 fn patch_pages(dir: &Path) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // An untrusted package can ship symlinks; following one would rewrite or walk files outside it.
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
             if entry.file_name() != "_metadata" {
                 patch_pages(&path)?;
             }
@@ -142,5 +147,18 @@ mod tests {
         );
         assert!(!std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap().contains("nxPermissions||"), "the polyfill itself is left alone");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn symlinked_pages_outside_the_package_are_left_alone() {
+        let root = std::env::temp_dir().join(format!("nx-polyfill-link-{}", std::process::id()));
+        let (dir, outside) = (root.join("ext"), root.join("outside.html"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&outside, "<head></head>").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("page.html")).unwrap();
+        std::os::unix::fs::symlink(&root, dir.join("up")).unwrap();
+        patch_pages(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "<head></head>");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

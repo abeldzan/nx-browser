@@ -1,5 +1,10 @@
 use std::sync::mpsc::Receiver;
 
+/// A tab's page area left uncovered by the chrome overlay.
+pub type Hole = (String, LogicalRect);
+/// (outer corner, arc centre) of a rounded-corner sliver that also shows the page.
+pub type Notch = ((f64, f64), (f64, f64));
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicalRect {
     pub x: f64,

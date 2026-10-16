@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Taken on drop, to be killed and reaped off the UI thread.
+    child: Option<Box<dyn Child + Send + Sync>>,
 }
 
 /// Starts `shell` (or `$SHELL`) as `-l -i` in `cwd`. Output arrives on the receiver, which ends when the shell exits.
@@ -45,7 +46,7 @@ pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Unb
             }
         }
     });
-    Ok((Pty { master: pair.master, writer, child }, rx))
+    Ok((Pty { master: pair.master, writer, child: Some(child) }, rx))
 }
 
 impl Pty {
@@ -62,7 +63,7 @@ impl Pty {
 
     /// The shell's working directory, so a restored tab starts where it was left.
     pub fn cwd(&self) -> Option<PathBuf> {
-        let pid = self.child.process_id()? as libc::c_int;
+        let pid = self.child.as_ref()?.process_id()? as libc::c_int;
         let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
         // SAFETY: `info` is a plain C struct valid for `size` bytes for the whole call.
@@ -78,7 +79,7 @@ impl Pty {
     /// The program in the foreground, when it is not the shell itself (`vim`, `htop`).
     pub fn foreground(&self) -> Option<String> {
         let group = self.master.process_group_leader().filter(|pid| *pid > 0)?;
-        if self.child.process_id().is_some_and(|shell| shell as libc::pid_t == group) {
+        if self.child.as_ref().and_then(|child| child.process_id()).is_some_and(|shell| shell as libc::pid_t == group) {
             return None;
         }
         let mut buf = [0u8; 64];
@@ -91,7 +92,13 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // `kill` sleeps up to 200 ms waiting on a shell that ignores SIGHUP, and leaves a zombie: not on the UI thread.
+        if let Some(mut child) = self.child.take() {
+            std::thread::spawn(move || {
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
     }
 }
 

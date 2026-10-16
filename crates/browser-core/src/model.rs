@@ -52,6 +52,8 @@ pub struct Tab {
     pub state: TabState,
     /// Window frame/snap/z-order saved by the UI as JSON; empty means default placement.
     pub layout: String,
+    /// Profile a window moved in from another profile keeps (its site data and history); empty means the space's.
+    pub profile_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -238,7 +240,12 @@ impl Model {
             model.create_profile("Personal")?;
         }
         if let Some(value) = model.storage.setting("prefs")? {
-            model.settings = serde_json::from_str(&value).unwrap_or_default();
+            model.settings = serde_json::from_str(&value).unwrap_or_else(|error| {
+                // Defaults get written back over these on the next save; keep the user's copy to recover from.
+                eprintln!("settings unreadable ({error}); defaults in use, original kept as prefs.bak");
+                let _ = model.storage.set_setting("prefs.bak", &value);
+                Settings::default()
+            });
         }
         // Bounds the LIKE scans behind suggestions and history search.
         model.storage.execute(
@@ -263,6 +270,16 @@ impl Model {
 
     pub fn active_profile(&self) -> Option<&Profile> {
         self.profiles.iter().find(|profile| profile.id == self.active_profile_id)
+    }
+
+    /// The profile whose site data a tab uses: its own if it was moved in from another profile, else its space's.
+    pub fn tab_profile(&self, tab_id: &str) -> Option<&Profile> {
+        let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
+        let id = match tab.profile_id.as_str() {
+            "" => &self.sessions.iter().find(|session| session.id == tab.session_id)?.profile_id,
+            id => id,
+        };
+        self.profiles.iter().find(|profile| profile.id == *id)
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -308,9 +325,12 @@ impl Model {
             icon: icon.to_string(),
             color: String::new(),
         };
+        // All or nothing: a profile row without its session can never be switched to.
+        let tx = self.storage.conn().unchecked_transaction()?;
         self.insert_profile(&profile)?;
         let session_id = self.insert_session(&profile.id, "Session 1")?;
         self.insert_tab(&session_id, "nxbrowser://home", "New Tab", true, 0, TabState::Suspended)?;
+        tx.commit()?;
         self.active_profile_id = profile.id.clone();
         self.active_session_id = session_id;
         self.save_active()?;
@@ -394,11 +414,7 @@ impl Model {
         let tab_ids: Vec<String> = self
             .tabs
             .iter()
-            .filter(|tab| {
-                self.sessions
-                    .iter()
-                    .any(|session| session.id == tab.session_id && session.profile_id == id)
-            })
+            .filter(|tab| self.tab_profile(&tab.id).is_some_and(|profile| profile.id == id))
             .map(|tab| tab.id.clone())
             .collect();
         for tab_id in tab_ids {
@@ -406,11 +422,8 @@ impl Model {
         }
         self.purge_profile_rows(id)?;
         self.reload()?;
-        self.storage.execute("DELETE FROM sessions WHERE profile_id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
+        // Older imports could share a store between profiles; the survivor still needs its site data.
+        let data_store_id = data_store_id.filter(|store| !self.profiles.iter().any(|profile| &profile.data_store_id == store));
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
             self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
@@ -471,6 +484,7 @@ impl Model {
     fn purge_profile_rows(&self, id: &str) -> anyhow::Result<()> {
         let tx = self.storage.conn().unchecked_transaction()?;
         self.storage.execute("DELETE FROM tabs WHERE session_id IN (SELECT id FROM sessions WHERE profile_id = ?1)", params![id])?;
+        self.storage.execute("DELETE FROM tabs WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM sessions WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
         self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
@@ -577,19 +591,27 @@ impl Model {
         Ok(id)
     }
 
-    /// Moves tabs of the active space into another space of this profile; an emptied space keeps a home tab.
+    /// Moves tabs of the active space into another space, of this or another profile; an emptied space keeps a home tab.
+    /// Tabs taken to another profile keep their own, and lose that mark when they come back home.
     pub fn move_tabs_to_session(&mut self, ids: &[String], session_id: &str) -> anyhow::Result<()> {
         let from = self.active_session_id.clone();
-        if session_id == from || !self.profile_sessions().iter().any(|session| session.id == session_id) {
+        let Some(to_profile) = self.sessions.iter().find(|session| session.id == session_id).map(|session| session.profile_id.clone()) else {
+            return Ok(());
+        };
+        if session_id == from {
             return Ok(());
         }
         let base = self.tabs.iter().filter(|tab| tab.session_id == session_id).map(|tab| tab.position + 1).max().unwrap_or(0);
+        let tx = self.storage.conn().unchecked_transaction()?;
         for (index, id) in ids.iter().enumerate() {
             self.storage.execute(
-                "UPDATE tabs SET session_id = ?1, active = 0, position = ?2 WHERE id = ?3 AND session_id = ?4",
-                params![session_id, base + index as i32, id, from],
+                "UPDATE tabs SET session_id = ?1, active = 0, position = ?2,
+                 profile_id = CASE WHEN COALESCE(NULLIF(profile_id, ''), ?5) = ?6 THEN '' ELSE COALESCE(NULLIF(profile_id, ''), ?5) END
+                 WHERE id = ?3 AND session_id = ?4",
+                params![session_id, base + index as i32, id, from, self.active_profile_id, to_profile],
             )?;
         }
+        tx.commit()?;
         self.reload()?;
         if !self.tabs.iter().any(|tab| tab.session_id == from) {
             self.insert_tab(&from, "nxbrowser://home", "New Tab", true, 0, TabState::Suspended)?;
@@ -599,11 +621,20 @@ impl Model {
     }
 
     pub fn create_tab(&mut self, url: &str) -> anyhow::Result<String> {
+        self.create_tab_beside(url, "")
+    }
+
+    /// A new tab that shares the profile of tab `beside`, for one opened in that tab's window.
+    pub fn create_tab_beside(&mut self, url: &str, beside: &str) -> anyhow::Result<String> {
+        let guest = self.tabs.iter().find(|tab| tab.id == beside).map(|tab| tab.profile_id.clone()).unwrap_or_default();
         let session_id = self.active_session_id.clone();
         // Closed and moved tabs leave gaps in positions, so the count could land mid-list.
         let position = self.session_tabs().last().map_or(0, |tab| tab.position + 1);
         self.mark_active_background();
         let id = self.insert_tab(&session_id, url, "New Tab", true, position, TabState::Active)?;
+        if !guest.is_empty() {
+            self.storage.execute("UPDATE tabs SET profile_id = ?1 WHERE id = ?2", params![guest, id])?;
+        }
         self.reload()?;
         self.queue_show_active();
         Ok(id)
@@ -715,12 +746,7 @@ impl Model {
             params![url, title, tab_id],
         )?;
         if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
-            let profile_id = self
-                .sessions
-                .iter()
-                .find(|session| session.id == tab.session_id)
-                .map(|session| session.profile_id.clone());
-            if let Some(profile_id) = profile_id {
+            if let Some(profile_id) = self.tab_profile(&tab.id).map(|profile| profile.id.clone()) {
                 if same_url {
                     self.storage.execute(
                         "UPDATE history SET title = ?1 WHERE id = (SELECT MAX(id) FROM history WHERE profile_id = ?2 AND url = ?3)",
@@ -785,6 +811,17 @@ impl Model {
                 *since = now;
             }
         }
+    }
+
+    /// A suspended tab whose page was loaded again (it came on screen): back under the live-tab cap.
+    pub fn mark_live(&mut self, tab_id: &str) -> anyhow::Result<()> {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id && tab.state == TabState::Suspended) else {
+            return Ok(());
+        };
+        self.storage.execute("UPDATE tabs SET state = 'background' WHERE id = ?1", params![tab_id])?;
+        tab.state = TabState::Background;
+        self.background_since.push((tab_id.to_string(), now_secs()));
+        Ok(())
     }
 
     pub fn mark_suspended(&mut self, tab_id: &str) -> anyhow::Result<()> {
@@ -1124,11 +1161,15 @@ impl Model {
 
     pub fn import_bundle(&mut self, bundle: ProfileBundle) -> anyhow::Result<String> {
         let id = self.create_profile(&bundle.profile.name)?;
+        // Reuse the bundle's store (restoring a backup keeps its logins) only when no profile has it: deleting
+        // one of two profiles sharing a store would wipe the other's site data.
+        let store = Some(bundle.profile.data_store_id.as_str())
+            .filter(|store| Uuid::parse_str(store).is_ok() && !self.profiles.iter().any(|profile| profile.data_store_id == *store));
         // One transaction: a bundle can carry thousands of history rows.
         let tx = self.storage.conn().unchecked_transaction()?;
         self.storage.execute(
-            "UPDATE profiles SET data_store_id = ?1, icon = ?2, color = ?3 WHERE id = ?4",
-            params![bundle.profile.data_store_id, bundle.profile.icon, bundle.profile.color, id],
+            "UPDATE profiles SET data_store_id = COALESCE(?1, data_store_id), icon = ?2, color = ?3 WHERE id = ?4",
+            params![store, bundle.profile.icon, bundle.profile.color, id],
         )?;
         let session_id = self.active_session_id.clone();
         self.storage.execute("DELETE FROM tabs WHERE session_id = ?1", params![session_id])?;
@@ -1168,7 +1209,7 @@ impl Model {
 
     fn queue_show_active(&mut self) {
         let tab = self.active_tab().cloned();
-        let store = self.active_profile().map(|profile| profile.data_store_id.clone());
+        let store = tab.as_ref().and_then(|tab| self.tab_profile(&tab.id)).map(|profile| profile.data_store_id.clone());
         if let (Some(tab), Some(data_store_id)) = (tab, store) {
             self.effects.push(Effect::EnsureTab {
                 tab_id: tab.id.clone(),
@@ -1398,7 +1439,7 @@ fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
 
 fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
     let mut stmt = storage.conn().prepare_cached(
-        "SELECT id, session_id, url, title, active, position, state, layout FROM tabs ORDER BY position",
+        "SELECT id, session_id, url, title, active, position, state, layout, profile_id FROM tabs ORDER BY position",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Tab {
@@ -1410,6 +1451,7 @@ fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
             position: row.get(5)?,
             state: TabState::parse(&row.get::<_, String>(6)?),
             layout: row.get(7)?,
+            profile_id: row.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1418,6 +1460,46 @@ fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_tab_shown_again_counts_toward_the_live_cap() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let first = model.active_tab().unwrap().id.clone();
+        model.create_tab("https://example.com").unwrap();
+        model.mark_suspended(&first).unwrap();
+        model.mark_live(&first).unwrap();
+        let tab = model.tabs.iter().find(|tab| tab.id == first).unwrap();
+        assert_eq!(tab.state, TabState::Background);
+        assert!(model.background_since.iter().any(|(id, _)| id == &first));
+        // Persisted, so a reopen agrees.
+        model.reload().unwrap();
+        assert_eq!(model.tabs.iter().find(|tab| tab.id == first).unwrap().state, TabState::Background);
+    }
+
+    #[test]
+    fn unreadable_settings_are_backed_up_before_defaults() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.set_setting("prefs", r#"{"page_zoom": "not a number"}"#).unwrap();
+        let model = Model::open(storage).unwrap();
+        assert_eq!(model.storage.setting("prefs.bak").unwrap().as_deref(), Some(r#"{"page_zoom": "not a number"}"#));
+    }
+
+    #[test]
+    fn import_never_shares_a_live_profiles_data_store() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let bundle = model.export_active().unwrap();
+        let original = bundle.profile.data_store_id.clone();
+        let imported = model.import_bundle(bundle).unwrap();
+        let store = |model: &Model, id: &str| model.profiles.iter().find(|p| p.id == id).unwrap().data_store_id.clone();
+        assert_ne!(store(&model, &imported), original);
+
+        // A backup whose store no profile uses (original deleted) gets it back.
+        let mut bundle = model.export_active().unwrap();
+        let unused = Uuid::new_v4().to_string();
+        bundle.profile.data_store_id = unused.clone();
+        let restored = model.import_bundle(bundle).unwrap();
+        assert_eq!(store(&model, &restored), unused);
+    }
 
     #[test]
     fn two_profiles_keep_separate_ids_and_restore() {
@@ -1672,6 +1754,26 @@ mod tests {
         assert_eq!(model.active_session_id, space);
         model.set_active(&main).unwrap();
         assert!(model.session_tabs().iter().all(|tab| tab.id != moved && tab.id != second));
+    }
+    #[test]
+    fn window_moved_to_another_profile_keeps_its_own_until_home() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let (home, home_space) = (model.active_profile_id.clone(), model.active_session_id.clone());
+        let tab = model.create_tab("https://example.com/").unwrap();
+        let other = model.create_profile("Work").unwrap();
+        let other_space = model.active_session_id.clone();
+        model.switch_profile(&home).unwrap();
+        model.move_tabs_to_session(std::slice::from_ref(&tab), &other_space).unwrap();
+        model.switch_profile(&other).unwrap();
+        assert_eq!(model.tab_profile(&tab).unwrap().id, home);
+        // A tab opened in its window shares its profile.
+        let sibling = model.create_tab_beside("https://rust-lang.org/", &tab).unwrap();
+        assert_eq!(model.tab_profile(&sibling).unwrap().id, home);
+        model.move_tabs_to_session(std::slice::from_ref(&tab), &home_space).unwrap();
+        assert!(model.tabs.iter().any(|t| t.id == tab && t.profile_id.is_empty()));
+        // Deleting a profile takes its windows parked in other profiles with it.
+        model.delete_profile(&home).unwrap();
+        assert!(!model.tabs.iter().any(|t| t.id == sibling));
     }
     #[test]
     fn torn_off_window_merges_back_and_its_space_goes() {

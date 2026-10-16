@@ -10,6 +10,9 @@ use gpuikit::elements::input::input;
 use gpuikit::input::bindings;
 use gpuikit::layout::{h_stack, v_stack};
 
+/// A settings switch the palette flips in place.
+type Toggle = fn(&mut Settings);
+
 const MAX_ROWS: usize = 10;
 
 /// Vivaldi-style scope filters, in Chrome (`@tabs`) and Firefox (`%`) spellings.
@@ -238,7 +241,7 @@ impl BrowserWindow {
             }
             // Zen-style toggles; the label says what picking it will do.
             let on_off = |on: bool| if on { "Turn off" } else { "Turn on" };
-            let toggles: [(String, fn(&mut Settings)); 8] = [
+            let toggles: [(String, Toggle); 8] = [
                 ("Use dark theme".into(), |s| s.theme = "dark".into()),
                 ("Use light theme".into(), |s| s.theme = "light".into()),
                 ("Use system theme".into(), |s| s.theme = "system".into()),

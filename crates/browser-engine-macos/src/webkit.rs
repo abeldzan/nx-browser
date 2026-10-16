@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
@@ -43,7 +43,7 @@ thread_local! {
     /// The compiled block list, once WebKit has it; `views` waits for it with each view's wanted state.
     static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
     /// Camera/microphone requests waiting for the user, by `EngineEvent::Permission::request`.
-    static ASKS: RefCell<HashMap<u64, RcBlock<dyn Fn(WKPermissionDecision)>>> = RefCell::new(HashMap::new());
+    static ASKS: RefCell<HashMap<u64, PermissionReply>> = RefCell::new(HashMap::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
     /// Downloads WebKit is running, by `EngineEvent::Download::download`.
     static DOWNLOADS: RefCell<HashMap<u64, Download>> = RefCell::new(HashMap::new());
@@ -465,9 +465,7 @@ impl NxWebDelegate {
         if unsafe { navigation_action.targetFrame() }.is_some() {
             return None;
         }
-        let Some(url) = unsafe { navigation_action.request() }.URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url)) else {
-            return None;
-        };
+        let url = unsafe { navigation_action.request() }.URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url))?;
         let from_extension = unsafe { web_view.URL() }.and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
         // Web popups get a real view built from WebKit's configuration so `window.opener` works:
         // OAuth sign-ins (Figma, Google, ...) post their result back through it. `ensure_tab` adopts it.
@@ -518,7 +516,7 @@ pub struct MacEngine {
     chrome: Option<Retained<NSView>>,
     bounds: LogicalRect,
     stacked: Vec<String>,
-    placed_holes: Option<(Vec<(String, LogicalRect)>, Vec<Notch>, NSSize)>,
+    placed_holes: Option<(Vec<Hole>, Vec<Notch>, NSSize)>,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     settings: EngineSettings,
     https_only: Arc<AtomicBool>,
@@ -532,7 +530,7 @@ pub struct MacEngine {
     /// Stores that had a tab this run; only their in-memory session cookies are current.
     cookie_used: HashSet<String>,
     /// Page loads held until a store's session cookies are back, per store.
-    held_loads: Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>,
+    held_loads: HeldLoads,
     /// Tabs whose next page must not start media on its own (restored at launch or woken from suspension).
     hold_media: HashSet<String>,
     extensions: Extensions,
@@ -877,7 +875,7 @@ impl MacEngine {
         with_window(self.window_no, |state| state.grabs = rects);
     }
 
-    pub fn set_page_holes(&mut self, holes: &[(String, LogicalRect)], notches: &[Notch]) {
+    pub fn set_page_holes(&mut self, holes: &[Hole], notches: &[Notch]) {
         let Some(chrome) = &self.chrome else {
             return;
         };
@@ -1413,6 +1411,11 @@ fn compile_blocklist(mtm: MainThreadMarker) {
             if let Some(error) = unsafe { error.as_ref() } {
                 eprintln!("block list failed to compile: {}", error.localizedDescription());
             }
+            // Drop the queued pages (or they live forever) and let the next page retry the compile.
+            BLOCKLIST.with_borrow_mut(|state| {
+                state.waiting.clear();
+                state.started = false;
+            });
             return;
         };
         let waiting = BLOCKLIST.with_borrow_mut(|state| {
@@ -1475,6 +1478,11 @@ fn write_session_cookies(path: &Path, cookies: &NSArray<NSHTTPCookie>) {
     let Ok(data) = (unsafe { NSPropertyListSerialization::dataWithPropertyList_format_options_error(&array, NSPropertyListFormat::BinaryFormat_v1_0, 0) }) else {
         return;
     };
+    let bytes = data.to_vec();
+    // Saved every few seconds; most snapshots match what is already on disk.
+    if std::fs::read(path).is_ok_and(|old| old == bytes) {
+        return;
+    }
     let Some(dir) = path.parent() else {
         return;
     };
@@ -1486,7 +1494,7 @@ fn write_session_cookies(path: &Path, cookies: &NSArray<NSHTTPCookie>) {
         .truncate(true)
         .mode(0o600)
         .open(&temp)
-        .and_then(|mut file| file.write_all(&data.to_vec()));
+        .and_then(|mut file| file.write_all(&bytes));
     if written.is_ok() {
         let _ = std::fs::rename(&temp, path);
     }
@@ -1631,7 +1639,9 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
     monitor
 }
 
-type Notch = ((f64, f64), (f64, f64));
+type PermissionReply = RcBlock<dyn Fn(WKPermissionDecision)>;
+/// Pages and the URL each will load, per data store.
+type HeldLoads = Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>;
 
 struct PageHole {
     tab_id: String,
@@ -1872,6 +1882,7 @@ fn add_key_script(controller: &WKUserContentController, mtm: MainThreadMarker) {
 /// GPUI sets no menu bar, and WebKit's copy/paste/undo/select-all only run as Edit menu actions,
 /// so pages never got them. Items have no target: they go to whatever has focus.
 fn install_edit_menu(mtm: MainThreadMarker) {
+    defuse_gpui_menu_handlers();
     let app = NSApplication::sharedApplication(mtm);
     let main = app.mainMenu().unwrap_or_else(|| {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
@@ -1898,6 +1909,30 @@ fn install_edit_menu(mtm: MainThreadMarker) {
     item.setTitle(ns_string!("Edit"));
     item.setSubmenu(Some(&edit));
     main.addItem(&item);
+}
+
+/// GPUI's app delegate answers `validateMenuItem:` and the edit actions by looking the item's tag up in
+/// its own menu actions, and on a miss locks its platform mutex a second time: a deadlock. We set no
+/// GPUI menus, so it always misses, and the app froze whenever our Edit menu landed on the delegate
+/// (focus outside a web view, or macOS validating the menu bar in the background). Here they disable
+/// the item and do nothing, which is all GPUI could have done for them.
+fn defuse_gpui_menu_handlers() {
+    extern "C-unwind" fn disabled(_: &AnyObject, _: Sel, _: *mut AnyObject) -> Bool {
+        Bool::NO
+    }
+    extern "C-unwind" fn ignore(_: &AnyObject, _: Sel, _: *mut AnyObject) {}
+    let Some(class) = AnyClass::get(c"GPUIApplicationDelegate") else {
+        return;
+    };
+    let class = std::ptr::from_ref(class).cast_mut();
+    unsafe {
+        let disabled: objc2::runtime::Imp = std::mem::transmute(disabled as extern "C-unwind" fn(_, _, _) -> _);
+        objc2::ffi::class_replaceMethod(class, sel!(validateMenuItem:), disabled, c"c@:@".as_ptr());
+        let ignore: objc2::runtime::Imp = std::mem::transmute(ignore as extern "C-unwind" fn(_, _, _));
+        for action in [sel!(cut:), sel!(copy:), sel!(paste:), sel!(selectAll:), sel!(undo:), sel!(redo:), sel!(handleGPUIMenuItem:)] {
+            objc2::ffi::class_replaceMethod(class, action, ignore, c"v@:@".as_ptr());
+        }
+    }
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str, shift: bool) -> Retained<NSMenuItem> {
