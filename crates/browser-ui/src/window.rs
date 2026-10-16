@@ -35,7 +35,7 @@ use gpuikit::traits::control_sized::ControlSized;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, MutexGuard, PoisonError};
@@ -135,6 +135,8 @@ pub struct BrowserWindow {
     downloads_rx: Receiver<DownloadUpdate>,
     attached: bool,
     loading: bool,
+    /// Tabs whose page is playing sound, for the speaker beside their title.
+    playing: HashSet<String>,
     started: Instant,
     metrics: SharedString,
     self_test: Option<SelfTest>,
@@ -459,6 +461,7 @@ impl BrowserWindow {
             downloads_rx,
             attached: false,
             loading: false,
+            playing: HashSet::new(),
             started,
             metrics: "Measuring…".into(),
             self_test: self_test.then(|| SelfTest {
@@ -755,6 +758,10 @@ impl BrowserWindow {
             }
             EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
             EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
+            EngineEvent::Audio { tab_id, playing } => {
+                if playing { self.playing.insert(tab_id) } else { self.playing.remove(&tab_id) };
+                cx.notify();
+            }
         }
     }
 
@@ -3215,7 +3222,7 @@ impl BrowserWindow {
                                     })),
                             ),
                     )
-                    .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
+                    .child(div().min_w(px(0.)).truncate().child(self.tab_title(tab))),
             );
         }
         row
@@ -4204,8 +4211,20 @@ impl BrowserWindow {
                 .text_color(paint.fg)
                 .child(measure_overlay(8.0, cx))
                 .child(favicon(tab, false))
-                .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
+                .child(div().min_w(px(0.)).truncate().child(self.tab_title(tab))),
         )
+    }
+
+    /// The tab's label, led by a speaker while it plays sound or is muted.
+    fn tab_title(&self, tab: &browser_core::Tab) -> String {
+        let label = tab_label(&tab.title, &tab.url);
+        if self.engine.is_muted(&tab.id) {
+            format!("🔇 {label}")
+        } else if self.playing.contains(&tab.id) {
+            format!("🔊 {label}")
+        } else {
+            label
+        }
     }
 
     /// The window a tab belongs to; a tab never added to another window is its own.

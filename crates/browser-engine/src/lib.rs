@@ -59,6 +59,10 @@ pub enum EngineEvent {
     CloseTab {
         tab_id: String,
     },
+    Audio {
+        tab_id: String,
+        playing: bool,
+    },
 }
 
 /// Browser settings the engine applies to web views.

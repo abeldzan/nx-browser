@@ -55,6 +55,7 @@ pub(crate) enum Run {
     CloseAll,
     NewSpace,
     NewPrivate,
+    ToggleMute,
     Pref(fn(&mut Settings)),
     Tab(String),
     Closed(String),
@@ -229,6 +230,7 @@ impl BrowserWindow {
                 ("Close all tabs", Run::CloseAll),
                 ("New space", Run::NewSpace),
                 ("New private profile", Run::NewPrivate),
+                (if self.active_tab_id().is_some_and(|id| self.engine.is_muted(&id)) { "Unmute tab" } else { "Mute tab" }, Run::ToggleMute),
                 ("Show downloads", Run::Downloads),
                 ("Manage extensions", Run::Extensions),
             ] {
@@ -345,6 +347,13 @@ impl BrowserWindow {
                 self.close_tabs(all, cx);
             }
             Run::NewSpace => self.with_model(|model| { let _ = model.create_session(); }),
+            Run::ToggleMute => {
+                if let Some(id) = self.active_tab_id() {
+                    let mute = !self.engine.is_muted(&id);
+                    self.engine.set_muted(&id, mute);
+                    self.status = if mute { "Tab muted" } else { "Tab unmuted" }.into();
+                }
+            }
             Run::NewPrivate => self.with_model(|model| { let _ = model.create_private_profile(); }),
             Run::Pref(change) => self.set_pref(cx, change),
             Run::Tab(id) => self.focus_window(&id, cx),

@@ -43,12 +43,15 @@ const HOME_HTML: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
-const OBSERVED_KEYS: [&str; 2] = ["URL", "title"];
+/// `_isPlayingAudio` is private but KVO-observable, as Safari's tab speaker uses it.
+const OBSERVED_KEYS: [&str; 3] = ["URL", "title", "_isPlayingAudio"];
 
 thread_local! {
     /// Popup views WebKit is already loading, keyed by the URL their new tab is created with.
     /// shortcut: a popup whose tab is never created stays here; evict if that ever matters.
     static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
+    /// Muted tabs, kept across windows and page re-creation (a suspended tab comes back muted).
+    static MUTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
 }
 
@@ -301,11 +304,18 @@ define_class!(
         #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
         unsafe fn observe_value(
             &self,
-            _key_path: Option<&NSString>,
+            key_path: Option<&NSString>,
             object: Option<&AnyObject>,
             _change: Option<&AnyObject>,
             _context: *mut c_void,
         ) {
+            if key_path.is_some_and(|key| ns_string(key) == "_isPlayingAudio") {
+                if let Some(web_view) = object {
+                    let playing: Bool = unsafe { msg_send![web_view, _isPlayingAudio] };
+                    let _ = self.ivars().events.borrow().send(EngineEvent::Audio { tab_id: self.ivars().tab_id.clone(), playing: playing.as_bool() });
+                }
+                return;
+            }
             if let Some(web_view) = object.and_then(|object| object.downcast_ref::<WKWebView>()) {
                 self.emit_page(web_view, web_view.isLoading());
             }
@@ -562,6 +572,17 @@ impl MacEngine {
             if (unsafe { live.view.pageZoom() } - zoom).abs() > f64::EPSILON {
                 unsafe { live.view.setPageZoom(zoom) };
             }
+        }
+    }
+
+    pub fn is_muted(&self, tab_id: &str) -> bool {
+        MUTED.with_borrow(|muted| muted.contains(tab_id))
+    }
+
+    pub fn set_muted(&mut self, tab_id: &str, mute: bool) {
+        MUTED.with_borrow_mut(|muted| if mute { muted.insert(tab_id.to_string()) } else { muted.remove(tab_id) });
+        if let Some(live) = self.tabs.get(tab_id) {
+            apply_muted(&live.view, mute);
         }
     }
 
@@ -869,6 +890,9 @@ impl WebEngine for MacEngine {
             None => self.new_view(tab_id, data_store_id, url, &store, mtm)?,
         };
         apply_view_settings(&view, &self.settings);
+        if self.is_muted(tab_id) {
+            apply_muted(&view, true);
+        }
         detach_inspector(&view, mtm);
         let delegate = self.page_delegate(tab_id, mtm);
         unsafe {
@@ -901,6 +925,7 @@ impl WebEngine for MacEngine {
     }
 
     fn close_tab(&mut self, tab_id: &str) {
+        MUTED.with_borrow_mut(|muted| muted.remove(tab_id));
         self.extensions.closed(tab_id);
         self.drop_view(tab_id);
     }
@@ -1158,6 +1183,13 @@ impl MacEngine {
 }
 
 /// KVO on `URL` and `title`, so in-page navigations reach the address bar.
+/// Private `_setPageMuted:`; 1 is `_WKMediaAudioMuted`.
+fn apply_muted(view: &WKWebView, mute: bool) {
+    if view.respondsToSelector(sel!(_setPageMuted:)) {
+        let _: () = unsafe { msg_send![view, _setPageMuted: if mute { 1usize } else { 0usize }] };
+    }
+}
+
 fn observe(view: &WKWebView, delegate: &NxWebDelegate) {
     for key in OBSERVED_KEYS {
         unsafe { NSObject::addObserver_forKeyPath_options_context(view, delegate, &NSString::from_str(key), NSKeyValueObservingOptions::New, std::ptr::null_mut()) };
