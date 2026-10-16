@@ -49,6 +49,7 @@ thread_local! {
     /// Popup views WebKit is already loading, keyed by the URL their new tab is created with.
     /// shortcut: a popup whose tab is never created stays here; evict if that ever matters.
     static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
+    static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
 }
 
 define_class!(
@@ -1051,6 +1052,7 @@ impl WebEngine for MacEngine {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
+        PRIVATE_STORES.with_borrow_mut(|stores| stores.remove(data_store_id));
         let Ok(uuid) = parse_uuid(data_store_id) else {
             return;
         };
@@ -1308,6 +1310,13 @@ fn round_bottom_corners(view: &NSView) {
 }
 
 fn data_store(id: &str, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebsiteDataStore>> {
+    // Must match `browser_core::PRIVATE_STORE_PREFIX`; this crate does not depend on browser-core.
+    if id.starts_with("private-") {
+        // One in-memory store per private profile, so its tabs share cookies; dropped with the profile.
+        return Ok(PRIVATE_STORES.with_borrow_mut(|stores| {
+            stores.entry(id.to_string()).or_insert_with(|| unsafe { WKWebsiteDataStore::nonPersistentDataStore(mtm) }).clone()
+        }));
+    }
     let uuid = parse_uuid(id)?;
     Ok(unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm) })
 }

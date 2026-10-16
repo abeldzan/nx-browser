@@ -12,7 +12,7 @@ pub use metrics::{sample_cpu_seconds, snapshot, MetricsSnapshot};
 pub use model::{
     Bookmark, BundleBookmark, BundleHistory, BundlePermission, BundleProfile,
     BundleTab, DownloadRecord, Effect, ExtensionRecord, HistoryEntry, Model, Profile, ProfileBundle,
-    Session, Tab,
+    Session, Tab, PRIVATE_STORE_PREFIX,
 };
 pub use settings::{Settings, SEARCH_ENGINES};
 pub use calc::calc;

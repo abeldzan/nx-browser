@@ -54,6 +54,7 @@ pub(crate) enum Run {
     CloseOthers,
     CloseAll,
     NewSpace,
+    NewPrivate,
     Pref(fn(&mut Settings)),
     Tab(String),
     Closed(String),
@@ -227,6 +228,7 @@ impl BrowserWindow {
                 ("Close other tabs", Run::CloseOthers),
                 ("Close all tabs", Run::CloseAll),
                 ("New space", Run::NewSpace),
+                ("New private profile", Run::NewPrivate),
                 ("Show downloads", Run::Downloads),
                 ("Manage extensions", Run::Extensions),
             ] {
@@ -343,6 +345,7 @@ impl BrowserWindow {
                 self.close_tabs(all, cx);
             }
             Run::NewSpace => self.with_model(|model| { let _ = model.create_session(); }),
+            Run::NewPrivate => self.with_model(|model| { let _ = model.create_private_profile(); }),
             Run::Pref(change) => self.set_pref(cx, change),
             Run::Tab(id) => self.focus_window(&id, cx),
             Run::Closed(url) => match self.with_model(|model| model.reopen_closed_url(Some(&url))) {

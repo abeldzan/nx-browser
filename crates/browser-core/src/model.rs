@@ -22,6 +22,15 @@ pub struct Profile {
     pub color: String,
 }
 
+/// Data store ids with this prefix are in-memory WebKit stores: nothing reaches disk and the profile is purged at launch.
+pub const PRIVATE_STORE_PREFIX: &str = "private-";
+
+impl Profile {
+    pub fn is_private(&self) -> bool {
+        self.data_store_id.starts_with(PRIVATE_STORE_PREFIX)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Session {
     pub id: String,
@@ -211,6 +220,16 @@ impl Model {
             suggest_memo: RefCell::new(None),
         };
         model.reload()?;
+        // A private profile left by the last run (quit or crash) has nothing worth keeping.
+        let leftover: Vec<String> = model.profiles.iter().filter(|p| p.is_private()).map(|p| p.id.clone()).collect();
+        for id in &leftover {
+            model.purge_profile_rows(id)?;
+        }
+        if !leftover.is_empty() {
+            model.active_profile_id.clear();
+            model.active_session_id.clear();
+            model.reload()?;
+        }
         if model.profiles.is_empty() {
             model.create_profile("Personal")?;
         }
@@ -264,8 +283,16 @@ impl Model {
     }
 
     pub fn create_profile(&mut self, name: &str) -> anyhow::Result<String> {
+        self.insert_new_profile(name, Uuid::new_v4().to_string(), "")
+    }
+
+    /// A profile whose cookies and site data live only in memory and that keeps no history.
+    pub fn create_private_profile(&mut self) -> anyhow::Result<String> {
+        self.insert_new_profile("Private", format!("{PRIVATE_STORE_PREFIX}{}", Uuid::new_v4()), "🕶️")
+    }
+
+    fn insert_new_profile(&mut self, name: &str, data_store_id: String, icon: &str) -> anyhow::Result<String> {
         let id = Uuid::new_v4().to_string();
-        let data_store_id = Uuid::new_v4().to_string();
         let storage_path = crate::app_support_dir().join("profiles").join(&id);
         std::fs::create_dir_all(&storage_path)?;
         let profile = Profile {
@@ -274,7 +301,7 @@ impl Model {
             storage_path,
             data_store_id,
             created_at: now_secs(),
-            icon: String::new(),
+            icon: icon.to_string(),
             color: String::new(),
         };
         self.insert_profile(&profile)?;
@@ -373,16 +400,13 @@ impl Model {
         for tab_id in tab_ids {
             self.effects.push(Effect::CloseTab { tab_id });
         }
-        let tx = self.storage.conn().unchecked_transaction()?;
-        self.storage.execute("DELETE FROM tabs WHERE session_id IN (SELECT id FROM sessions WHERE profile_id = ?1)", params![id])?;
+        self.purge_profile_rows(id)?;
+        self.reload()?;
         self.storage.execute("DELETE FROM sessions WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
         self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
-        self.storage.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", params![id])?;
-        tx.commit()?;
-        self.reload()?;
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
             self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
@@ -437,6 +461,19 @@ impl Model {
         self.save_active()?;
         self.reload()?;
         self.queue_show_active();
+        Ok(())
+    }
+
+    fn purge_profile_rows(&self, id: &str) -> anyhow::Result<()> {
+        let tx = self.storage.conn().unchecked_transaction()?;
+        self.storage.execute("DELETE FROM tabs WHERE session_id IN (SELECT id FROM sessions WHERE profile_id = ?1)", params![id])?;
+        self.storage.execute("DELETE FROM sessions WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -685,7 +722,9 @@ impl Model {
                         "UPDATE history SET title = ?1 WHERE id = (SELECT MAX(id) FROM history WHERE profile_id = ?2 AND url = ?3)",
                         params![title, profile_id, url],
                     )?;
-                } else if self.settings.save_history && (url.starts_with("http://") || url.starts_with("https://")) {
+                } else if self.settings.save_history
+                    && !self.profiles.iter().any(|p| p.id == profile_id && p.is_private())
+                    && (url.starts_with("http://") || url.starts_with("https://")) {
                     self.storage.execute(
                         "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, ?3, ?4)",
                         params![profile_id, url, title, now_secs()],
@@ -1372,6 +1411,23 @@ mod tests {
         assert!(loaded.profiles.iter().any(|profile| profile.id == profile_id));
         loaded.switch_profile(&profile_id).unwrap();
         assert_eq!(loaded.active_tab().unwrap().url, url);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn private_profile_keeps_no_history_and_is_gone_after_relaunch() {
+        let path = std::env::temp_dir().join(format!("nxbrowser-test-{}.sqlite", Uuid::new_v4()));
+        let mut disk = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let id = disk.create_private_profile().unwrap();
+        assert!(disk.active_profile().unwrap().is_private());
+        let tab = disk.create_tab("https://example.com/").unwrap();
+        disk.note_navigation(&tab, "https://example.org/", "Example").unwrap();
+        assert!(disk.history().unwrap().is_empty());
+        drop(disk);
+        let loaded = Model::open(Storage::open(&path).unwrap()).unwrap();
+        assert!(loaded.profiles.iter().all(|profile| profile.id != id));
+        assert!(!loaded.active_profile().unwrap().is_private());
+        assert!(loaded.active_tab().is_some());
         let _ = std::fs::remove_file(path);
     }
 
