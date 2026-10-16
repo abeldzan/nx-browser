@@ -140,8 +140,6 @@ pub struct BrowserWindow {
     /// Tabs a page opened (popup → opener). An opener stays live while its popup is in front:
     /// suspending it would drop the page an OAuth popup reports back to.
     openers: HashMap<String, String>,
-    /// Hides the title bar, profile rail and dock so only pages show (Orion/Zen focus mode).
-    focus_mode: bool,
     started: Instant,
     metrics: SharedString,
     self_test: Option<SelfTest>,
@@ -468,7 +466,6 @@ impl BrowserWindow {
             loading: false,
             playing: HashSet::new(),
             openers: HashMap::new(),
-            focus_mode: false,
             started,
             metrics: "Measuring…".into(),
             self_test: self_test.then(|| SelfTest {
@@ -845,10 +842,6 @@ impl BrowserWindow {
                 if let Some(id) = self.active_tab_id().filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.peek)) {
                     self.close_tabs(vec![id], cx);
                 }
-            }
-            Shortcut::FocusMode => {
-                self.focus_mode = !self.focus_mode;
-                self.status = if self.focus_mode { "Focus mode: ⌘⇧F to exit" } else { "Focus mode off" }.into();
             }
             Shortcut::TileWindows => {
                 let session = self.model.lock().active_session_id.clone();
@@ -1867,13 +1860,13 @@ impl Render for BrowserWindow {
                     }
                 });
             }))
-            .when(!self.focus_mode, |root| root.child(self.titlebar(&sessions, &all_tabs, &active_session, cx)))
+            .child(self.titlebar(&sessions, &all_tabs, &active_session, cx))
             .child(
                 h_stack()
                     .flex_1()
                     .min_h(px(0.))
                     .w_full()
-                    .when(self.model.detached.is_none() && !self.focus_mode, |row| row.child(self.rail(&profiles, &active_profile, cx)))
+                    .when(self.model.detached.is_none(), |row| row.child(self.rail(&profiles, &active_profile, cx)))
                     .child(
                 v_stack()
                     .relative()
@@ -1893,7 +1886,7 @@ impl Render for BrowserWindow {
                     }),
             ),
             )
-            .when(!self.tab_window && !self.focus_mode, |root| root.child(self.dock(&tabs, cx)))
+            .when(!self.tab_window, |root| root.child(self.dock(&tabs, cx)))
             .children(self.carried_view(&tabs, cx))
             .children(self.tab_drag_view(cx))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
@@ -3262,7 +3255,8 @@ impl BrowserWindow {
                                     })),
                             ),
                     )
-                    .child(div().min_w(px(0.)).truncate().child(self.tab_title(tab))),
+                    .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url)))
+                    .children(self.audio_button(tab, cx)),
             );
         }
         row
@@ -4260,20 +4254,37 @@ impl BrowserWindow {
                 .text_color(paint.fg)
                 .child(measure_overlay(8.0, cx))
                 .child(favicon(tab, false))
-                .child(div().min_w(px(0.)).truncate().child(self.tab_title(tab))),
+                .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
         )
     }
 
-    /// The tab's label, led by a speaker while it plays sound or is muted.
-    fn tab_title(&self, tab: &browser_core::Tab) -> String {
-        let label = tab_label(&tab.title, &tab.url);
-        if self.engine.is_muted(&tab.id) {
-            format!("🔇 {label}")
-        } else if self.playing.contains(&tab.id) {
-            format!("🔊 {label}")
-        } else {
-            label
+    /// A speaker after the title while the tab plays sound or is muted; clicking it toggles mute.
+    fn audio_button(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let muted = self.engine.is_muted(&tab.id);
+        if !muted && !self.playing.contains(&tab.id) {
+            return None;
         }
+        let paint = paint(cx);
+        let id = tab.id.clone();
+        let icon = if muted { Icons::speaker_off() } else { Icons::speaker_loud() };
+        Some(
+            div()
+                .id(SharedString::from(format!("ctab-audio-{id}")))
+                .flex_none()
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .hover(|style| style.bg(paint.border))
+                .child(icon.size(px(12.)).text_color(paint.fg))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    let mute = !this.engine.is_muted(&id);
+                    this.engine.set_muted(&id, mute);
+                    cx.notify();
+                })),
+        )
     }
 
     /// The window a tab belongs to; a tab never added to another window is its own.

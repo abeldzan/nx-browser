@@ -122,7 +122,6 @@ pub enum Shortcut {
     NewTerminal,
     /// Re-splits the space's windows among the stage; palette and dock only, no key.
     TileWindows,
-    FocusMode,
     /// Escape; the page still gets the key.
     Dismiss,
 }

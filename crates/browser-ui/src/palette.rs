@@ -21,7 +21,7 @@ const SCOPES: [(&str, &str, &str); 5] = [
     ("@spaces", "", "Spaces"),
 ];
 
-const ACTIONS: [(&str, &str, Shortcut); 21] = [
+const ACTIONS: [(&str, &str, Shortcut); 20] = [
     ("New tab", "⌘T", Shortcut::NewTab),
     ("New terminal", "⌥⌘T", Shortcut::NewTerminal),
     ("Close tab", "⌘W", Shortcut::CloseTab),
@@ -42,7 +42,6 @@ const ACTIONS: [(&str, &str, Shortcut); 21] = [
     ("Focus address bar", "⌘L", Shortcut::FocusUrl),
     ("Go to last tab", "⌘9", Shortcut::SelectTab(9)),
     ("Tile windows", "", Shortcut::TileWindows),
-    ("Toggle focus mode", "⌘⇧F", Shortcut::FocusMode),
 ];
 
 #[derive(Clone)]
@@ -231,7 +230,7 @@ impl BrowserWindow {
                 ("Close all tabs", Run::CloseAll),
                 ("New space", Run::NewSpace),
                 ("New private profile", Run::NewPrivate),
-                (if self.active_tab_id().is_some_and(|id| self.engine.is_muted(&id)) { "Unmute tab" } else { "Mute tab" }, Run::ToggleMute),
+                (if model.active_tab().is_some_and(|tab| self.engine.is_muted(&tab.id)) { "Unmute tab" } else { "Mute tab" }, Run::ToggleMute),
                 ("Show downloads", Run::Downloads),
                 ("Manage extensions", Run::Extensions),
             ] {

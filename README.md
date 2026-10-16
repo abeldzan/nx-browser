@@ -43,7 +43,6 @@ Passkeys do not work. WebAuthn in WKWebView needs Apple's `com.apple.developer.w
 | Cmd+[ / Cmd+] | Back / forward |
 | Cmd+F | Find in page |
 | Cmd+D | Bookmark |
-| Cmd+Shift+F | Focus mode (hide browser chrome) |
 | Option+click a link | Peek: preview in a floating window (Esc closes) |
 
 Pages are inspectable from Safari’s Develop menu. Links that ask for a new window open as a new tab in this process.

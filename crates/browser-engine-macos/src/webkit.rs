@@ -27,7 +27,7 @@ use objc2_web_kit::{
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
     WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
-    WKAudiovisualMediaTypes, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKFullscreenState, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
 };
 use uuid::Uuid;
 
@@ -819,7 +819,8 @@ impl MacEngine {
 
     /// Orders live page views back to front, directly below the GPUI chrome view.
     pub fn stack_tabs(&mut self, ids: &[String]) {
-        if self.stacked == ids {
+        // Restacking re-adds views to our window, which would pull a fullscreen page out of WebKit's.
+        if self.stacked == ids || self.tabs.values().any(|live| in_fullscreen(&live.view)) {
             return;
         }
         self.stacked = ids.to_vec();
@@ -948,7 +949,7 @@ impl WebEngine for MacEngine {
 
     fn show_tab(&mut self, tab_id: Option<&str>) {
         let mut inserted = false;
-        for (id, live) in &self.tabs {
+        for (id, live) in self.tabs.iter().filter(|(_, live)| !in_fullscreen(&live.view)) {
             let visible = Some(id.as_str()) == tab_id;
             live.view.setHidden(!visible);
             if visible && unsafe { live.view.superview() }.is_none() {
@@ -964,7 +965,7 @@ impl WebEngine for MacEngine {
     }
 
     fn place_tab(&mut self, tab_id: &str, bounds: Option<LogicalRect>) {
-        let Some(live) = self.tabs.get(tab_id) else {
+        let Some(live) = self.tabs.get(tab_id).filter(|live| !in_fullscreen(&live.view)) else {
             return;
         };
         let Some(bounds) = bounds else {
@@ -1178,7 +1179,7 @@ impl MacEngine {
         let Some(tab_id) = &self.visible else {
             return;
         };
-        let Some(live) = self.tabs.get(tab_id) else {
+        let Some(live) = self.tabs.get(tab_id).filter(|live| !in_fullscreen(&live.view)) else {
             return;
         };
         let height = content.bounds().size.height;
@@ -1425,6 +1426,11 @@ fn round_bottom_corners(view: &NSView) {
     layer.setMasksToBounds(true);
 }
 
+/// While WebKit runs element fullscreen it owns the view (in its own window); our layout must not move, hide or reparent it.
+fn in_fullscreen(view: &WKWebView) -> bool {
+    (unsafe { view.fullscreenState() }) != WKFullscreenState::NotInFullscreen
+}
+
 fn data_store(id: &str, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebsiteDataStore>> {
     // Must match `browser_core::PRIVATE_STORE_PREFIX`; this crate does not depend on browser-core.
     if id.starts_with("private-") {
@@ -1466,10 +1472,6 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
                 // A focused page gets these first; the key script reports them back if it ignores them.
                 if key == "i" && flags.contains(NSEventModifierFlags::Option) {
                     let _ = events.send(EngineEvent::Shortcut(Shortcut::Inspect));
-                    return std::ptr::null_mut();
-                }
-                if key == "f" && shift {
-                    let _ = events.send(EngineEvent::Shortcut(Shortcut::FocusMode));
                     return std::ptr::null_mut();
                 }
                 if key == "t" && flags.contains(NSEventModifierFlags::Option) {

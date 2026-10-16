@@ -79,7 +79,6 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 - [x] HTML5 element fullscreen (video players)
 - [x] Private profiles (palette: New private profile): in-memory WebKit store, no history, purged at launch; extensions don't run there
 - [x] Mute tab (palette) and a speaker on tabs playing sound (private `_setPageMuted:` / `_isPlayingAudio`)
-- [x] Focus mode (⌘⇧F) hides the title bar, profile rail and dock
 - [x] Built-in ad/tracker blocking: WebKit content rules from Peter Lowe's list (`scripts/update-blocklist.sh`), third-party requests only; network blocking, no cosmetic filtering
 - [x] Peek: ⌥-click a link opens a floating preview; Esc closes it, the window button keeps it
 
