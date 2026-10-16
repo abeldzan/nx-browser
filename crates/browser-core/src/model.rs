@@ -26,6 +26,8 @@ pub struct Session {
     pub profile_id: String,
     pub name: String,
     pub active: bool,
+    /// Windows float where they are put instead of tiling the stage.
+    pub free: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +419,12 @@ impl Model {
             return Ok(());
         }
         self.storage.execute("UPDATE sessions SET name = ?1 WHERE id = ?2", params![name, session_id])?;
+        self.reload()?;
+        Ok(())
+    }
+
+    pub fn set_session_free(&mut self, session_id: &str, free: bool) -> anyhow::Result<()> {
+        self.storage.execute("UPDATE sessions SET free = ?1 WHERE id = ?2", params![free as i32, session_id])?;
         self.reload()?;
         Ok(())
     }
@@ -1254,13 +1262,14 @@ fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
 fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
     let mut stmt = storage
         .conn()
-        .prepare("SELECT id, profile_id, name, active FROM sessions")?;
+        .prepare("SELECT id, profile_id, name, active, free FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         Ok(Session {
             id: row.get(0)?,
             profile_id: row.get(1)?,
             name: row.get(2)?,
             active: row.get::<_, i32>(3)? != 0,
+            free: row.get::<_, i32>(4)? != 0,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

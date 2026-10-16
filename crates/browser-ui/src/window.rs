@@ -1,3 +1,5 @@
+mod tiling;
+
 use crate::profiles::profile_label;
 use crate::settings::SettingsSection;
 use crate::sidebar::SidebarPage;
@@ -25,6 +27,7 @@ use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
+use tiling::{cell, move_border, set_span, span, uncell, Side, Tile};
 use gpuikit::input::{bindings, InputState, InputStateEvent, SubmitOn};
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
@@ -43,6 +46,10 @@ pub struct BrowserWindow {
     pub(crate) model: WindowModel,
     /// Space chip being dragged, so a release outside the window can open it in its own.
     space_drag: Option<String>,
+    /// Held during a window drag when nothing else has GPUI focus: modifier changes only travel the focus path.
+    gesture_focus: FocusHandle,
+    /// Each space's tiled windows, keyed by window group, as a split tree laid out over the stage.
+    tiles: HashMap<String, Tile>,
     /// Holds one torn-off window instead of a space: its tabs take the spaces' place in the title bar.
     tab_window: bool,
     /// A torn-off window's last tab closed; the window goes on the next render.
@@ -385,6 +392,8 @@ impl BrowserWindow {
         let mut view = Self {
             model: WindowModel { shared: model, detached },
             space_drag: None,
+            gesture_focus: cx.focus_handle(),
+            tiles: HashMap::new(),
             tab_window,
             close_window: false,
             engine: MacEngine::new(extensions),
@@ -811,6 +820,13 @@ impl BrowserWindow {
                 }
             }
             Shortcut::CommandPalette => self.open_palette(cx),
+            Shortcut::TileWindows => {
+                let session = self.model.lock().active_session_id.clone();
+                if self.free_space() {
+                    self.with_model(|model| { let _ = model.set_session_free(&session, false); });
+                }
+                self.retile = true;
+            }
             Shortcut::Inspect => match self.active_tab_id() {
                 Some(_) if !self.model.lock().settings.inspector => self.status = "Turn on Web Inspector in Settings".into(),
                 Some(id) => self.engine.inspect(&id),
@@ -1118,10 +1134,6 @@ impl BrowserWindow {
                 .filter(open)
                 .find(|id| self.is_front(id) && !self.chrome.get(*id).is_some_and(|chrome| chrome.minimized))
                 .cloned()
-        });
-        self.retile |= ids.iter().any(|id| {
-            let group = self.group_id(id);
-            current.iter().filter(|other| self.group_id(other) == group).all(|other| ids.contains(other))
         });
         if self.model.detached.is_some() && current.iter().all(|id| ids.contains(id)) {
             self.close_window = true;
@@ -1789,6 +1801,13 @@ impl Render for BrowserWindow {
             .relative()
             .size_full()
             .bg(colors.bg)
+            // Shift pressed or released without moving still shows or drops the swap at once.
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                if let Some((x, y)) = this.gesture.as_ref().map(|gesture| gesture.pointer) {
+                    this.track_gesture(gpui::point(px(x), px(y)), event.modifiers.shift, window, cx);
+                }
+            }))
+            .child(div().absolute().track_focus(&self.gesture_focus))
             .text_color(colors.fg)
             .text_size(px(13.))
             // Inputs only ask for keys on a GPUI focus change; clicking one that already had GPUI focus while a page
@@ -2102,6 +2121,8 @@ impl BrowserWindow {
                         // Snapped windows keep their share of the stage, including splits the user dragged.
                         entry.frame = Some(match (old, entry.frame) {
                             (Some((ow, oh)), Some(frame)) => rescale_snapped(frame, ow as f32, oh as f32, sw, sh),
+                            // First layout of this run: seeded frames were already fitted to this stage.
+                            (None, Some(frame)) => frame,
                             _ => snap.frame(sw, sh),
                         });
                     }
@@ -2111,44 +2132,181 @@ impl BrowserWindow {
                 }
             }
         }
-        let mut fresh = false;
+        let session = self.model.lock().active_session_id.clone();
+        let free = self.free_space();
+        // New windows open beside the window used last: tiled, they split it; free, they open a step down from it.
+        let mut anchor = self
+            .order
+            .iter()
+            .rev()
+            .filter(|id| tabs.iter().any(|tab| tab.id == **id))
+            .find_map(|id| self.chrome.get(id).filter(|entry| !entry.minimized && entry.panel.is_none())?.frame);
         for tab in tabs {
             if !self.order.iter().any(|id| id == &tab.id) {
                 self.order.push(tab.id.clone());
             }
             let entry = self.chrome.entry(tab.id.clone()).or_default();
-            if entry.frame.is_some() {
+            if free && entry.snap == Some(Snap::Tiled) {
+                // Free space: tiled windows (switched over, or carried in from a tiled space) float where they are.
+                entry.snap = None;
+            }
+            if entry.frame.is_some() || entry.panel.is_some() || entry.snap.is_some() {
                 continue;
             }
-            fresh = true;
+            if free {
+                let frame = match anchor {
+                    Some(last) => {
+                        let (w, h) = (last.w.min(sw * 0.8), last.h.min(sh * 0.8));
+                        let next = Frame { x: last.x + CASCADE, y: last.y + CASCADE, w, h };
+                        // Past the stage's edge the cascade starts again at its top left.
+                        if next.x + w > sw - SNAP_INSET || next.y + h > sh - SNAP_INSET { Frame { x: SNAP_INSET, y: SNAP_INSET, w, h } } else { next }
+                    }
+                    None => Frame { x: sw * 0.15, y: sh * 0.1, w: sw * 0.7, h: sh * 0.8 },
+                };
+                entry.frame = Some(frame);
+                anchor = Some(frame);
+            } else {
+                entry.snap = Some(Snap::Tiled);
+            }
             if self.layout_stage.is_some() && self.self_test.is_none() && !self.reduce_motion {
                 self.opened.insert(tab.id.clone(), Instant::now());
             }
         }
-        if !fresh && !self.retile {
-            return;
+        if std::mem::take(&mut self.retile) {
+            // Tile windows: every window on the stage joins, rebuilt from where each one is and how big.
+            let fronts = tabs.iter().filter(|tab| self.is_front(&tab.id)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
+            for id in fronts {
+                if let Some(entry) = self.chrome.get_mut(&id).filter(|entry| !entry.minimized && entry.panel.is_none()) {
+                    if entry.snap.is_none() && !entry.maximized {
+                        entry.restore = entry.frame;
+                    }
+                    (entry.snap, entry.maximized) = (Some(Snap::Tiled), false);
+                }
+            }
+            self.tiles.remove(&session);
         }
-        self.retile = false;
-        // Like a tiling window manager: a new or closed window re-splits the stage among all of them.
-        let mut windows = tabs
+        if free {
+            self.tiles.remove(&session);
+        } else if !self.tab_window {
+            self.sync_tiles(tabs, &session, sw, sh);
+        }
+    }
+
+    /// Whether the open space lets windows float instead of tiling them.
+    fn free_space(&self) -> bool {
+        let model = self.model.lock();
+        model.sessions.iter().any(|session| session.id == model.active_session_id && session.free)
+    }
+
+    /// Switches space `id` between tiling and free windows.
+    fn toggle_free(&mut self, id: &str, cx: &mut Context<Self>) {
+        let free = !self.model.lock().sessions.iter().any(|session| session.id == id && session.free);
+        self.with_model(|model| { let _ = model.set_session_free(id, free); });
+        // Into tiling, every window joins from where it is, as with Tile windows.
+        self.retile = !free;
+        cx.notify();
+    }
+
+    /// Brings this space's tile tree in line with its tiled windows, then lays their frames out from it:
+    /// windows gone from the tiling hand their space to their siblings, and new ones split the window used last.
+    fn sync_tiles(&mut self, tabs: &[browser_core::Tab], session: &str, sw: f32, sh: f32) {
+        // One leaf per window; a maximized one keeps its slot for when it comes back.
+        let members = tabs
             .iter()
-            .filter_map(|tab| Some((tab.id.clone(), self.chrome.get(&tab.id)?.clone())))
-            .filter(|(id, entry)| self.is_front(id) && !entry.minimized && entry.panel.is_none())
+            .filter(|tab| self.is_front(&tab.id))
+            .filter_map(|tab| {
+                let entry = self.chrome.get(&tab.id)?;
+                (entry.snap == Some(Snap::Tiled) && !entry.minimized && entry.panel.is_none()).then(|| (self.group_id(&tab.id), tab.id.clone(), entry.frame))
+            })
             .collect::<Vec<_>>();
-        // Keep the windows already on the stage in their reading order; new ones (no frame yet) go last, on the right.
-        windows.sort_by(|(_, a), (_, b)| match (a.frame, b.frame) {
-            (Some(a), Some(b)) => a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)),
-            (a, b) => a.is_none().cmp(&b.is_none()),
+        let rect = cell(Snap::Tiled.frame(sw, sh));
+        // After a restart the tree comes back from the frames it laid out before.
+        let mut tree = self.tiles.remove(session).or_else(|| {
+            Tile::infer(&members.iter().filter_map(|(group, _, frame)| Some((group.clone(), cell((*frame)?)))).collect::<Vec<_>>())
         });
-        let windows = windows.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-        for (id, frame) in windows.iter().zip(tile(windows.len(), sw, sh)) {
-            if let Some(entry) = self.chrome.get_mut(id) {
-                entry.frame = Some(frame);
-                entry.snap = Some(Snap::Tiled);
-                entry.restore = None;
-                entry.maximized = false;
+        for leaf in tree.as_ref().map(Tile::leaves).unwrap_or_default() {
+            if !members.iter().any(|(group, ..)| *group == leaf) {
+                tree = tree.and_then(|tree| tree.without(&leaf));
             }
         }
+        for (group, ..) in &members {
+            tree = Some(match tree {
+                Some(tree) if tree.contains(group) => tree,
+                Some(tree) => {
+                    let laid = tree.layout(rect);
+                    // The window raised last splits, along its longer side: right of it, or below it.
+                    let last = self.order.iter().rev().map(|id| self.group_id(id)).find(|other| tree.contains(other));
+                    match last.and_then(|last| laid.into_iter().find(|(leaf, _)| *leaf == last)) {
+                        Some((target, at)) => tree.insert(&target, group, if at.w >= at.h { Side::Right } else { Side::Bottom }),
+                        None => tree.beside(group, Side::Right),
+                    }
+                }
+                None => Tile::Leaf(group.clone()),
+            });
+        }
+        let Some(tree) = tree else {
+            return;
+        };
+        // The window being dragged follows the pointer; its slot waits for the drop.
+        let moving = self.gesture.as_ref().filter(|gesture| gesture.kind == GestureKind::Move).map(|gesture| self.group_id(&gesture.tab_id));
+        for (group, laid) in tree.layout(rect) {
+            if moving.as_ref() == Some(&group) {
+                continue;
+            }
+            if let Some((_, id, _)) = members.iter().find(|(member, ..)| *member == group) {
+                if let Some(entry) = self.chrome.get_mut(id) {
+                    entry.frame = Some(uncell(laid));
+                }
+            }
+        }
+        self.tiles.insert(session.to_string(), tree);
+    }
+
+    /// Where dropping a tiled window would leave the tiling: on another tile, beside it on the nearest side;
+    /// on a stage-edge snap zone, along that whole side. None for other drops, and for windows not tiled.
+    fn dropped_tiles(&self, gesture: &Gesture) -> Option<Tile> {
+        if gesture.kind != GestureKind::Move {
+            return None;
+        }
+        let session = self.model.lock().active_session_id.clone();
+        let tree = self.tiles.get(&session)?.clone();
+        let group = self.group_id(&gesture.tab_id);
+        if !tree.contains(&group) {
+            return None;
+        }
+        let rest = tree.without(&group);
+        match (gesture.snap, &gesture.insert) {
+            (Some(snap), _) if snap != Snap::Maximize => {
+                let side = if snap.place().0 < 0 { Side::Left } else { Side::Right };
+                Some(rest.map_or_else(|| Tile::Leaf(group.clone()), |rest| rest.beside(&group, side)))
+            }
+            (None, Some((target, side))) => Some(rest?.insert(target, &group, *side)),
+            _ => None,
+        }
+    }
+
+    /// The tiled window under stage point (x, y), other than `except`'s, and the side of it nearest the point.
+    fn tile_under(&self, x: f32, y: f32, except: &str) -> Option<(String, Side)> {
+        let session = self.model.lock().active_session_id.clone();
+        let tree = self.tiles.get(&session)?;
+        let (sw, sh) = self.layout_stage.map(|(w, h)| (w as f32, h as f32))?;
+        tree.layout(cell(Snap::Tiled.frame(sw, sh)))
+            .into_iter()
+            .find(|(group, laid)| group != except && x >= laid.x && x < laid.x + laid.w && y >= laid.y && y < laid.y + laid.h)
+            .map(|(group, laid)| (group, Side::nearest(laid, x, y)))
+    }
+
+    /// Windows snapped to the stage's halves and quarters, and their frames: the ones that share borders outside the tile tree.
+    fn snapped_windows(&self) -> Vec<(String, Frame)> {
+        let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        current
+            .into_iter()
+            .filter(|id| self.is_front(id))
+            .filter_map(|id| {
+                let entry = self.chrome.get(&id)?;
+                (entry.snap.is_some_and(|snap| snap != Snap::Tiled) && !entry.minimized && !entry.maximized && entry.panel.is_none()).then_some((id.clone(), entry.frame?))
+            })
+            .collect()
     }
 
     /// Writes changed window layouts to the tab rows so they survive restarts.
@@ -2224,16 +2382,7 @@ impl BrowserWindow {
             if phase != DispatchPhase::Capture {
                 return;
             }
-            let out = torn_off(window, event.position);
-            entity.update(cx, |view, cx| {
-                view.apply_gesture(event.position, event.modifiers.shift, cx);
-                let tears = view.model.detached.is_none();
-                // Out past the margin the window leaves on release, so it previews no snap or swap.
-                if let Some(gesture) = view.gesture.as_mut().filter(|gesture| out && tears && gesture.kind == GestureKind::Move) {
-                    gesture.snap = None;
-                    gesture.swap = None;
-                }
-            });
+            entity.update(cx, |view, cx| view.track_gesture(event.position, event.modifiers.shift, window, cx));
         });
         let entity = cx.entity();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
@@ -2242,8 +2391,20 @@ impl BrowserWindow {
             }
             // Released past the window's edge: the window leaves the app for an OS window of its own.
             let out = torn_off(window, event.position).then(|| window.bounds().origin + event.position);
-            entity.update(cx, |view, cx| view.finish_gesture(out, cx));
+            entity.update(cx, |view, cx| view.finish_gesture(out, window, cx));
         });
+    }
+
+    fn track_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, window: &Window, cx: &mut Context<Self>) {
+        let out = torn_off(window, position);
+        self.apply_gesture(position, shift, cx);
+        let tears = self.model.detached.is_none();
+        // Out past the margin the window leaves on release, so it previews no snap or swap.
+        if let Some(gesture) = self.gesture.as_mut().filter(|gesture| out && tears && gesture.kind == GestureKind::Move) {
+            gesture.snap = None;
+            gesture.swap = None;
+            gesture.insert = None;
+        }
     }
 
     fn apply_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
@@ -2307,6 +2468,25 @@ impl BrowserWindow {
                 }
             }
         }
+        if let GestureKind::Resize(edges) = gesture.kind {
+            if self.chrome.get(&gesture.tab_id).is_some_and(|entry| entry.snap == Some(Snap::Tiled)) {
+                // A tiled window's border is a split in its space's tree; moving it re-lays the tree on the next layout.
+                let session = self.model.lock().active_session_id.clone();
+                let rect = cell(Snap::Tiled.frame(sw, sh));
+                let to = cell(frame);
+                if let Some(tree) = self.tiles.get_mut(&session) {
+                    for (on, across, after) in [(edges.left, true, false), (edges.right, true, true), (edges.top, false, false), (edges.bottom, false, true)] {
+                        if on {
+                            let (lo, hi) = span(to, across);
+                            tree.set_divider(rect, &group, across, after, if after { hi } else { lo });
+                        }
+                    }
+                }
+                self.gesture = Some(gesture);
+                cx.notify();
+                return;
+            }
+        }
         match gesture.kind {
             GestureKind::Move => {
                 frame = magnet(frame, Edges { left: true, right: true, top: true, bottom: true }, &others, sw, sh);
@@ -2348,6 +2528,11 @@ impl BrowserWindow {
                         })
                         .cloned();
                 }
+                // Without Shift, a tiled window dropped on another tile goes beside it.
+                gesture.insert = None;
+                if !shift && gesture.snap.is_none() && !over_bar {
+                    gesture.insert = self.tile_under(x, y, &group);
+                }
             }
             GestureKind::Resize(edges) => {
                 frame = magnet(frame, edges, &others, sw, sh);
@@ -2361,12 +2546,20 @@ impl BrowserWindow {
             frame.y = frame.y.max(0.0);
         }
         if let GestureKind::Resize(edges) = gesture.kind {
-            let starts = gesture.partners.iter().map(|(_, start)| *start).collect::<Vec<_>>();
-            let (linked, followers) = link_resize(gesture.start, frame, edges, &starts);
-            frame = linked;
-            for ((id, _), follower) in gesture.partners.iter().zip(followers) {
-                if let (Some(follower), Some(entry)) = (follower, self.chrome.get_mut(id)) {
-                    entry.frame = Some(follower);
+            let mut cells = std::iter::once(gesture.start).chain(gesture.partners.iter().map(|(_, start)| *start)).map(cell).collect::<Vec<_>>();
+            let (from, to) = (cell(gesture.start), cell(frame));
+            for (on, x, lead) in [(edges.left, true, true), (edges.right, true, false), (edges.top, false, true), (edges.bottom, false, false)] {
+                let (line, at) = if lead { (span(from, x).0, span(to, x).0) } else { (span(from, x).1, span(to, x).1) };
+                // An edge bordering no tiled window, like one on the stage edge, just moves on its own.
+                if on && !move_border(&mut cells, 0, x, line, at) {
+                    let (lo, hi) = span(cells[0], x);
+                    set_span(&mut cells[0], x, if lead { (at, hi) } else { (lo, at) });
+                }
+            }
+            frame = uncell(cells[0]);
+            for ((id, _), laid) in gesture.partners.iter().zip(&cells[1..]) {
+                if let Some(entry) = self.chrome.get_mut(id) {
+                    entry.frame = Some(uncell(*laid));
                 }
             }
         }
@@ -2379,7 +2572,7 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn finish_gesture(&mut self, out: Option<gpui::Point<Pixels>>, cx: &mut Context<Self>) {
+    fn finish_gesture(&mut self, out: Option<gpui::Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         let carried = self.carried();
         let Some(gesture) = self.gesture.take() else {
             return;
@@ -2406,6 +2599,12 @@ impl BrowserWindow {
             self.landing = (!self.reduce_motion).then(|| (id, from, Instant::now()));
         }
         self.update_dock(cx);
+        let session = self.model.lock().active_session_id.clone();
+        let group = self.group_id(&gesture.tab_id);
+        let was_tiled = self.tiles.get(&session).is_some_and(|tree| tree.contains(&group));
+        if let Some(tree) = self.dropped_tiles(&gesture) {
+            self.tiles.insert(session.clone(), tree);
+        }
         if let (Some(target), Some((snap, frame, restore))) = (&gesture.swap, gesture.from) {
             if let Some(theirs) = self.chrome.get(target).cloned() {
                 if let Some(entry) = self.chrome.get_mut(target) {
@@ -2414,9 +2613,14 @@ impl BrowserWindow {
                 if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
                     (entry.snap, entry.frame, entry.restore) = (theirs.snap, theirs.frame, theirs.restore);
                 }
+                let theirs = self.group_id(target);
+                if let Some(tree) = self.tiles.get_mut(&session) {
+                    tree.swap(&group, &theirs);
+                }
             }
         }
-        if let (Some(snap), Some(stage)) = (gesture.snap, self.stage_bounds) {
+        // A tiled window dropped on an edge zone was rearranged above; it only maximizes from here.
+        if let (Some(snap), Some(stage)) = (gesture.snap.filter(|snap| !was_tiled || *snap == Snap::Maximize), self.stage_bounds) {
             let (sw, sh) = (f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
             // The size the window had when the drag began is what dragging it out of the snap brings back.
             if snap == Snap::Maximize {
@@ -2428,7 +2632,8 @@ impl BrowserWindow {
             if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
                 if snap == Snap::Maximize {
                     entry.maximized = true;
-                    entry.snap = None;
+                    // A maximized tile keeps its slot to come back to.
+                    entry.snap = was_tiled.then_some(Snap::Tiled);
                     entry.restore = None;
                     entry.frame = Some(gesture.start);
                 } else {
@@ -2438,6 +2643,11 @@ impl BrowserWindow {
                 }
             }
         }
+        // The press gave keys to the chrome for the drag; hand them back to the window's page or terminal.
+        if self.gesture_focus.is_focused(window) {
+            window.blur();
+        }
+        self.focus_active_content();
         cx.notify();
     }
 
@@ -2529,7 +2739,7 @@ impl BrowserWindow {
         self.engine.set_grab_zones(&grab_zones(&stack, &resizable));
     }
 
-    fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         if self.suppress_window_drag {
             self.suppress_window_drag = false;
             return;
@@ -2547,7 +2757,8 @@ impl BrowserWindow {
             return;
         };
         // A maximized window keeps its floating frame; a snapped one keeps it in `restore`.
-        let restore = self.chrome.get(id).and_then(|entry| if entry.maximized { entry.frame } else { entry.restore });
+        // A tiled window keeps its size while dragged: it is rearranged, not floated.
+        let restore = self.chrome.get(id).and_then(|entry| if entry.maximized { entry.frame } else if entry.snap == Some(Snap::Tiled) { None } else { entry.restore });
         let from = self.chrome.get(id).filter(|entry| !entry.maximized).and_then(|entry| Some((entry.snap?, start, entry.restore)));
         self.gesture = Some(Gesture {
             tab_id: id.to_string(),
@@ -2561,8 +2772,12 @@ impl BrowserWindow {
             pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
             from,
             swap: None,
+            insert: None,
         });
         self.engine.focus_chrome();
+        if window.focused(cx).is_none() {
+            window.focus(&self.gesture_focus, cx);
+        }
         cx.notify();
     }
 
@@ -2571,21 +2786,16 @@ impl BrowserWindow {
         let Some(start) = self.visual_frame(id) else {
             return;
         };
-        let snapped = self.chrome.get(id).is_some_and(|entry| entry.snap.is_some());
+        let snapped = self.chrome.get(id).is_some_and(|entry| entry.snap.is_some_and(|snap| snap != Snap::Tiled));
         if let Some(entry) = self.chrome.get_mut(id) {
             entry.maximized = false;
             entry.frame = Some(start);
         }
-        // Snapped neighbours share borders with a snapped window, so they resize along with it.
-        let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        // Windows snapped to halves and quarters share borders: the ones across a dragged border make room.
+        // Tiled windows need none of this; their tree moves the border.
         let partners = if snapped {
-            self.chrome
-                .iter()
-                .filter(|(other, entry)| current.contains(other) && self.group_id(other) != self.group_id(id) && entry.snap.is_some() && !entry.minimized && !entry.maximized)
-                .filter_map(|(other, entry)| Some((other.clone(), entry.frame?)))
-                // Only neighbours on a dragged border follow it; the rest stay magnetic.
-                .filter(|(_, frame)| shared_edges(start, edges, frame) != Edges { left: false, right: false, top: false, bottom: false })
-                .collect()
+            let group = self.group_id(id);
+            self.snapped_windows().into_iter().filter(|(other, _)| self.group_id(other) != group).collect()
         } else {
             Vec::new()
         };
@@ -2600,6 +2810,7 @@ impl BrowserWindow {
             partners,
             from: None,
             swap: None,
+            insert: None,
             pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
         });
         self.engine.focus_chrome();
@@ -2678,6 +2889,12 @@ impl BrowserWindow {
     /// Where releasing the drag would put the dragged window: its snap target, or the snapped window it would swap with.
     fn drop_preview(&self) -> Option<(String, Frame)> {
         let gesture = self.gesture.as_ref()?;
+        if let Some(tree) = self.dropped_tiles(gesture) {
+            let (sw, sh) = self.layout_stage.map(|(w, h)| (w as f32, h as f32))?;
+            let group = self.group_id(&gesture.tab_id);
+            let (_, laid) = tree.layout(cell(Snap::Tiled.frame(sw, sh))).into_iter().find(|(leaf, _)| *leaf == group)?;
+            return Some((gesture.tab_id.clone(), uncell(laid)));
+        }
         let frame = match (gesture.snap, &gesture.swap) {
             (Some(snap), _) => {
                 let stage = self.stage_bounds?;
@@ -2765,16 +2982,12 @@ impl BrowserWindow {
             shell.left(px(GRIP_OUT)).top(px(GRIP_OUT)).right(px(GRIP_OUT)).bottom(px(GRIP_OUT))
         };
         let target = tab.id.clone();
-        let own = members.iter().map(|member| member.id.clone()).collect::<Vec<_>>();
         let mut body = div().relative().size_full().child(
             v_stack()
                 .id(SharedString::from(format!("window-{}", tab.id)))
                 .size_full()
                 .when(!self.tab_window, |column| {
                     column.rounded(px(WINDOW_RADIUS as f32)).border_1().border_color(if active { accent } else { paint.border })
-                })
-                .drag_over::<TabDrag>(move |style, drag, _, _| {
-                    if own.contains(&drag.0.id) { style } else { style.border_color(accent).bg(accent.opacity(0.12)) }
                 })
                 .on_drop(cx.listener(move |this, drag: &TabDrag, window, cx| this.drop_tab_on(&drag.0.id, &target, window.mouse_position(), cx)))
                 .shadow_md()
@@ -2874,8 +3087,8 @@ impl BrowserWindow {
         let nav = self.nav_controls(&tab.id, cx);
         let tools = self.window_tools(&tab.id, cx);
         let new_tab_id = tab.id.clone();
-        let new_tab = self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
-            this.new_tab_in(&new_tab_id, None, cx);
+        let new_tab = self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, event, cx| {
+            this.click_new_tab(&new_tab_id, event.modifiers().shift, cx);
         });
         let bar = (tab.active && self.load_bar > 0.0).then(|| {
             let fade = self.load_done.map_or(1.0, |at| 1.0 - (at.elapsed().as_secs_f32() / LOAD_FADE.as_secs_f32()).min(1.0));
@@ -2892,8 +3105,8 @@ impl BrowserWindow {
                 .border_b_1()
                 .border_color(paint.border)
                 .cursor(CursorStyle::OpenHand)
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.begin_move(&id, event.position, cx);
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.begin_move(&id, event.position, window, cx);
                 }))
                 // Buttons keep their size; the tabs shrink, and the empty space either side drags the window.
                 .child(self.hit_guard(format!("nav-guard-{}", tab.id), nav, cx).flex_none())
@@ -3013,7 +3226,7 @@ impl BrowserWindow {
         let paint = paint(cx);
         let meta = self.ext_meta.get(ext).cloned().unwrap_or_default();
         let (move_id, close_id) = (tab_id.to_string(), tab_id.to_string());
-        let close = self.tool_button(format!("close-{tab_id}"), Icons::cross_2(), false, cx, move |this, cx| {
+        let close = self.tool_button(format!("close-{tab_id}"), Icons::cross_2(), false, cx, move |this, _, cx| {
             this.close_tabs(vec![close_id.clone()], cx);
         });
         div().child(
@@ -3027,8 +3240,8 @@ impl BrowserWindow {
                 .border_b_1()
                 .border_color(paint.border)
                 .cursor(CursorStyle::OpenHand)
-                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.begin_move(&move_id, event.position, cx);
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.begin_move(&move_id, event.position, window, cx);
                 }))
                 .child(extension_icon(&meta.name, meta.icon.clone(), 16.))
                 .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.)).child(meta.name.clone()))
@@ -3121,11 +3334,11 @@ impl BrowserWindow {
         h_stack()
             .items_center()
             .gap(px(2.))
-            .child(self.tool_button(format!("back-{back_id}"), Icons::arrow_left(), true, cx, move |this, cx| {
+            .child(self.tool_button(format!("back-{back_id}"), Icons::arrow_left(), true, cx, move |this, _, cx| {
                 this.focus_window(&back_id, cx);
                 this.back();
             }))
-            .child(self.tool_button(format!("forward-{forward_id}"), Icons::arrow_right(), true, cx, move |this, cx| {
+            .child(self.tool_button(format!("forward-{forward_id}"), Icons::arrow_right(), true, cx, move |this, _, cx| {
                 this.focus_window(&forward_id, cx);
                 this.forward();
             }))
@@ -3142,22 +3355,22 @@ impl BrowserWindow {
         h_stack()
             .items_center()
             .gap(px(2.))
-            .child(self.tool_button(format!("reload-{reload_id}"), Icons::reload(), false, cx, move |this, cx| {
+            .child(self.tool_button(format!("reload-{reload_id}"), Icons::reload(), false, cx, move |this, _, cx| {
                 this.focus_window(&reload_id, cx);
                 this.reload();
             }))
-            .child(self.tool_button(format!("bookmark-{bookmark_id}"), Icons::star(), false, cx, move |this, cx| {
+            .child(self.tool_button(format!("bookmark-{bookmark_id}"), Icons::star(), false, cx, move |this, _, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
-            .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, cx| {
+            .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, _, cx| {
                 let entry = this.chrome.entry(min_id.clone()).or_default();
                 entry.minimized = true;
                 entry.maximized = false;
                 cx.notify();
             }))
-            .child(self.tool_button(format!("zoom-{zoom_id}"), zoom_icon, false, cx, move |this, cx| {
+            .child(self.tool_button(format!("zoom-{zoom_id}"), zoom_icon, false, cx, move |this, _, cx| {
                 let next = !maximized;
                 for chrome in this.chrome.values_mut() {
                     chrome.maximized = false;
@@ -3167,7 +3380,7 @@ impl BrowserWindow {
                 entry.minimized = false;
                 this.focus_window(&zoom_id, cx);
             }))
-            .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, cx| {
+            .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, _, cx| {
                 let group = this.group_id(&close_id);
                 let members = this.chrome.keys().filter(|id| this.group_id(id) == group).cloned().collect::<Vec<_>>();
                 this.close_tabs(members, cx);
@@ -3180,13 +3393,13 @@ impl BrowserWindow {
         icon: gpui::Svg,
         prominent: bool,
         cx: &mut Context<Self>,
-        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        action: impl Fn(&mut Self, &ClickEvent, &mut Context<Self>) + 'static,
     ) -> gpuikit::elements::icon_button::IconButton {
         // Sized to the title bar so the bar sets the height, not its buttons.
         let size = self.pill_h();
         let icon_size = if prominent { size * 0.75 } else { size * 0.65 };
         let button = icon_button(id, icon).box_size(rems(size / 16.)).icon_size(rems(icon_size / 16.));
-        button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| action(this, cx)))
+        button.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| action(this, event, cx)))
     }
 
     fn titlebar(
@@ -3279,7 +3492,7 @@ impl BrowserWindow {
             );
         }
         if self.model.detached.is_none() {
-            spaces = spaces.child(self.tool_button("new-space".to_string(), Icons::plus(), false, cx, |this, cx| {
+            spaces = spaces.child(self.tool_button("new-space".to_string(), Icons::plus(), false, cx, |this, _, cx| {
                 this.with_model(|model| { let _ = model.create_session(); });
                 this.refresh_url(cx);
             }));
@@ -3421,14 +3634,25 @@ impl BrowserWindow {
                 tile("dock-new".into(), DOCK_NEW_W)
                     .hover(|style| style.bg(ink.opacity(0.08)))
                     .child(Icons::plus().size(px(14.)).text_color(ink.opacity(0.7)))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); });
-                        this.focus_address = true;
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        let shift = event.modifiers().shift;
+                        this.with_model(|model| { let _ = model.create_tab(&if shift { TERMINAL_URL.into() } else { model.settings.new_tab_url() }); });
+                        this.focus_address = !shift;
                         this.refresh_url(cx);
+                    })),
+            )
+            .child(
+                tile("dock-tile".into(), DOCK_NEW_W)
+                    .hover(|style| style.bg(ink.opacity(0.08)))
+                    // Tiles while the space auto-tiles; overlapping squares while its windows float freely.
+                    .child(if self.free_space() { Icons::stack() } else { Icons::layout() }.size(px(14.)).text_color(ink.opacity(0.7)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let session = this.model.lock().active_session_id.clone();
+                        this.toggle_free(&session, cx);
                     })),
             );
         // Every child has a fixed width, so the island opens to exactly fit its content.
-        let shelf_w = DOCK_PAD * 2.0 + count as f32 * (DOCK_ITEM_W + DOCK_GAP) + 1.0 + DOCK_GAP + DOCK_NEW_W;
+        let shelf_w = DOCK_PAD * 2.0 + count as f32 * (DOCK_ITEM_W + DOCK_GAP) + 1.0 + (DOCK_GAP + DOCK_NEW_W) * 2.0;
         let lerp = |a: f32, b: f32| a + (b - a) * p;
         let height = lerp(DOCK_REST_H, DOCK_OPEN_H);
         // A capsule at every size, like the island. No shadow: it would darken the chrome around it
@@ -3504,8 +3728,8 @@ impl BrowserWindow {
             return h_stack();
         };
         let new_tab_id = front.clone();
-        let new_tab = self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, cx| {
-            this.new_tab_in(&new_tab_id, None, cx);
+        let new_tab = self.tool_button(format!("new-tab-{new_tab_id}"), Icons::plus(), false, cx, move |this, event, cx| {
+            this.click_new_tab(&new_tab_id, event.modifiers().shift, cx);
         });
         h_stack()
             .flex_none()
@@ -3653,6 +3877,16 @@ impl BrowserWindow {
         self.focus_address = url.is_none();
     }
 
+    /// The + button: a new tab in the window holding `id`, or a terminal with Shift held.
+    fn click_new_tab(&mut self, id: &str, shift: bool, cx: &mut Context<Self>) {
+        if shift {
+            self.focus_window(id, cx);
+            self.on_shortcut(Shortcut::NewTerminal, cx);
+        } else {
+            self.new_tab_in(id, None, cx);
+        }
+    }
+
     /// Moves a tab into the window holding `target`, in front, sharing its frame.
     fn move_tab_to_window(&mut self, id: &str, target: &str, cx: &mut Context<Self>) {
         let group = self.group_id(target);
@@ -3677,8 +3911,16 @@ impl BrowserWindow {
         let x = f64::from(at.x - stage.origin.x) as f32 - 60.0;
         let y = f64::from(at.y - stage.origin.y) as f32 - TITLEBAR_H / 2.0;
         // A fresh key: the tabs left behind may still be keyed by this tab's id.
-        chrome.window = Some(Uuid::new_v4().to_string());
-        chrome.snap = None;
+        let group = Uuid::new_v4().to_string();
+        chrome.window = Some(group.clone());
+        // It tiles beside the tile it was dropped on; dropped elsewhere, it splits the largest one.
+        chrome.snap = (!self.free_space()).then_some(Snap::Tiled);
+        let session = self.model.lock().active_session_id.clone();
+        if let Some((target, side)) = self.tile_under(f64::from(at.x - stage.origin.x) as f32, f64::from(at.y - stage.origin.y) as f32, "") {
+            if let Some(tree) = self.tiles.remove(&session) {
+                self.tiles.insert(session, tree.insert(&target, &group, side));
+            }
+        }
         chrome.restore = None;
         chrome.maximized = false;
         chrome.minimized = false;
@@ -3891,7 +4133,12 @@ impl BrowserWindow {
         }
         let order = self.dropped_order(id, &group);
         self.reorder = None;
-        if !own {
+        // Only the tab row takes a tab in; dropped on the window's body it becomes a window of its own.
+        if order.is_none() && self.group_len(id) > 1 {
+            self.detach_tab(id, at, cx);
+            return;
+        }
+        if !own && order.is_some() {
             self.move_tab_to_window(id, target, cx);
         }
         if let Some(order) = &order {
@@ -4304,7 +4551,7 @@ struct Gesture {
     restore: Option<Frame>,
     /// Snap target under the pointer, shown as a preview and applied on release.
     snap: Option<Snap>,
-    /// Other snapped windows and their frames when a resize began; the adjacent ones follow the shared border.
+    /// Other tiled windows and their frames when a resize began; the ones across a dragged border make room.
     partners: Vec<(String, Frame)>,
     /// Pointer in window coordinates.
     pointer: (f32, f32),
@@ -4312,6 +4559,8 @@ struct Gesture {
     from: Option<(Snap, Frame, Option<Frame>)>,
     /// Snapped window under the pointer that the dragged one would trade places with on release.
     swap: Option<String>,
+    /// Tile (window group) a dragged tiled window would be put beside on release, and on which side.
+    insert: Option<(String, Side)>,
 }
 
 /// The address as shown when not editing: no scheme, no trailing slash on a bare host.
@@ -4396,71 +4645,9 @@ const MAGNET: f32 = 12.0;
 const RESTORE_DRAG: f32 = 6.0;
 /// Smallest size a resize shrinks a window to.
 const MIN_W: f32 = 220.0;
+/// How far down and right of the last window a new free window opens.
+const CASCADE: f32 = 28.0;
 const MIN_H: f32 = 120.0;
-
-/// Moves the borders `frame` shares with snapped neighbours along with it, keeping the inset gap between them.
-/// Adjacency is judged on the frames as they were when the resize began; returns the dragged frame,
-/// held back so no neighbour shrinks below the minimum, and each neighbour's new frame if it follows.
-fn link_resize(start: Frame, frame: Frame, edges: Edges, partners: &[Frame]) -> (Frame, Vec<Option<Frame>>) {
-    let left = |o: &Frame| shared_edges(start, edges, o).left;
-    let right = |o: &Frame| shared_edges(start, edges, o).right;
-    let top = |o: &Frame| shared_edges(start, edges, o).top;
-    let bottom = |o: &Frame| shared_edges(start, edges, o).bottom;
-    let mut frame = frame;
-    for o in partners {
-        if left(o) {
-            let x = frame.x.max(o.x + MIN_W + SNAP_INSET);
-            frame.w -= x - frame.x;
-            frame.x = x;
-        }
-        if right(o) {
-            frame.w = frame.w.min(o.x + o.w - MIN_W - SNAP_INSET - frame.x);
-        }
-        if top(o) {
-            let y = frame.y.max(o.y + MIN_H + SNAP_INSET);
-            frame.h -= y - frame.y;
-            frame.y = y;
-        }
-        if bottom(o) {
-            frame.h = frame.h.min(o.y + o.h - MIN_H - SNAP_INSET - frame.y);
-        }
-    }
-    let followers = partners
-        .iter()
-        .map(|o| {
-            let mut f = *o;
-            if left(o) {
-                f.w = frame.x - SNAP_INSET - o.x;
-            }
-            if right(o) {
-                f.x = frame.x + frame.w + SNAP_INSET;
-                f.w = o.x + o.w - f.x;
-            }
-            if top(o) {
-                f.h = frame.y - SNAP_INSET - o.y;
-            }
-            if bottom(o) {
-                f.y = frame.y + frame.h + SNAP_INSET;
-                f.h = o.y + o.h - f.y;
-            }
-            (left(o) || right(o) || top(o) || bottom(o)).then_some(f)
-        })
-        .collect();
-    (frame, followers)
-}
-
-/// Which of the dragged `edges` of `start` border `o` across one inset gap.
-fn shared_edges(start: Frame, edges: Edges, o: &Frame) -> Edges {
-    let touches = |a: f32, b: f32| (b - a - SNAP_INSET).abs() <= 2.0;
-    let beside_y = o.y < start.y + start.h && start.y < o.y + o.h;
-    let beside_x = o.x < start.x + start.w && start.x < o.x + o.w;
-    Edges {
-        left: edges.left && beside_y && touches(o.x + o.w, start.x),
-        right: edges.right && beside_y && touches(start.x + start.w, o.x),
-        top: edges.top && beside_x && touches(o.y + o.h, start.y),
-        bottom: edges.bottom && beside_x && touches(start.y + start.h, o.y),
-    }
-}
 
 /// The frame for `snap`, fitted to the space windows already snapped opposite leave free,
 /// so snapping beside a resized half fills the rest instead of overlapping it or leaving a gap.
@@ -4499,29 +4686,6 @@ fn fit_snap(snap: Snap, sw: f32, sh: f32, others: &[(Snap, Frame)]) -> Frame {
 
 /// Fits a snapped frame to a resized stage. Borders on the stage inset stay there; inner borders keep
 /// their proportional place, measured at the middle of the gap so neighbours stay one inset apart.
-/// Splits the stage among `n` windows like a dwindling tiler: each window halves the space left along its longer side.
-fn tile(n: usize, sw: f32, sh: f32) -> Vec<Frame> {
-    let mut rest = Snap::Tiled.frame(sw, sh);
-    (0..n)
-        .map(|index| {
-            if index + 1 == n {
-                return rest;
-            }
-            if rest.w >= rest.h {
-                let w = ((rest.w - SNAP_INSET) / 2.0).max(1.0);
-                let frame = Frame { w, ..rest };
-                rest = Frame { x: rest.x + w + SNAP_INSET, w: rest.w - w - SNAP_INSET, ..rest };
-                frame
-            } else {
-                let h = ((rest.h - SNAP_INSET) / 2.0).max(1.0);
-                let frame = Frame { h, ..rest };
-                rest = Frame { y: rest.y + h + SNAP_INSET, h: rest.h - h - SNAP_INSET, ..rest };
-                frame
-            }
-        })
-        .collect()
-}
-
 fn rescale_snapped(frame: Frame, ow: f32, oh: f32, sw: f32, sh: f32) -> Frame {
     let lead = |v: f32, old: f32, new: f32| {
         if v <= SNAP_INSET + 0.5 { SNAP_INSET } else { (v - SNAP_INSET / 2.0) * new / old + SNAP_INSET / 2.0 }
@@ -5345,16 +5509,6 @@ mod tests {
     }
 
     #[test]
-    fn tiler_halves_the_last_window() {
-        let one = tile(1, 1000., 700.);
-        assert_eq!((one[0].x, one[0].y, one[0].w, one[0].h), (8., 8., 984., 684.));
-        let two = tile(2, 1000., 700.);
-        assert_eq!((two[0].w, two[1].x, two[1].x + two[1].w), (488., 504., 992.));
-        let three = tile(3, 1000., 700.);
-        assert_eq!((three[1].x, three[1].h, three[2].y, three[2].y + three[2].h), (504., 338., 354., 692.));
-    }
-
-    #[test]
     fn snapped_halves_tile_the_stage() {
         let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
         assert_eq!((l.x, l.y, l.w, l.h), (8., 8., 488., 684.));
@@ -5369,27 +5523,6 @@ mod tests {
         assert_eq!(display_url("https://music.youtube.com/"), "music.youtube.com");
         assert_eq!(display_url("https://www.youtube.com/watch?v=x"), "youtube.com/watch?v=x");
         assert_eq!(display_url("http://example.com/a/"), "example.com/a/");
-    }
-
-    #[test]
-    fn shared_border_resizes_both_snapped_windows() {
-        let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
-        let mut dragged = l;
-        dragged.w += 100.;
-        let (frame, followers) = link_resize(l, dragged, Edges::right(), &[r]);
-        assert_eq!(frame.w, 588.);
-        let f = followers[0].unwrap();
-        assert_eq!((f.x, f.w, f.x + f.w), (604., 388., 992.));
-        // The neighbour never shrinks below the minimum width.
-        dragged.w = 900.;
-        let (frame, followers) = link_resize(l, dragged, Edges::right(), &[r]);
-        assert_eq!(followers[0].unwrap().w, MIN_W);
-        assert_eq!(frame.x + frame.w + SNAP_INSET, followers[0].unwrap().x);
-        // A quarter below shares the bottom border only; the far border of a half is not shared.
-        let (tl, bl) = (Snap::TopLeft.frame(1000., 700.), Snap::BottomLeft.frame(1000., 700.));
-        let (_, followers) = link_resize(tl, Frame { h: tl.h + 50., ..tl }, Edges::bottom(), &[bl, r]);
-        assert_eq!(followers[0].map(|f| (f.y, f.h)), Some((bl.y + 50., bl.h - 50.)));
-        assert!(followers[1].is_none());
     }
 
     #[test]
@@ -5408,16 +5541,6 @@ mod tests {
         assert_eq!(fit_snap(Snap::Right, 1000., 700., &[(Snap::Left, left)]).x, Snap::Right.frame(1000., 700.).x);
         // Neighbours on the same side don't change it.
         assert_eq!(fit_snap(Snap::Left, 1000., 700., &[(Snap::TopLeft, left)]).w, Snap::Left.frame(1000., 700.).w);
-    }
-
-    #[test]
-    fn only_bordering_snapped_windows_follow_a_resize() {
-        let (l, r) = (Snap::Left.frame(1000., 700.), Snap::Right.frame(1000., 700.));
-        assert!(shared_edges(l, Edges::right(), &r).right);
-        assert_eq!(shared_edges(l, Edges::left(), &r), Edges { left: false, right: false, top: false, bottom: false });
-        let mut narrow = l;
-        narrow.w = 300.;
-        assert!(!shared_edges(narrow, Edges::right(), &r).right);
     }
 
     #[test]
