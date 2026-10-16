@@ -137,6 +137,8 @@ pub struct BrowserWindow {
     loading: bool,
     /// Tabs whose page is playing sound, for the speaker beside their title.
     playing: HashSet<String>,
+    /// Hides the title bar, profile rail and dock so only pages show (Orion/Zen focus mode).
+    focus_mode: bool,
     started: Instant,
     metrics: SharedString,
     self_test: Option<SelfTest>,
@@ -462,6 +464,7 @@ impl BrowserWindow {
             attached: false,
             loading: false,
             playing: HashSet::new(),
+            focus_mode: false,
             started,
             metrics: "Measuring…".into(),
             self_test: self_test.then(|| SelfTest {
@@ -827,6 +830,10 @@ impl BrowserWindow {
                 }
             }
             Shortcut::CommandPalette => self.open_palette(cx),
+            Shortcut::FocusMode => {
+                self.focus_mode = !self.focus_mode;
+                self.status = if self.focus_mode { "Focus mode: ⌘⇧F to exit" } else { "Focus mode off" }.into();
+            }
             Shortcut::TileWindows => {
                 let session = self.model.lock().active_session_id.clone();
                 if self.free_space() {
@@ -1827,13 +1834,13 @@ impl Render for BrowserWindow {
                     }
                 });
             }))
-            .child(self.titlebar(&sessions, &all_tabs, &active_session, cx))
+            .when(!self.focus_mode, |root| root.child(self.titlebar(&sessions, &all_tabs, &active_session, cx)))
             .child(
                 h_stack()
                     .flex_1()
                     .min_h(px(0.))
                     .w_full()
-                    .when(self.model.detached.is_none(), |row| row.child(self.rail(&profiles, &active_profile, cx)))
+                    .when(self.model.detached.is_none() && !self.focus_mode, |row| row.child(self.rail(&profiles, &active_profile, cx)))
                     .child(
                 v_stack()
                     .relative()
@@ -1853,7 +1860,7 @@ impl Render for BrowserWindow {
                     }),
             ),
             )
-            .when(!self.tab_window, |root| root.child(self.dock(&tabs, cx)))
+            .when(!self.tab_window && !self.focus_mode, |root| root.child(self.dock(&tabs, cx)))
             .children(self.carried_view(&tabs, cx))
             .children(self.tab_drag_view(cx))
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {

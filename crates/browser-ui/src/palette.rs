@@ -21,7 +21,7 @@ const SCOPES: [(&str, &str, &str); 5] = [
     ("@spaces", "", "Spaces"),
 ];
 
-const ACTIONS: [(&str, &str, Shortcut); 20] = [
+const ACTIONS: [(&str, &str, Shortcut); 21] = [
     ("New tab", "⌘T", Shortcut::NewTab),
     ("New terminal", "⌥⌘T", Shortcut::NewTerminal),
     ("Close tab", "⌘W", Shortcut::CloseTab),
@@ -42,6 +42,7 @@ const ACTIONS: [(&str, &str, Shortcut); 20] = [
     ("Focus address bar", "⌘L", Shortcut::FocusUrl),
     ("Go to last tab", "⌘9", Shortcut::SelectTab(9)),
     ("Tile windows", "", Shortcut::TileWindows),
+    ("Toggle focus mode", "⌘⇧F", Shortcut::FocusMode),
 ];
 
 #[derive(Clone)]

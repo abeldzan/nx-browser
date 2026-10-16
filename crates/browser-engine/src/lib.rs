@@ -116,6 +116,7 @@ pub enum Shortcut {
     NewTerminal,
     /// Re-splits the space's windows among the stage; palette and dock only, no key.
     TileWindows,
+    FocusMode,
 }
 
 pub trait WebEngine {

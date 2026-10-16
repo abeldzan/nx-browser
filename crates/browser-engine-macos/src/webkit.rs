@@ -1380,6 +1380,10 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
                     let _ = events.send(EngineEvent::Shortcut(Shortcut::Inspect));
                     return std::ptr::null_mut();
                 }
+                if key == "f" && shift {
+                    let _ = events.send(EngineEvent::Shortcut(Shortcut::FocusMode));
+                    return std::ptr::null_mut();
+                }
                 if key == "t" && flags.contains(NSEventModifierFlags::Option) {
                     let _ = events.send(EngineEvent::Shortcut(Shortcut::NewTerminal));
                     return std::ptr::null_mut();
