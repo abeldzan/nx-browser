@@ -14,34 +14,22 @@ use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngi
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSUUID,
+    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSHTTPURLResponse, NSProgress, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
     WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
-    WKAudiovisualMediaTypes, WKFullscreenState, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKDownload, WKDownloadDelegate, WKFullscreenState, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
 };
 use uuid::Uuid;
-
-const HOME_HTML: &str = r#"<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>NxBrowser</title></head>
-<body style="margin:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#1c1c1e;color:#f5f5f7">
-<main style="max-width:40rem;margin:4rem auto;padding:0 1.5rem">
-<h1>NxBrowser</h1>
-<p>This tab is running in the profile's own WebKit data store.</p>
-<p>Enter a URL in the toolbar and press Return.</p>
-</main>
-</body>
-</html>"#;
 
 /// `_isPlayingAudio` is private but KVO-observable, as Safari's tab speaker uses it.
 const OBSERVED_KEYS: [&str; 5] = ["URL", "title", "_isPlayingAudio", "cameraCaptureState", "microphoneCaptureState"];
@@ -54,7 +42,84 @@ thread_local! {
     static MUTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// The compiled block list, once WebKit has it; `views` waits for it with each view's wanted state.
     static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
+    /// Camera/microphone requests waiting for the user, by `EngineEvent::Permission::request`.
+    static ASKS: RefCell<HashMap<u64, RcBlock<dyn Fn(WKPermissionDecision)>>> = RefCell::new(HashMap::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
+    /// Downloads WebKit is running, by `EngineEvent::Download::download`.
+    static DOWNLOADS: RefCell<HashMap<u64, Download>> = RefCell::new(HashMap::new());
+    /// `WKDownload` holds its delegate weakly; this one serves every download.
+    static DOWNLOAD_DELEGATE: Retained<NxDownloadDelegate> = NxDownloadDelegate::new(MainThreadMarker::new().expect("downloads start on the main thread"));
+}
+
+struct Download {
+    download: Retained<WKDownload>,
+    /// The starting tab's window, which records the download and hears when it ends.
+    events: Sender<EngineEvent>,
+    tab_id: String,
+    /// WebKit waits on this for the file to write to, until `save_download`.
+    choose: Option<RcBlock<dyn Fn(*mut NSURL)>>,
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NxDownloadDelegate"]
+    struct NxDownloadDelegate;
+
+    unsafe impl NSObjectProtocol for NxDownloadDelegate {}
+
+    unsafe impl WKDownloadDelegate for NxDownloadDelegate {
+        #[unsafe(method(download:decideDestinationUsingResponse:suggestedFilename:completionHandler:))]
+        unsafe fn download_decideDestinationUsingResponse_suggestedFilename_completionHandler(
+            &self,
+            download: &WKDownload,
+            _response: &NSURLResponse,
+            suggested_filename: &NSString,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSURL)>,
+        ) {
+            let url = download.originalRequest().and_then(|request| request.URL()).and_then(|url| url.absoluteString()).map(|url| ns_string(&url)).unwrap_or_default();
+            let asked = DOWNLOADS.with_borrow_mut(|downloads| {
+                let (id, entry) = downloads.iter_mut().find(|(_, entry)| std::ptr::eq(&*entry.download, download))?;
+                entry.choose = Some(completion_handler.copy());
+                entry.events.send(EngineEvent::Download { tab_id: entry.tab_id.clone(), url, filename: ns_string(suggested_filename), download: *id }).ok()
+            });
+            if asked.is_none() {
+                completion_handler.call((std::ptr::null_mut(),));
+            }
+        }
+
+        #[unsafe(method(downloadDidFinish:))]
+        unsafe fn downloadDidFinish(&self, download: &WKDownload) {
+            finish_download(download, None);
+        }
+
+        #[unsafe(method(download:didFailWithError:resumeData:))]
+        unsafe fn download_didFailWithError_resumeData(&self, download: &WKDownload, error: &NSError, _resume_data: Option<&NSData>) {
+            finish_download(download, Some(ns_string(&error.localizedDescription())));
+        }
+    }
+);
+
+impl NxDownloadDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+fn download_progress(download: &WKDownload) -> Retained<NSProgress> {
+    unsafe { msg_send![download, progress] }
+}
+
+fn finish_download(download: &WKDownload, error: Option<String>) {
+    let ended = DOWNLOADS.with_borrow_mut(|downloads| {
+        let id = *downloads.iter().find(|(_, entry)| std::ptr::eq(&*entry.download, download))?.0;
+        downloads.remove(&id).map(|entry| (id, entry))
+    });
+    if let Some((id, entry)) = ended {
+        let bytes = download_progress(download).completedUnitCount().max(0) as u64;
+        let _ = entry.events.send(EngineEvent::DownloadDone { download: id, bytes, error });
+    }
 }
 
 define_class!(
@@ -119,6 +184,14 @@ define_class!(
     #[ivars = DelegateIvars]
     struct NxWebDelegate;
 
+    impl NxWebDelegate {
+        /// Private WKUIDelegate hook for the right-click menu's "Download Image" / "Download Linked File".
+        #[unsafe(method(_webView:contextMenuDidCreateDownload:))]
+        fn context_menu_download(&self, _web_view: &WKWebView, download: &WKDownload) {
+            self.track_download(download);
+        }
+    }
+
     unsafe impl NSObjectProtocol for NxWebDelegate {}
 
     unsafe impl WKNavigationDelegate for NxWebDelegate {
@@ -147,6 +220,10 @@ define_class!(
                 let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url, from: None });
                 return;
             }
+            if navigation_action.shouldPerformDownload() {
+                decision_handler.call((WKNavigationActionPolicy::Download,));
+                return;
+            }
             if self.ivars().https_only.load(Ordering::Relaxed) {
                 let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
                 let url = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
@@ -168,19 +245,29 @@ define_class!(
             navigation_response: &WKNavigationResponse,
             decision_handler: &block2::DynBlock<dyn Fn(WKNavigationResponsePolicy)>,
         ) {
-            if navigation_response.isForMainFrame() && !navigation_response.canShowMIMEType() {
-                // The generated `response()` assumes non-null, but WebKit can hand back nil; a panic here aborts the app.
-                let response: Option<Retained<NSURLResponse>> = msg_send![navigation_response, response];
-                if let Some(url) = response.and_then(|response| response.URL()).and_then(|url| url.absoluteString()) {
-                    let _ = self.ivars().events.borrow().send(EngineEvent::Download {
-                        tab_id: self.ivars().tab_id.clone(),
-                        url: ns_string(&url),
-                    });
-                }
-                decision_handler.call((WKNavigationResponsePolicy::Cancel,));
+            // The generated `response()` assumes non-null, but WebKit can hand back nil; a panic here aborts the app.
+            let response: Option<Retained<NSURLResponse>> = msg_send![navigation_response, response];
+            let attachment = response
+                .as_ref()
+                .and_then(|response| response.downcast_ref::<NSHTTPURLResponse>())
+                .and_then(|response| response.valueForHTTPHeaderField(ns_string!("Content-Disposition")))
+                .is_some_and(|value| ns_string(&value).trim_start().to_ascii_lowercase().starts_with("attachment"));
+            // A page WebKit can show (SVG, image, PDF) still downloads when the server says it's an attachment.
+            if attachment || (navigation_response.isForMainFrame() && !navigation_response.canShowMIMEType()) {
+                decision_handler.call((WKNavigationResponsePolicy::Download,));
                 return;
             }
             decision_handler.call((WKNavigationResponsePolicy::Allow,));
+        }
+
+        #[unsafe(method(webView:navigationAction:didBecomeDownload:))]
+        unsafe fn webView_navigationAction_didBecomeDownload(&self, _web_view: &WKWebView, _navigation_action: &WKNavigationAction, download: &WKDownload) {
+            self.track_download(download);
+        }
+
+        #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
+        unsafe fn webView_navigationResponse_didBecomeDownload(&self, _web_view: &WKWebView, _navigation_response: &WKNavigationResponse, download: &WKDownload) {
+            self.track_download(download);
         }
 
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
@@ -293,18 +380,22 @@ define_class!(
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get(&key)
-                .cloned()
-                .unwrap_or_else(|| "deny".into());
-            let _ = self.ivars().events.borrow().send(EngineEvent::Permission {
-                tab_id: self.ivars().tab_id.clone(),
-                origin,
-                kind: kind.into(),
-            });
-            decision_handler.call((if decision == "allow" {
-                WKPermissionDecision::Grant
-            } else {
-                WKPermissionDecision::Deny
-            },));
+                .cloned();
+            match decision.as_deref() {
+                Some("allow") => decision_handler.call((WKPermissionDecision::Grant,)),
+                Some(_) => decision_handler.call((WKPermissionDecision::Deny,)),
+                None => {
+                    // Ask, and let WebKit wait: it raises if a decision handler is dropped uncalled, so each one is kept until answered.
+                    let request = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+                    ASKS.with_borrow_mut(|asks| asks.insert(request, decision_handler.copy()));
+                    let _ = self.ivars().events.borrow().send(EngineEvent::Permission {
+                        tab_id: self.ivars().tab_id.clone(),
+                        origin,
+                        kind: kind.into(),
+                        request,
+                    });
+                }
+            }
         }
     }
 
@@ -361,6 +452,13 @@ impl NxWebDelegate {
     fn new(mtm: MainThreadMarker, ivars: DelegateIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn track_download(&self, download: &WKDownload) {
+        let id = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+        DOWNLOAD_DELEGATE.with(|delegate| unsafe { download.setDelegate(Some(ProtocolObject::from_ref(&**delegate))) });
+        let entry = Download { download: download.retain(), events: self.ivars().events.borrow().clone(), tab_id: self.ivars().tab_id.clone(), choose: None };
+        DOWNLOADS.with_borrow_mut(|downloads| downloads.insert(id, entry));
     }
 
     fn open_popup(&self, web_view: &WKWebView, configuration: &WKWebViewConfiguration, navigation_action: &WKNavigationAction) -> Option<Retained<WKWebView>> {
@@ -727,6 +825,34 @@ impl MacEngine {
             NSAppearance::appearanceNamed(unsafe { if dark { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua } })
         });
         NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
+    }
+
+    /// Tells WebKit where to write a download it is holding (see `EngineEvent::Download`); `None` cancels it.
+    pub fn save_download(&mut self, download: u64, path: Option<&Path>) {
+        let Some(choose) = DOWNLOADS.with_borrow_mut(|downloads| downloads.get_mut(&download).and_then(|entry| entry.choose.take())) else {
+            return;
+        };
+        match path {
+            Some(path) => {
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+                choose.call((Retained::as_ptr(&url).cast_mut(),));
+            }
+            None => choose.call((std::ptr::null_mut(),)),
+        }
+    }
+
+    /// Bytes written so far and the expected total, while WebKit runs the download.
+    pub fn download_bytes(&self, download: u64) -> Option<(u64, Option<u64>)> {
+        let progress = DOWNLOADS.with_borrow(|downloads| downloads.get(&download).map(|entry| download_progress(&entry.download)))?;
+        let total = progress.totalUnitCount();
+        Some((progress.completedUnitCount().max(0) as u64, (total > 0).then_some(total as u64)))
+    }
+
+    /// Answers a waiting camera/microphone request; an unknown or already answered one is ignored.
+    pub fn answer_permission(&mut self, request: u64, allow: bool) {
+        if let Some(handler) = ASKS.with_borrow_mut(|asks| asks.remove(&request)) {
+            handler.call((if allow { WKPermissionDecision::Grant } else { WKPermissionDecision::Deny },));
+        }
     }
 
     pub fn set_permissions(&mut self, entries: Vec<(String, String, String)>) {
@@ -1241,6 +1367,8 @@ fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
     }
 }
 
+static NEXT_ASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 const BLOCKLIST_JSON: &str = include_str!("blocklist.json");
 
 #[derive(Default)]
@@ -1325,9 +1453,9 @@ pub(crate) fn safari_ua_suffix() -> String {
 
 fn load_url(view: &WKWebView, url: &str) {
     unsafe {
-        if url == "nxbrowser://home" || url.is_empty() {
-            view.loadHTMLString_baseURL(&NSString::from_str(HOME_HTML), None);
-        } else if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
+        // The new-tab page is drawn by the UI over a blank view.
+        let url = if url == "nxbrowser://home" || url.is_empty() { "about:blank" } else { url };
+        if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
             let request = NSURLRequest::requestWithURL(&nsurl);
             view.loadRequest(&request);
         }

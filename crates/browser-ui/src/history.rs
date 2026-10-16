@@ -1,5 +1,5 @@
 use crate::settings::measure_overlay;
-use crate::window::{paint, site_host, site_icon, BrowserWindow};
+use crate::window::{paint, site_host, site_icon, BrowserWindow, Paint};
 use browser_core::{now_secs, HistoryEntry};
 use gpui::{div, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
 use gpuikit::elements::icon_button::icon_button;
@@ -11,23 +11,59 @@ use gpuikit::traits::control_sized::ControlSized;
 
 const POPUP_LIMIT: usize = 12;
 const MODAL_LIMIT: usize = 200;
+/// Shared by the history and downloads popovers so their edges line up.
+pub(crate) const INSET: f32 = 12.;
+pub(crate) const HEADER_H: f32 = 36.;
+const ROW_H: f32 = 30.;
+const LABEL_H: f32 = 24.;
+const FOOTER_H: f32 = 32.;
+
+/// Title on the left, actions on the right, one hairline under it.
+pub(crate) fn popover_header(title: &'static str, actions: gpui::Div, paint: Paint) -> gpui::Div {
+    h_stack()
+        .flex_none()
+        .w_full()
+        .h(px(HEADER_H))
+        .pl(px(INSET))
+        .pr(px(6.))
+        .items_center()
+        .justify_between()
+        .border_b_1()
+        .border_color(paint.border)
+        .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(actions.items_center().gap(px(2.)))
+}
+
+/// A small text action for popover headers and footers.
+pub(crate) fn text_action(id: &'static str, label: &'static str, paint: Paint) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(5.))
+        .text_size(px(12.))
+        .text_color(paint.muted)
+        .cursor_pointer()
+        .hover(|style| style.bg(paint.secondary).text_color(paint.fg))
+        .child(label)
+}
 
 impl BrowserWindow {
     /// Recent visits, dropped from the title bar's history button.
     pub(crate) fn history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let entries = self.model.lock().search_history("", POPUP_LIMIT).unwrap_or_default();
-        let groups = group_entries(&entries);
-        let empty = if entries.is_empty() { 72. } else { 0. };
-        let height = (112. + entries.len() as f32 * 48. + groups.len() as f32 * 26. + empty).min(440.);
+        let groups = group_entries(&entries).len() as f32;
+        let body = if entries.is_empty() { 56. } else { entries.len() as f32 * ROW_H + groups * LABEL_H + 8. };
+        let height = (HEADER_H + body + FOOTER_H + 2.).min(420.);
         v_stack()
             .id("history-popover")
             .absolute()
             .top(px(self.titlebar_h() + 6.))
             .right(px(8.))
-            .w(px(380.))
+            .w(px(340.))
             .h(px(height))
-            .rounded(px(12.))
+            .rounded(px(10.))
             .overflow_hidden()
             .bg(paint.surface)
             .border_1()
@@ -38,51 +74,32 @@ impl BrowserWindow {
                 this.history_open = false;
                 cx.notify();
             }))
-            .child(measure_overlay(12., cx))
-            .child(
-                h_stack()
-                    .w_full()
-                    .px(px(16.))
-                    .pt(px(14.))
-                    .pb(px(10.))
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        v_stack()
-                            .gap(px(2.))
-                            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("History"))
-                            .child(div().text_size(px(12.)).text_color(paint.muted).child("Recent")),
-                    )
-                    .child(icon_button("history-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.history_open = false;
-                        cx.notify();
-                    }))),
-            )
+            .child(measure_overlay(10., cx))
+            .child(popover_header(
+                "History",
+                h_stack().child(icon_button("history-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.history_open = false;
+                    cx.notify();
+                }))),
+                paint,
+            ))
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .px(px(6.))
                     .child(scroll_area("history-list").vertical().child(self.history_groups(&entries, "No history yet", cx))),
             )
             .child(
                 h_stack()
+                    .flex_none()
                     .w_full()
-                    .px(px(12.))
-                    .py(px(10.))
+                    .h(px(FOOTER_H))
+                    .px(px(INSET - 6.))
+                    .items_center()
                     .border_t_1()
                     .border_color(paint.border)
-                    .child(
-                        div()
-                            .id("history-view-all")
-                            .text_size(px(12.))
-                            .text_color(paint.muted)
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(paint.fg))
-                            .child("View all history")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_history_modal(cx))),
-                    ),
+                    .child(text_action("history-view-all", "Show all history", paint).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_history_modal(cx)))),
             )
     }
 
@@ -97,22 +114,15 @@ impl BrowserWindow {
             .h(px(520.))
             .max_w_full()
             .max_h_full()
+            .child(popover_header(
+                "History",
+                h_stack().child(icon_button("history-modal-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.close_history_modal(cx);
+                }))),
+                paint,
+            ))
             .child(
-                h_stack()
-                    .w_full()
-                    .px(px(16.))
-                    .py(px(12.))
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(paint.border)
-                    .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("History"))
-                    .child(icon_button("history-modal-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.close_history_modal(cx);
-                    }))),
-            )
-            .child(
-                div().w_full().px(px(16.)).py(px(10.)).child(
+                div().flex_none().w_full().px(px(INSET)).py(px(8.)).child(
                     text_field(&self.history_query, cx).placeholder("Search history").full_width(true),
                 ),
             )
@@ -121,8 +131,6 @@ impl BrowserWindow {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .px(px(8.))
-                    .pb(px(8.))
                     .child(scroll_area("history-modal-list").vertical().child(self.history_groups(&entries, empty, cx))),
             );
         self.modal_shell("history-modal", card, Self::close_history_modal, cx)
@@ -144,20 +152,23 @@ impl BrowserWindow {
     fn history_groups(&self, entries: &[HistoryEntry], empty: &'static str, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         if entries.is_empty() {
-            return div().px(px(12.)).py(px(20.)).text_color(paint.muted).child(empty);
+            return div().w_full().h(px(56.)).flex().items_center().justify_center().text_size(px(12.)).text_color(paint.muted).child(empty);
         }
-        let mut column = v_stack().w_full().gap(px(2.)).pb(px(6.));
+        // Rows are inset by 6px so their hover fill sits inside the popover's edges, with text still on the 12px line.
+        let mut column = v_stack().w_full().px(px(6.)).pb(px(8.));
         let mut last = String::new();
         for entry in entries {
             let label = day_label(entry.visited_at, now_secs());
             if label != last {
                 column = column.child(
                     div()
-                        .px(px(10.))
-                        .pt(px(10.))
-                        .pb(px(2.))
+                        .h(px(LABEL_H))
+                        .px(px(INSET - 6.))
+                        .flex()
+                        .items_end()
+                        .pb(px(4.))
                         .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(paint.muted)
                         .child(label.clone()),
                 );
@@ -168,31 +179,26 @@ impl BrowserWindow {
         column
     }
 
-    fn history_row(&self, entry: &HistoryEntry, paint: crate::window::Paint, cx: &mut Context<Self>) -> impl IntoElement {
+    fn history_row(&self, entry: &HistoryEntry, paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
         let url = entry.url.clone();
-        let title = if entry.title.is_empty() { site_host(&entry.url) } else { entry.title.clone() };
-        let when = clock_label(entry.visited_at);
+        let host = site_host(&entry.url);
+        let title = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
         h_stack()
             .id(SharedString::from(format!("history-row-{}", entry.id)))
             .w_full()
-            .gap(px(10.))
-            .px(px(8.))
-            .py(px(7.))
-            .rounded(px(8.))
+            .h(px(ROW_H))
+            .gap(px(8.))
+            .px(px(INSET - 6.))
+            .rounded(px(6.))
             .items_center()
+            .text_size(px(12.5))
             .cursor_pointer()
             .hover(|style| style.bg(paint.secondary))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_history_url(&url, cx)))
-            .child(site_icon(&entry.url, 28., false))
-            .child(
-                v_stack()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(1.))
-                    .child(div().truncate().child(title))
-                    .child(div().text_size(px(11.)).text_color(paint.muted).truncate().child(site_host(&entry.url))),
-            )
-            .child(div().flex_none().text_size(px(11.)).text_color(paint.muted).child(when))
+            .child(div().flex_none().child(site_icon(&entry.url, 16., false)))
+            .child(div().flex_1().min_w(px(0.)).truncate().child(title))
+            .child(div().flex_none().max_w(px(110.)).truncate().text_size(px(11.)).text_color(paint.muted).child(host))
+            .child(h_stack().flex_none().w(px(52.)).justify_end().text_size(px(11.)).text_color(paint.muted).child(clock_label(entry.visited_at)))
     }
 }
 

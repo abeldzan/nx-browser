@@ -6,7 +6,7 @@ mod model;
 mod settings;
 mod url;
 
-pub use download::{fetch_suggestions, spawn_download, spawn_favicon, DownloadUpdate};
+pub use download::{fetch_suggestions, spawn_favicon, unique_path};
 pub use lifecycle::{suspend_candidates, TabState};
 pub use metrics::{sample_cpu_seconds, snapshot, MetricsSnapshot};
 pub use model::{

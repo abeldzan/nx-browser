@@ -20,14 +20,26 @@ pub enum EngineEvent {
         tab_id: String,
         message: String,
     },
+    /// WebKit is holding a download until `save_download(download, path)` says where to write it.
     Download {
         tab_id: String,
         url: String,
+        /// The server's or the link's file name.
+        filename: String,
+        download: u64,
     },
+    /// A download finished, or failed with `error` (cancelled included).
+    DownloadDone {
+        download: u64,
+        bytes: u64,
+        error: Option<String>,
+    },
+    /// A site asking for camera/microphone with no saved answer; WebKit waits for `answer_permission(request, ..)`.
     Permission {
         tab_id: String,
         origin: String,
         kind: String,
+        request: u64,
     },
     OpenInNewTab {
         url: String,

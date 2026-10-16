@@ -7,7 +7,7 @@ use crate::tabs::tab_label;
 use crate::terminal::{self, is_terminal, TERMINAL_URL};
 use crate::SharedModel;
 use browser_core::{
-    app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_download, spawn_favicon, DownloadUpdate, Effect,
+    app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model,
 };
 use browser_engine::{EngineEvent, EngineSettings, LogicalRect, Shortcut, WebEngine};
@@ -130,11 +130,11 @@ pub struct BrowserWindow {
     space_rename: Option<String>,
     space_input: Entity<InputState>,
     confirm_delete: bool,
-    permission: Option<(String, String)>,
-    downloads_tx: Sender<DownloadUpdate>,
-    downloads_rx: Receiver<DownloadUpdate>,
+    /// Camera/microphone request the page is waiting on: (request, origin, kind).
+    permission: Option<(u64, String, String)>,
+    /// Downloads WebKit is writing, by engine id: (download id in the model, file path).
+    web_downloads: HashMap<u64, (String, String)>,
     attached: bool,
-    loading: bool,
     /// Tabs whose page is playing sound, for the speaker beside their title.
     playing: HashSet<String>,
     /// Tabs whose page is recording: (camera, microphone).
@@ -271,7 +271,6 @@ impl BrowserWindow {
     pub fn new(model: SharedModel, handoff: Option<Handoff>, self_test: bool, started: Instant, cx: &mut Context<Self>) -> Self {
         let (installs_tx, installs_rx) = mpsc::channel();
         let ext_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let (downloads_tx, downloads_rx) = mpsc::channel();
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -462,10 +461,8 @@ impl BrowserWindow {
             space_input,
             confirm_delete: false,
             permission: None,
-            downloads_tx,
-            downloads_rx,
+            web_downloads: HashMap::new(),
             attached: false,
-            loading: false,
             playing: HashSet::new(),
             capturing: HashMap::new(),
             openers: HashMap::new(),
@@ -655,12 +652,9 @@ impl BrowserWindow {
         let effects = self.model.lock().take_effects();
         let mut changed = !effects.is_empty();
         self.apply(effects);
-        while let Ok(update) = self.downloads_rx.try_recv() {
-            changed = true;
-            self.download_progress.insert(update.id.clone(), (update.received, update.total));
-            if update.status != "running" {
-                let _ = self.model.lock().update_download(&update.id, &update.status, &update.path);
-                self.status = format!("Download {}", update.status).into();
+        for (download, (id, _)) in &self.web_downloads {
+            if let Some(bytes) = self.engine.download_bytes(*download) {
+                changed |= self.download_progress.insert(id.clone(), bytes) != Some(bytes);
             }
         }
         let mut events = Vec::new();
@@ -697,7 +691,6 @@ impl BrowserWindow {
     fn on_event(&mut self, event: EngineEvent, cx: &mut Context<Self>) {
         match event {
             EngineEvent::Navigated { tab_id, url, title, loading } => {
-                self.loading = loading;
                 if !loading {
                     let _ = self.model.lock().note_navigation(&tab_id, &url, &title);
                 } else if !title.is_empty() {
@@ -705,7 +698,8 @@ impl BrowserWindow {
                 }
                 let active = self.model.lock().active_tab().map(|tab| tab.id.clone());
                 if active.as_deref() == Some(tab_id.as_str()) && !self.address_focused && !url.is_empty() {
-                    self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
+                    let shown = if is_blank(&url) { String::new() } else { url.clone() };
+                    self.address.update(cx, |input, cx| input.set_content_silent(shown, cx));
                 }
                 if is_web(&url) {
                     let zoom = self.model.lock().settings.zoom_for(&site_glyph(&url).1);
@@ -720,10 +714,22 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Failed { message, .. } => self.status = message.into(),
-            EngineEvent::Download { url, .. } => self.start_download(&url),
-            EngineEvent::Permission { origin, kind, .. } => {
-                self.permission = Some((origin.clone(), kind.clone()));
-                self.status = format!("Permission request: {kind} for {origin}").into();
+            EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename),
+            EngineEvent::DownloadDone { download, bytes, error } => {
+                // Unknown ids are downloads cancelled before they were recorded.
+                if let Some((id, path)) = self.web_downloads.remove(&download) {
+                    let status = error.map_or_else(|| "done".to_string(), |error| format!("error: {error}"));
+                    self.download_progress.insert(id.clone(), (bytes, Some(bytes)));
+                    let _ = self.model.lock().update_download(&id, &status, &path);
+                    self.status = format!("Download {status}").into();
+                }
+            }
+            EngineEvent::Permission { origin, kind, request, .. } => {
+                // One prompt at a time: a newer request turns down the one still showing.
+                if let Some((older, _, _)) = self.permission.replace((request, origin, kind)) {
+                    self.engine.answer_permission(older, false);
+                }
+                cx.notify();
             }
             EngineEvent::OpenInNewTab { url, from } => {
                 // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
@@ -1259,7 +1265,8 @@ impl BrowserWindow {
             return;
         }
         if let Some(url) = Some(self.model.lock()).and_then(|model| model.active_tab().map(|tab| tab.url.clone())) {
-            self.address.update(cx, |input, cx| input.set_content_silent(url.clone(), cx));
+            let url = if is_blank(&url) { String::new() } else { url };
+            self.address.update(cx, |input, cx| input.set_content_silent(url, cx));
         }
     }
 
@@ -1369,26 +1376,32 @@ impl BrowserWindow {
         Some(self.model.lock()).and_then(|model| model.active_tab().map(|tab| tab.id.clone()))
     }
 
-    fn start_download(&mut self, url: &str) {
-        let id = Uuid::new_v4().to_string();
-        let name = url.split('/').next_back().filter(|part| !part.is_empty()).unwrap_or("download");
+    /// Picks the file for a download WebKit is holding, then lets it write there.
+    fn start_download(&mut self, download: u64, url: &str, filename: &str) {
         let (dir, ask) = {
             let settings = &self.model.lock().settings;
             (settings.download_dir.clone(), settings.ask_download_path)
         };
+        let dir = if dir.is_empty() { downloads_dir() } else { std::path::PathBuf::from(dir) };
+        let path = unique_path(&dir, filename);
         let path = if ask {
-            let Some(path) = choose_save_path(name) else {
+            let Some(path) = path.file_name().and_then(|name| choose_save_path(&name.to_string_lossy())) else {
+                self.engine.save_download(download, None);
                 return;
             };
+            // The save panel already asked about replacing it; WebKit won't write over a file.
+            let _ = std::fs::remove_file(&path);
             path
-        } else if dir.is_empty() {
-            downloads_dir().join(name)
         } else {
-            std::path::PathBuf::from(dir).join(name)
+            let _ = std::fs::create_dir_all(&dir);
+            path
         };
-        let _ = self.model.lock().add_download(&id, url, &path.display().to_string());
+        let id = Uuid::new_v4().to_string();
+        let shown = path.display().to_string();
+        let _ = self.model.lock().add_download(&id, url, &shown);
         self.download_progress.insert(id.clone(), (0, None));
-        spawn_download(id, url.to_string(), path, self.downloads_tx.clone());
+        self.web_downloads.insert(download, (id, shown));
+        self.engine.save_download(download, Some(&path));
         self.status = "Download started".into();
         self.downloads_open = true;
     }
@@ -1911,6 +1924,7 @@ impl Render for BrowserWindow {
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
+            .child(self.permission_prompt(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
@@ -2749,7 +2763,7 @@ impl BrowserWindow {
         let ids = self.order.clone();
         // `order` spans every space; only this space's windows are on the stage.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        let terminals = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let drawn = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url) || is_blank(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
         let preview = self.drop_preview();
         let carried = self.carried().map(|(id, _)| id);
@@ -2782,7 +2796,7 @@ impl BrowserWindow {
             let find = if active.as_deref() == Some(id.as_str()) { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
             let (scale, alpha) = self.window_motion(&id);
             let frame = scaled(frame, scale);
-            if terminals.contains(&id) {
+            if drawn.contains(&id) {
                 // Drawn by GPUI inside the shell: it hides pages behind it but needs no hole of its own.
                 self.engine.place_tab(&id, None);
                 let shell = LogicalRect { x: origin_x + f64::from(frame.x), y: origin_y + f64::from(frame.y), width: f64::from(frame.w), height: f64::from(frame.h) };
@@ -3097,6 +3111,15 @@ impl BrowserWindow {
                         .overflow_hidden()
                         .bg(paint.bg)
                         .child(terminal::terminal_for(&tab.id, &tab.url, cx)),
+                    false if is_blank(&tab.url) => div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .mx(px(PAGE_INSET as f32))
+                        .mb(px(PAGE_INSET as f32))
+                        .rounded_b(px(PAGE_RADIUS as f32))
+                        .overflow_hidden()
+                        .bg(paint.bg)
+                        .child(self.new_tab_page(tab, cx)),
                     false => div().flex_1().min_h(px(0.)),
                 }),
         );
@@ -3175,7 +3198,8 @@ impl BrowserWindow {
             let fade = self.load_done.map_or(1.0, |at| 1.0 - (at.elapsed().as_secs_f32() / LOAD_FADE.as_secs_f32()).min(1.0));
             div().absolute().left_0().bottom_0().h(px(2.)).w(relative(self.load_bar)).bg(paint.accent).opacity(fade)
         });
-        div().relative().children(bar).child(
+        // The bar goes after the title bar, whose opaque background would otherwise paint over it.
+        div().relative().child(
             h_stack()
                 .id(SharedString::from(format!("title-{id}")))
                 .h(px(self.title_h() as f32))
@@ -3197,6 +3221,7 @@ impl BrowserWindow {
                 .child(div().flex_1().min_w(px(8.)).h_full())
                 .child(self.hit_guard(format!("tools-guard-{}", tab.id), tools, cx).flex_none()),
         )
+        .children(bar)
     }
 
     /// Small centred tab pills; clicking the shown tab widens it into the address field.
@@ -3346,7 +3371,8 @@ impl BrowserWindow {
 
     fn address_slot(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        let editing = tab.active && (self.address_editing || self.address_focused);
+        // A blank tab's field is the new-tab page's big one; one input can only be drawn once.
+        let editing = tab.active && !is_blank(&tab.url) && (self.address_editing || self.address_focused);
         let pill = div()
             .h(px(self.pill_h()))
             .w_full()
@@ -3359,26 +3385,7 @@ impl BrowserWindow {
             .border_1()
             .text_size(px(12.));
         if editing {
-            let watch = cx.entity();
-            return pill
-                .relative()
-                .border_color(paint.accent.opacity(0.6))
-                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| this.end_address_edit(window, cx)))
-                // The input turns these keys into actions; catching them first lets arrows move through suggestions instead of the caret.
-                .capture_action(cx.listener(|this, _: &bindings::Down, window, cx| this.address_key("down", window, cx)))
-                .capture_action(cx.listener(|this, _: &bindings::Up, window, cx| this.address_key("up", window, cx)))
-                .capture_action(cx.listener(|this, _: &bindings::Enter, window, cx| this.address_key("enter", window, cx)))
-                .capture_action(cx.listener(|this, _: &bindings::Escape, window, cx| this.address_key("escape", window, cx)))
-                .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.address_bounds = Some(bounds)), |_, _, _, _| {}).absolute().size_full())
-                .child(
-                input(&self.address, cx)
-                    .placeholder("Search or enter an address")
-                    .cursor_color(paint.accent)
-                    .flex_1()
-                    .h_full()
-                    .text_size(px(12.))
-                    .text_color(paint.fg),
-            );
+            return self.address_field(pill.border_color(paint.accent.opacity(0.6)), 12., cx);
         }
         let id = tab.id.clone();
         if is_terminal(&tab.url) {
@@ -3388,7 +3395,7 @@ impl BrowserWindow {
                     .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(terminal::location(&tab.url))),
             );
         }
-        let (label, color) = if tab.url.is_empty() || tab.url == "nxbrowser://home" {
+        let (label, color) = if is_blank(&tab.url) {
             ("Search or enter an address".to_string(), paint.muted)
         } else {
             (display_url(&tab.url), if tab.active { paint.fg } else { paint.muted })
@@ -3405,6 +3412,109 @@ impl BrowserWindow {
                     cx.notify();
                 })),
         )
+    }
+
+    /// The live address input inside `pill`, with suggestion keys and the bounds the suggestion list hangs from.
+    fn address_field(&self, pill: gpui::Div, size: f32, cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let watch = cx.entity();
+        pill.relative()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| this.end_address_edit(window, cx)))
+            // The input turns these keys into actions; catching them first lets arrows move through suggestions instead of the caret.
+            .capture_action(cx.listener(|this, _: &bindings::Down, window, cx| this.address_key("down", window, cx)))
+            .capture_action(cx.listener(|this, _: &bindings::Up, window, cx| this.address_key("up", window, cx)))
+            .capture_action(cx.listener(|this, _: &bindings::Enter, window, cx| this.address_key("enter", window, cx)))
+            .capture_action(cx.listener(|this, _: &bindings::Escape, window, cx| this.address_key("escape", window, cx)))
+            .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.address_bounds = Some(bounds)), |_, _, _, _| {}).absolute().size_full())
+            .child(
+                input(&self.address, cx)
+                    .placeholder("Search or enter an address")
+                    .cursor_color(paint.accent)
+                    .flex_1()
+                    .h_full()
+                    .text_size(px(size))
+                    .text_color(paint.fg),
+            )
+    }
+
+    /// Drawn in place of a blank tab's page: a big address field over bookmarks and recently visited sites.
+    fn new_tab_page(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
+        let paint = paint(cx);
+        let id = tab.id.clone();
+        let pill = div()
+            .h(px(46.))
+            .w_full()
+            .px(px(16.))
+            .gap(px(10.))
+            .rounded(px(12.))
+            .flex()
+            .items_center()
+            .bg(paint.secondary)
+            .border_1()
+            .shadow_sm()
+            .child(Icons::magnifying_glass().size(px(16.)).text_color(paint.muted));
+        let field = if tab.active {
+            self.address_field(pill.border_color(if self.address_focused { paint.accent.opacity(0.6) } else { paint.border }), 16., cx)
+        } else {
+            let open = id.clone();
+            div().w_full().child(
+                pill.id(SharedString::from(format!("home-field-{id}")))
+                    .border_color(paint.border)
+                    .cursor_text()
+                    .text_size(px(16.))
+                    .text_color(paint.muted)
+                    .child("Search or enter an address")
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.focus_window(&open, cx);
+                        this.focus_address = true;
+                        cx.notify();
+                    })),
+            )
+        };
+        let (bookmarks, recent) = {
+            let model = self.model.lock();
+            let bookmarks = model.bookmarks().unwrap_or_default().into_iter().map(|entry| (entry.title, entry.url)).take(8).collect::<Vec<_>>();
+            let mut hosts = HashSet::new();
+            let recent = model
+                .history()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| hosts.insert(site_host(&entry.url)))
+                .map(|entry| (entry.title, entry.url))
+                .take(8)
+                .collect::<Vec<_>>();
+            (bookmarks, recent)
+        };
+        let mut column = v_stack().w_full().max_w(px(640.)).gap(px(20.)).child(field);
+        for (label, sites) in [("Bookmarks", bookmarks), ("Recent", recent)] {
+            if sites.is_empty() {
+                continue;
+            }
+            let mut grid = div().flex().flex_wrap().gap(px(8.));
+            for (index, (title, url)) in sites.into_iter().enumerate() {
+                let (window_id, open) = (id.clone(), url.clone());
+                let name = if title.is_empty() { site_host(&url) } else { title };
+                grid = grid.child(
+                    v_stack()
+                        .id(SharedString::from(format!("home-{label}-{index}-{id}")))
+                        .w(px(72.))
+                        .p(px(8.))
+                        .gap(px(6.))
+                        .items_center()
+                        .rounded(px(10.))
+                        .cursor_pointer()
+                        .hover(|tile| tile.bg(paint.secondary))
+                        .child(site_icon(&url, 32., false))
+                        .child(div().w_full().text_size(px(11.)).text_center().truncate().child(name))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.focus_window(&window_id, cx);
+                            this.commit_navigation(&open, cx);
+                        })),
+                );
+            }
+            column = column.child(v_stack().gap(px(6.)).child(self.section_label(label, paint)).child(grid));
+        }
+        div().size_full().flex().justify_center().pt(relative(0.18)).px(px(24.)).child(column)
     }
 
     fn nav_controls(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
@@ -4567,7 +4677,6 @@ impl BrowserWindow {
                 this.import_profile();
                 this.refresh_url(cx);
             }))
-            .child(self.permission_row(cx))
     }
 
     fn link_list(&self, empty: &'static str, rows: Vec<(String, String)>, cx: &mut Context<Self>) -> gpui::Div {
@@ -4599,28 +4708,51 @@ impl BrowserWindow {
         column
     }
 
-    fn permission_row(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let Some((origin, kind)) = self.permission.clone() else {
-            return div().text_color(paint.muted).child("No permission requests");
+    /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
+    fn permission_prompt(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some((request, origin, kind)) = self.permission.clone() else {
+            return div();
         };
-        v_stack()
-            .gap(px(6.))
-            .child(self.section_label("Permission", paint))
-            .child(format!("{kind} for {origin}"))
-            .child(action_button("allow-permission", "Allow", Kind::Primary, true, cx, {
-                let (origin, kind) = (origin.clone(), kind.clone());
-                move |this, _| {
-                    let _ = this.model.lock().set_permission(&origin, &kind, "allow");
-                    this.sync_permissions();
-                    this.status = "Allowed for the next request".into();
-                }
-            }))
-            .child(action_button("deny-permission", "Deny", Kind::Secondary, true, cx, move |this, _| {
-                let _ = this.model.lock().set_permission(&origin, &kind, "deny");
+        let paint = paint(cx);
+        let what = match kind.as_str() {
+            "microphone" => "your microphone",
+            "camera-microphone" => "your camera and microphone",
+            _ => "your camera",
+        };
+        let host = origin.split("://").nth(1).unwrap_or(&origin).to_string();
+        let answer = move |allow: bool| {
+            let (origin, kind) = (origin.clone(), kind.clone());
+            move |this: &mut Self, cx: &mut Context<Self>| {
+                let _ = this.model.lock().set_permission(&origin, &kind, if allow { "allow" } else { "deny" });
                 this.sync_permissions();
+                this.engine.answer_permission(request, allow);
                 this.permission = None;
-            }))
+                cx.notify();
+            }
+        };
+        div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
+            v_stack()
+                .relative()
+                .w(px(340.))
+                .p(px(14.))
+                .gap(px(10.))
+                .rounded(px(10.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(px(13.))
+                .occlude()
+                .child(measure_overlay(10., cx))
+                .child(format!("{host} wants to use {what}."))
+                .child(
+                    h_stack()
+                        .gap(px(8.))
+                        .justify_end()
+                        .child(action_button("deny-permission", "Don't Allow", Kind::Secondary, true, cx, answer(false)))
+                        .child(action_button("allow-permission", "Allow", Kind::Primary, true, cx, answer(true))),
+                ),
+        )
     }
 
     fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
@@ -5309,6 +5441,11 @@ pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {
     app_support_dir().join("favicons").join(format!("icon-{name}"))
 }
 
+/// A new tab: drawn by GPUI as the new-tab page, its web view kept hidden until it navigates.
+fn is_blank(url: &str) -> bool {
+    url.is_empty() || url == "about:blank" || url == "nxbrowser://home"
+}
+
 fn is_web(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
@@ -5490,25 +5627,20 @@ impl Activity {
     }
 }
 
-/// A capsule on the badge's corner: red camera, orange microphone (macOS's recording colors), and a speaker.
+/// Tiny dots along the badge's bottom edge, like macOS's privacy dots: green camera, orange microphone, and a
+/// faint dot for sound.
 fn activity_chip(state: Activity, paint: Paint) -> gpui::Div {
-    let glyph = |icon: gpui::Svg, color: gpui::Hsla| icon.size(px(9.)).text_color(color);
+    let dot = |color: gpui::Hsla| div().size(px(4.)).rounded_full().bg(color);
     h_stack()
         .absolute()
-        .right(px(-6.))
-        .bottom(px(-5.))
-        .h(px(16.))
-        .px(px(4.))
+        .bottom(px(3.))
+        .left_0()
+        .right_0()
+        .justify_center()
         .gap(px(3.))
-        .items_center()
-        .rounded_full()
-        .bg(paint.bg)
-        .border_2()
-        .border_color(paint.surface)
-        .shadow_sm()
-        .when(state.camera, |chip| chip.child(glyph(Icons::video(), parse_hex("#ff453a"))))
-        .when(state.microphone, |chip| chip.child(glyph(gpui::svg().path(crate::MIC_ICON), parse_hex("#ff9f0a"))))
-        .when(state.sound, |chip| chip.child(glyph(Icons::speaker_loud(), paint.fg)))
+        .when(state.camera, |row| row.child(dot(parse_hex("#30d158"))))
+        .when(state.microphone, |row| row.child(dot(parse_hex("#ff9f0a"))))
+        .when(state.sound, |row| row.child(dot(paint.fg.opacity(0.55))))
 }
 
 /// Draws an icon value: a `.svg` asset path, an emoji, or (empty) the name's initial.

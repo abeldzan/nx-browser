@@ -1,7 +1,7 @@
 use crate::settings::measure_overlay;
 use crate::window::{paint, BrowserWindow};
 use gpui::{div, prelude::*, px, relative, ClickEvent, Context, SharedString};
-use crate::ui::{action_button, Kind};
+use crate::history::{popover_header, text_action, INSET};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
 use gpuikit::icons::Icons;
@@ -10,15 +10,16 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::traits::control_sized::ControlSized;
 use std::path::Path;
 
+const ROW_H: f32 = 36.;
+
 impl BrowserWindow {
     pub(crate) fn downloads_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paint = paint(cx);
         let danger = cx.theme().danger();
         let downloads = self.model.lock().downloads().unwrap_or_default();
-        let mut list = v_stack().w_full().gap(px(2.));
-        if downloads.is_empty() {
-            list = list.child(div().p(px(16.)).text_color(paint.muted).child("No downloads yet"));
-        }
+        let empty = downloads.is_empty();
+        // Rows are inset by 6px so their hover fill sits inside the popover, with text on the 12px line.
+        let mut list = v_stack().w_full().px(px(6.)).py(px(4.));
         for entry in downloads {
             let name = Path::new(&entry.path)
                 .file_name()
@@ -35,7 +36,7 @@ impl BrowserWindow {
             } else if let Some((received, total)) = progress {
                 match total {
                     Some(total) if total > 0 => (
-                        format!("{} of {}", human_bytes(received), human_bytes(total)),
+                        format!("{} / {}", human_bytes(received), human_bytes(total)),
                         Some((received as f32 / total as f32).clamp(0., 1.)),
                     ),
                     _ => (human_bytes(received), Some(0.)),
@@ -45,63 +46,63 @@ impl BrowserWindow {
             };
             let path = entry.path.clone();
             let reveal = entry.path.clone();
+            let group = SharedString::from(format!("download-{}", entry.id));
             list = list.child(
                 h_stack()
-                    .id(SharedString::from(format!("download-{}", entry.id)))
+                    .id(group.clone())
+                    .group(group.clone())
+                    .relative()
                     .w_full()
-                    .gap(px(10.))
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(8.))
+                    .h(px(ROW_H))
+                    .gap(px(8.))
+                    .px(px(INSET - 6.))
+                    .rounded(px(6.))
                     .items_center()
+                    .text_size(px(12.5))
                     .when(done, |row| {
                         row.cursor_pointer()
                             .hover(|style| style.bg(paint.secondary))
                             .on_click(move |_: &ClickEvent, _, _| open_path(&path, false))
                     })
-                    .child(
-                        div()
-                            .size(px(32.))
-                            .flex_none()
-                            .rounded(px(6.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(paint.secondary)
-                            .child(Icons::file().size(px(16.)).text_color(paint.muted)),
-                    )
+                    .child(Icons::file().flex_none().size(px(16.)).text_color(if failed { danger } else { paint.muted }))
                     .child(
                         v_stack()
                             .flex_1()
                             .min_w(px(0.))
-                            .gap(px(4.))
-                            .child(div().truncate().child(name))
+                            .gap(px(3.))
+                            .child(div().truncate().when(failed, |name| name.text_color(paint.muted)).child(name))
                             .when_some(fraction, |column, fraction| {
                                 column.child(
                                     div()
                                         .w_full()
-                                        .h(px(4.))
+                                        .h(px(3.))
                                         .rounded_full()
                                         .bg(paint.border)
                                         .child(div().h_full().w(relative(fraction)).rounded_full().bg(paint.accent)),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .truncate()
-                                    .text_color(if failed { danger } else { paint.muted })
-                                    .child(detail),
-                            ),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(150.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(if failed { danger } else { paint.muted })
+                            // The reveal button takes the size's place on hover.
+                            .when(done, |detail| detail.group_hover(group.clone(), |style| style.opacity(0.)))
+                            .child(detail),
                     )
                     .when(done, |row| {
                         row.child(
-                            icon_button(SharedString::from(format!("reveal-{}", entry.id)), Icons::magnifying_glass())
-                                .small()
-                                .on_click(move |_: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    open_path(&reveal, true);
-                                }),
+                            div().absolute().right(px(INSET - 10.)).opacity(0.).group_hover(group, |style| style.opacity(1.)).child(
+                                icon_button(SharedString::from(format!("reveal-{}", entry.id)), Icons::magnifying_glass())
+                                    .small()
+                                    .on_click(move |_: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        open_path(&reveal, true);
+                                    }),
+                            ),
                         )
                     }),
             );
@@ -111,8 +112,8 @@ impl BrowserWindow {
             .absolute()
             .left(px(64.))
             .bottom(px(12.))
-            .w(px(360.))
-            .max_h(px(440.))
+            .w(px(340.))
+            .max_h(px(420.))
             .rounded(px(10.))
             .overflow_hidden()
             .bg(paint.surface)
@@ -125,33 +126,37 @@ impl BrowserWindow {
                 cx.notify();
             }))
             .child(measure_overlay(10., cx))
-            .child(
+            .child(popover_header(
+                "Downloads",
                 h_stack()
-                    .w_full()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(paint.border)
-                    .child(crate::settings::title("Downloads"))
-                    .child(
-                        h_stack()
-                            .gap(px(6.))
-                            .child(action_button("downloads-clear", "Clear", Kind::Secondary, true, cx, |this, cx| {
-                                let _ = this.model.lock().clear_finished_downloads();
-                                cx.notify();
-                            }))
-                            .child(icon_button("downloads-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.downloads_open = false;
-                                    cx.notify();
-                                },
-                            ))),
-                    ),
-            )
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().p(px(4.)).child(
-                scroll_area("downloads-list").vertical().child(list),
+                    .when(!empty, |actions| {
+                        actions.child(text_action("downloads-clear", "Clear", paint).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            let _ = this.model.lock().clear_finished_downloads();
+                            cx.notify();
+                        })))
+                    })
+                    .child(icon_button("downloads-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.downloads_open = false;
+                        cx.notify();
+                    }))),
+                paint,
             ))
+            .when(empty, |popover| {
+                popover.child(
+                    v_stack()
+                        .h(px(88.))
+                        .gap(px(6.))
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.))
+                        .text_color(paint.muted)
+                        .child(Icons::download().size(px(18.)).text_color(paint.muted))
+                        .child("No downloads yet"),
+                )
+            })
+            .when(!empty, |popover| {
+                popover.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(scroll_area("downloads-list").vertical().child(list)))
+            })
     }
 }
 
