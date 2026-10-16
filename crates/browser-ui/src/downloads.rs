@@ -121,10 +121,7 @@ impl BrowserWindow {
             .border_color(paint.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.downloads_open = false;
-                cx.notify();
-            }))
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
             .child(measure_overlay(10., cx))
             .child(popover_header(
                 "Downloads",
@@ -136,7 +133,7 @@ impl BrowserWindow {
                         })))
                     })
                     .child(icon_button("downloads-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.downloads_open = false;
+                        this.popover = None;
                         cx.notify();
                     }))),
                 paint,

@@ -40,6 +40,11 @@ thread_local! {
     static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
     /// Muted tabs, kept across windows and page re-creation (a suspended tab comes back muted).
     static MUTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// App shortcuts by gpui keystroke (`cmd-shift-t`), shared by every window's key monitor.
+    static KEYMAP: RefCell<HashMap<String, Shortcut>> = RefCell::new(HashMap::new());
+    /// The page-first shortcut of the last key handed to a page, fired if the page reports it unhandled.
+    /// shortcut: a second key pressed before the page's reply overwrites it; key the reply by event if that bites.
+    static PENDING_PAGE_FIRST: std::cell::Cell<Option<Shortcut>> = const { std::cell::Cell::new(None) };
     /// The compiled block list, once WebKit has it; `views` waits for it with each view's wanted state.
     static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
     /// Camera/microphone requests waiting for the user, by `EngineEvent::Permission::request`.
@@ -157,9 +162,7 @@ define_class!(
                 resent
             });
             let flags = event.modifierFlags();
-            let page_first = flags.contains(NSEventModifierFlags::Command)
-                && !flags.contains(NSEventModifierFlags::Control)
-                && event.charactersIgnoringModifiers().is_some_and(|chars| PAGE_FIRST_KEYS.contains(&ns_string(&chars).to_ascii_lowercase().as_str()));
+            let page_first = bound(event).is_some_and(Shortcut::page_first);
             let ignored_plain_key = resent && !flags.contains(NSEventModifierFlags::Command);
             if !page_first && !ignored_plain_key {
                 let _: () = unsafe { msg_send![super(self), keyDown: event] };
@@ -440,7 +443,7 @@ define_class!(
             message: &WKScriptMessage,
         ) {
             if ns_string(&message.name()) == "nxShortcut" {
-                if let Some(shortcut) = message.body().downcast::<NSString>().ok().and_then(|key| shortcut_for(&ns_string(&key), false)) {
+                if let Some(shortcut) = PENDING_PAGE_FIRST.take() {
                     let _ = self.ivars().events.borrow().send(EngineEvent::Shortcut(shortcut));
                 }
             }
@@ -667,6 +670,11 @@ impl MacEngine {
         self.tabs.insert(tab_id.to_string(), live);
     }
 
+    /// Runs `notify` on each page click in this window, from inside AppKit's event dispatch: it should only wake the UI.
+    pub fn on_page_click(&mut self, notify: impl Fn() + Send + 'static) {
+        with_window(self.window_no, |state| state.on_click = Some(Box::new(notify)));
+    }
+
     pub fn take_page_click(&mut self) -> Option<String> {
         with_window(self.window_no, |state| state.click.take()).flatten()
     }
@@ -755,6 +763,11 @@ impl MacEngine {
         unsafe {
             live.view.loadHTMLString_baseURL(&NSString::from_str(html), base.as_deref());
         }
+    }
+
+    /// Replaces the app shortcuts in every window; empty pauses them (while one is being recorded).
+    pub fn set_shortcuts(&mut self, keys: Vec<(String, Shortcut)>) {
+        KEYMAP.with_borrow_mut(|map| *map = keys.into_iter().collect());
     }
 
     /// Zoom, user agent and inspector apply to open tabs; the rest to tabs created afterwards.
@@ -1156,6 +1169,12 @@ impl WebEngine for MacEngine {
     fn reload(&mut self, tab_id: &str) {
         if let Some(live) = self.tabs.get(tab_id) {
             unsafe { live.view.reload() };
+        }
+    }
+
+    fn hard_reload(&mut self, tab_id: &str) {
+        if let Some(live) = self.tabs.get(tab_id) {
+            unsafe { live.view.reloadFromOrigin() };
         }
     }
 
@@ -1600,35 +1619,17 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
         let Some(events) = window.and_then(|window| with_window(window.windowNumber(), |state| state.events.clone()).flatten()) else {
             return event.as_ptr();
         };
-        let flags = event_ref.modifierFlags();
-        let shift = flags.contains(NSEventModifierFlags::Shift);
         const ESCAPE: u16 = 53;
         if event_ref.keyCode() == ESCAPE {
             let _ = events.send(EngineEvent::Shortcut(Shortcut::Dismiss));
         }
-        if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command)
-            && event_ref.charactersIgnoringModifiers().is_some_and(|chars| ns_string(&chars) == "\t") {
-                let _ = events.send(EngineEvent::Shortcut(if shift { Shortcut::PrevTab } else { Shortcut::NextTab }));
-                return std::ptr::null_mut();
-            }
-        if flags.contains(NSEventModifierFlags::Command) && !flags.contains(NSEventModifierFlags::Control) {
-            if let Some(chars) = event_ref.charactersIgnoringModifiers() {
-                let key = ns_string(&chars).to_ascii_lowercase();
-                // A focused page gets these first; the key script reports them back if it ignores them.
-                if key == "i" && flags.contains(NSEventModifierFlags::Option) {
-                    let _ = events.send(EngineEvent::Shortcut(Shortcut::Inspect));
-                    return std::ptr::null_mut();
-                }
-                if key == "t" && flags.contains(NSEventModifierFlags::Option) {
-                    let _ = events.send(EngineEvent::Shortcut(Shortcut::NewTerminal));
-                    return std::ptr::null_mut();
-                }
-                let page_first = PAGE_FIRST_KEYS.contains(&key.as_str()) && page_has_focus(event_ref);
-                if let Some(shortcut) = shortcut_for(&key, shift).filter(|_| !page_first) {
-                    let _ = events.send(EngineEvent::Shortcut(shortcut));
-                    return std::ptr::null_mut();
-                }
-            }
+        let shortcut = bound(event_ref);
+        // A focused page gets these first; the key script reports them back if it ignores them.
+        let to_page = shortcut.filter(|shortcut| shortcut.page_first() && page_has_focus(event_ref));
+        PENDING_PAGE_FIRST.set(to_page);
+        if let Some(shortcut) = shortcut.filter(|_| to_page.is_none()) {
+            let _ = events.send(EngineEvent::Shortcut(shortcut));
+            return std::ptr::null_mut();
         }
         event.as_ptr()
     });
@@ -1658,6 +1659,8 @@ struct WindowState {
     modal: bool,
     /// Tab whose page was clicked since the engine last asked.
     click: Option<String>,
+    /// Tells the UI a page was clicked, so it needn't wait for its next poll.
+    on_click: Option<Box<dyn Fn() + Send>>,
     /// Where this window's shortcuts go.
     events: Option<Sender<EngineEvent>>,
 }
@@ -1701,6 +1704,9 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
         with_window(window.windowNumber(), |state| {
             // The latest click wins: a page click still waiting for the UI tick would blur an address field opened since.
             state.click = over_page(state, point).map(|hit| hit.tab_id.clone());
+            if let Some(notify) = state.on_click.as_ref().filter(|_| state.click.is_some()) {
+                notify();
+            }
         });
         event.as_ptr()
     });
@@ -1830,36 +1836,50 @@ fn page_has_focus(event: &NSEvent) -> bool {
     false
 }
 
-/// App shortcuts. Ones a page may claim are offered to the page first while it has focus
-/// (as Chrome does): Excalidraw uses Cmd+D to duplicate, docs editors take Cmd+F.
-fn shortcut_for(key: &str, shift: bool) -> Option<Shortcut> {
-    match key {
-        "t" if shift => Some(Shortcut::ReopenTab),
-        "t" => Some(Shortcut::NewTab),
-        "w" => Some(Shortcut::CloseTab),
-        "l" => Some(Shortcut::FocusUrl),
-        "r" => Some(Shortcut::Reload),
-        "f" => Some(Shortcut::Find),
-        "d" => Some(Shortcut::Bookmark),
-        "[" => Some(Shortcut::Back),
-        "]" => Some(Shortcut::Forward),
-        "," => Some(Shortcut::Settings),
-        "p" => Some(Shortcut::Print),
-        "k" => Some(Shortcut::CommandPalette),
-        "=" | "+" => Some(Shortcut::ZoomIn),
-        "-" => Some(Shortcut::ZoomOut),
-        "0" => Some(Shortcut::ZoomReset),
-        _ => key.parse::<usize>().ok().filter(|n| (1..=9).contains(n)).map(Shortcut::SelectTab),
+/// The event's keys in gpui keystroke form (`ctrl-alt-cmd-shift-key`); None without Cmd or Ctrl,
+/// so plain typing never reaches the keymap.
+fn combo(event: &NSEvent) -> Option<String> {
+    let flags = event.modifierFlags();
+    let (ctrl, cmd) = (flags.contains(NSEventModifierFlags::Control), flags.contains(NSEventModifierFlags::Command));
+    if !ctrl && !cmd {
+        return None;
     }
+    let key = match event.keyCode() {
+        123 => "left".to_string(),
+        124 => "right".into(),
+        125 => "down".into(),
+        126 => "up".into(),
+        48 => "tab".into(),
+        36 => "enter".into(),
+        49 => "space".into(),
+        51 => "backspace".into(),
+        // Unshifted, as gpui names keys: Shift+[ is `shift-[`, not `{`.
+        _ => ns_string(&*event.charactersByApplyingModifiers(NSEventModifierFlags::empty())?).to_lowercase(),
+    };
+    let mut out = String::new();
+    for (flag, name) in [
+        (NSEventModifierFlags::Control, "ctrl-"),
+        (NSEventModifierFlags::Option, "alt-"),
+        (NSEventModifierFlags::Command, "cmd-"),
+        (NSEventModifierFlags::Shift, "shift-"),
+    ] {
+        if flags.contains(flag) {
+            out.push_str(name);
+        }
+    }
+    out.push_str(&key);
+    Some(out)
 }
 
-const PAGE_FIRST_KEYS: [&str; 11] = ["d", "f", "r", "[", "]", "p", "=", "+", "-", "0", "k"];
+fn bound(event: &NSEvent) -> Option<Shortcut> {
+    let combo = combo(event)?;
+    KEYMAP.with_borrow(|map| map.get(&combo).copied())
+}
 
-/// Runs in its own world; reports page-first shortcuts the page did not `preventDefault`.
+/// Runs in its own world; tells the app a modified key went unhandled, so a page-first shortcut still fires.
 const KEY_FALLBACK_JS: &str = r#"addEventListener('keydown', (e) => {
-  const key = (e.key || '').toLowerCase();
-  if (!e.metaKey || e.ctrlKey || !['d', 'f', 'r', '[', ']', 'p', '=', '+', '-', '0', 'k'].includes(key)) return;
-  setTimeout(() => { if (!e.defaultPrevented) webkit.messageHandlers.nxShortcut.postMessage(key); }, 0);
+  if (!e.metaKey && !e.ctrlKey) return;
+  setTimeout(() => { if (!e.defaultPrevented) webkit.messageHandlers.nxShortcut.postMessage(''); }, 0);
 }, true);"#;
 
 fn key_world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {

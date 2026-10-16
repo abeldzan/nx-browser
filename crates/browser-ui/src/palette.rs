@@ -2,9 +2,10 @@
 //! modelled on Arc's command bar, Vivaldi's Quick Commands and Zen's command bar.
 use crate::settings::measure_overlay;
 use crate::tabs::tab_label;
-use crate::window::{favicon_path, paint, site_host, site_icon, BrowserWindow};
+use crate::window::{favicon_path, paint, site_host, site_icon, BrowserWindow, Popover};
 use browser_core::{bang_home, calc, find_bang, normalize_url, spawn_favicon, Settings, BANGS};
-use browser_engine::Shortcut;
+use crate::shortcuts::{keys, label};
+use browser_engine::{Shortcut, SHORTCUTS};
 use gpui::{div, prelude::*, px, ClickEvent, Context, MouseDownEvent, SharedString};
 use gpuikit::elements::input::input;
 use gpuikit::input::bindings;
@@ -24,39 +25,13 @@ const SCOPES: [(&str, &str, &str); 5] = [
     ("@spaces", "", "Spaces"),
 ];
 
-const ACTIONS: [(&str, &str, Shortcut); 20] = [
-    ("New tab", "⌘T", Shortcut::NewTab),
-    ("New terminal", "⌥⌘T", Shortcut::NewTerminal),
-    ("Close tab", "⌘W", Shortcut::CloseTab),
-    ("Reopen closed tab", "⇧⌘T", Shortcut::ReopenTab),
-    ("Reload page", "⌘R", Shortcut::Reload),
-    ("Go back", "⌘[", Shortcut::Back),
-    ("Go forward", "⌘]", Shortcut::Forward),
-    ("Find in page", "⌘F", Shortcut::Find),
-    ("Bookmark page", "⌘D", Shortcut::Bookmark),
-    ("Open settings", "⌘,", Shortcut::Settings),
-    ("Print page", "⌘P", Shortcut::Print),
-    ("Inspect page", "⌥⌘I", Shortcut::Inspect),
-    ("Zoom in", "⌘+", Shortcut::ZoomIn),
-    ("Zoom out", "⌘-", Shortcut::ZoomOut),
-    ("Reset zoom", "⌘0", Shortcut::ZoomReset),
-    ("Next tab", "⌃⇥", Shortcut::NextTab),
-    ("Previous tab", "⌃⇧⇥", Shortcut::PrevTab),
-    ("Focus address bar", "⌘L", Shortcut::FocusUrl),
-    ("Go to last tab", "⌘9", Shortcut::SelectTab(9)),
-    ("Tile windows", "", Shortcut::TileWindows),
-];
-
 #[derive(Clone)]
 pub(crate) enum Run {
     Shortcut(Shortcut),
-    Downloads,
     Extensions,
-    CopyUrl,
     Duplicate,
     CloseOthers,
     CloseAll,
-    NewSpace,
     NewPrivate,
     ToggleMute,
     Pref(fn(&mut Settings)),
@@ -223,18 +198,16 @@ impl BrowserWindow {
             }
         }
         if wants("Actions") {
-            for (label, hint, shortcut) in ACTIONS {
-                add(label, item("Actions", label, hint, Run::Shortcut(shortcut)));
+            // Tabs 1-8 would crowd the list; "Go to last tab" stands for them.
+            for binding in SHORTCUTS.iter().filter(|binding| !matches!(binding.action, Shortcut::SelectTab(n) if n < 9)) {
+                add(binding.label, item("Actions", binding.label, label(keys(&settings, binding)), Run::Shortcut(binding.action)));
             }
             for (label, run) in [
-                ("Copy page URL", Run::CopyUrl),
                 ("Duplicate tab", Run::Duplicate),
                 ("Close other tabs", Run::CloseOthers),
                 ("Close all tabs", Run::CloseAll),
-                ("New space", Run::NewSpace),
                 ("New private profile", Run::NewPrivate),
                 (if model.active_tab().is_some_and(|tab| self.engine.is_muted(&tab.id)) { "Unmute tab" } else { "Mute tab" }, Run::ToggleMute),
-                ("Show downloads", Run::Downloads),
                 ("Manage extensions", Run::Extensions),
             ] {
                 add(label, item("Actions", label, "", run));
@@ -324,16 +297,13 @@ impl BrowserWindow {
         let mut keep_focus = false;
         match entry.run {
             Run::Shortcut(shortcut) => {
-                keep_focus = matches!(shortcut, Shortcut::Find | Shortcut::Settings | Shortcut::FocusUrl | Shortcut::NewTab);
+                keep_focus = matches!(
+                    shortcut,
+                    Shortcut::Find | Shortcut::Settings | Shortcut::FocusUrl | Shortcut::NewTab | Shortcut::Downloads | Shortcut::Bookmarks | Shortcut::History
+                );
                 self.on_shortcut(shortcut, cx);
             }
-            Run::Downloads => (self.downloads_open, keep_focus) = (true, true),
-            Run::Extensions => (self.extensions_open, keep_focus) = (true, true),
-            Run::CopyUrl => {
-                let url = self.model.lock().active_tab().map(|tab| tab.url.clone()).unwrap_or_default();
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
-                self.status = "Copied page URL".into();
-            }
+            Run::Extensions => (self.popover, keep_focus) = (Some(Popover::Extensions), true),
             Run::Duplicate => {
                 let tab = self.model.lock().active_tab().map(|tab| (tab.id.clone(), tab.url.clone()));
                 if let Some((id, url)) = tab {
@@ -350,7 +320,6 @@ impl BrowserWindow {
                 let all = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect();
                 self.close_tabs(all, cx);
             }
-            Run::NewSpace => self.with_model(|model| { let _ = model.create_session(); }),
             Run::ToggleMute => {
                 if let Some(id) = self.active_tab_id() {
                     let mute = !self.engine.is_muted(&id);

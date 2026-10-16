@@ -69,10 +69,7 @@ impl BrowserWindow {
             .border_color(paint.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.extensions_open = false;
-                cx.notify();
-            }))
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
             .child(measure_overlay(12., cx))
             .child(
                 h_stack()
@@ -89,7 +86,7 @@ impl BrowserWindow {
                             .child(div().text_size(px(12.)).text_color(paint.muted).child(summary)),
                     )
                     .child(icon_button("extensions-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.extensions_open = false;
+                        this.popover = None;
                         cx.notify();
                     }))),
             )
@@ -127,7 +124,7 @@ impl BrowserWindow {
                             .gap(px(16.))
                             .items_center()
                             .child(link("browse-store", "Browse the store", paint, cx, |this, cx| {
-                                this.extensions_open = false;
+                                this.popover = None;
                                 this.with_model(|model| { let _ = model.create_tab(STORE_URL); });
                                 cx.notify();
                             }))
@@ -175,7 +172,7 @@ impl BrowserWindow {
                 row.cursor_pointer().hover(|style| style.bg(paint.secondary)).on_click(cx.listener({
                     let id = id.clone();
                     move |this, event: &ClickEvent, _, cx| {
-                        this.extensions_open = false;
+                        this.popover = None;
                         this.open_extension(&id, f32::from(event.position().x), cx);
                     }
                 }))
@@ -213,7 +210,7 @@ impl BrowserWindow {
                                     let id = id.clone();
                                     move |this, _: &ClickEvent, _, cx| {
                                         cx.stop_propagation();
-                                        this.extensions_open = false;
+                                        this.popover = None;
                                         this.open_extension_options(&id, cx);
                                     }
                                 })))

@@ -5,6 +5,7 @@
 //! Everything here works in cells: frames grown by half the inset gap, so neighbouring cells touch.
 
 use super::{Frame, MIN_H, MIN_W, SNAP_INSET};
+use browser_engine::Dir;
 
 pub(super) fn cell(f: Frame) -> Frame {
     Frame { x: f.x - SNAP_INSET / 2.0, y: f.y - SNAP_INSET / 2.0, w: f.w + SNAP_INSET, h: f.h + SNAP_INSET }
@@ -54,6 +55,27 @@ impl Side {
     fn first(self) -> bool {
         matches!(self, Side::Left | Side::Top)
     }
+}
+
+/// The window nearest `from` in direction `dir`: its centre must lie that way, and a big sideways
+/// offset costs twice the distance travelled, so the one straight across wins over a closer diagonal.
+pub(super) fn neighbour(from: Frame, others: &[(String, Frame)], dir: Dir) -> Option<String> {
+    let centre = |f: Frame| (f.x + f.w / 2.0, f.y + f.h / 2.0);
+    let (fx, fy) = centre(from);
+    others
+        .iter()
+        .filter_map(|(id, frame)| {
+            let (x, y) = centre(*frame);
+            let (ahead, aside) = match dir {
+                Dir::Left => (fx - x, y - fy),
+                Dir::Right => (x - fx, y - fy),
+                Dir::Up => (fy - y, x - fx),
+                Dir::Down => (y - fy, x - fx),
+            };
+            (ahead > 1.0).then(|| (ahead + aside.abs() * 2.0, id))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id)| id.clone())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -326,6 +348,21 @@ mod tests {
     }
 
     const STAGE: Frame = Frame { x: 0.0, y: 0.0, w: 1000.0, h: 600.0 };
+
+    #[test]
+    fn neighbours_follow_the_arrow() {
+        // a b
+        // c d   with c wide enough to also sit under b.
+        let (a, b, c, d) = (f(0., 0., 500., 300.), f(500., 0., 500., 300.), f(0., 300., 700., 300.), f(700., 300., 300., 300.));
+        let all = [("a".to_string(), a), ("b".into(), b), ("c".into(), c), ("d".into(), d)];
+        let others = |me: &str| all.iter().filter(|(id, _)| id != me).cloned().collect::<Vec<_>>();
+        assert_eq!(neighbour(a, &others("a"), Dir::Right).as_deref(), Some("b"));
+        assert_eq!(neighbour(a, &others("a"), Dir::Down).as_deref(), Some("c"));
+        assert_eq!(neighbour(b, &others("b"), Dir::Down).as_deref(), Some("d"));
+        assert_eq!(neighbour(d, &others("d"), Dir::Left).as_deref(), Some("c"));
+        assert_eq!(neighbour(a, &others("a"), Dir::Left), None);
+        assert_eq!(neighbour(a, &others("a"), Dir::Up), None);
+    }
 
     #[test]
     fn new_windows_split_and_always_fill_the_stage() {

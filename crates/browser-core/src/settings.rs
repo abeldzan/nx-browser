@@ -55,6 +55,8 @@ pub struct Settings {
     pub terminal_shell: String,
     /// Lines of history kept per terminal.
     pub terminal_scrollback: usize,
+    /// Shortcuts rebound away from their defaults, by binding id; an empty value unbinds it.
+    pub shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -89,6 +91,7 @@ impl Default for Settings {
             terminal_cursor: "block".into(),
             terminal_shell: String::new(),
             terminal_scrollback: 10_000,
+            shortcuts: BTreeMap::new(),
         }
     }
 }
@@ -140,6 +143,7 @@ mod tests {
         assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
         assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));
+        assert!(parsed.shortcuts.is_empty());
         let round: Settings = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(round, parsed);
     }

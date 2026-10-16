@@ -31,6 +31,7 @@ const SUSPEND_OPTIONS: [(&str, i64); 6] =
 pub enum SettingsSection {
     Profiles,
     General,
+    Shortcuts,
     Appearance,
     Search,
     Privacy,
@@ -43,9 +44,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Profiles,
         Self::General,
+        Self::Shortcuts,
         Self::Appearance,
         Self::Search,
         Self::Privacy,
@@ -61,6 +63,7 @@ impl SettingsSection {
         match self {
             Self::Profiles => "Profiles",
             Self::General => "General",
+            Self::Shortcuts => "Keyboard shortcuts",
             Self::Appearance => "Appearance",
             Self::Search => "Search engine",
             Self::Privacy => "Privacy & security",
@@ -78,6 +81,7 @@ type Apply<T> = fn(&mut Settings, T);
 
 impl BrowserWindow {
     pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.end_recording();
         self.settings_open = !self.settings_open;
         self.settings_note = None;
         if self.settings_open {
@@ -377,6 +381,7 @@ impl BrowserWindow {
                     .hover(|style| style.bg(paint.secondary))
                     .child(section.label())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.end_recording();
                         this.settings_section = section;
                         cx.notify();
                     })),
@@ -453,6 +458,7 @@ impl BrowserWindow {
                     div().w(px(260.)).child(text_field(&self.home_input, cx).placeholder("nxbrowser://home").full_width(true)),
                     paint,
                 )),
+            SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, paint, cx)),
             SettingsSection::Appearance => page
                 .child(row(
                     "Theme",
@@ -687,7 +693,10 @@ impl BrowserWindow {
                 )),
             SettingsSection::Developer => page.child(row(
                 "Allow Web Inspector",
-                Some("Right-click a page and choose Inspect Element, or press ⌥⌘I."),
+                Some(&match crate::shortcuts::hint(&settings, browser_engine::Shortcut::Inspect) {
+                    keys if keys.is_empty() => "Right-click a page and choose Inspect Element.".to_string(),
+                    keys => format!("Right-click a page and choose Inspect Element, or press {keys}."),
+                }),
                 switch("inspector", settings.inspector, |s, v| s.inspector = v, paint, cx),
                 paint,
             )),
@@ -900,7 +909,7 @@ pub(crate) fn title(text: impl Into<SharedString>) -> gpui::Div {
     div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(text.into())
 }
 
-fn row(title: &'static str, detail: Option<&str>, control: impl IntoElement, paint: Paint) -> gpui::Div {
+pub(crate) fn row(title: &'static str, detail: Option<&str>, control: impl IntoElement, paint: Paint) -> gpui::Div {
     h_stack()
         .w_full()
         .gap(px(16.))

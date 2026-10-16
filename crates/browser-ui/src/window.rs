@@ -10,7 +10,7 @@ use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model, TabState,
 };
-use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
+use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
 use browser_engine_macos::{choose_folder_path, choose_open_path, choose_save_path, Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
 use gpui::{
@@ -27,11 +27,11 @@ use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
-use tiling::{cell, move_border, set_span, span, uncell, Side, Tile};
+use tiling::{cell, move_border, neighbour, set_span, span, uncell, Side, Tile};
 use gpuikit::input::{bindings, InputState, InputStateEvent, SubmitOn};
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
-use gpuikit::traits::control_sized::ControlSized;
+use futures::StreamExt;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -48,6 +48,10 @@ pub struct BrowserWindow {
     space_drag: Option<String>,
     /// Held during a window drag when nothing else has GPUI focus: modifier changes only travel the focus path.
     gesture_focus: FocusHandle,
+    /// The shortcut whose new keys settings is waiting for; app shortcuts are paused meanwhile.
+    pub(crate) recording: Option<&'static str>,
+    /// Takes the keys being recorded.
+    pub(crate) shortcut_focus: FocusHandle,
     /// Each space's tiled windows, keyed by window group, as a split tree laid out over the stage.
     tiles: HashMap<String, Tile>,
     /// Holds one torn-off window instead of a space: its tabs take the spaces' place in the title bar.
@@ -85,13 +89,12 @@ pub struct BrowserWindow {
     /// Bounds of open modal cards this frame; web pages are cut out beneath them.
     /// Open overlays this frame (bounds, corner radius); web pages are cut out beneath them.
     pub(crate) overlay_rects: Vec<(LogicalRect, f64)>,
-    /// Right-click menu on a rail profile: (profile id, index, click position).
-    pub(crate) downloads_open: bool,
-    pub(crate) extensions_open: bool,
-    pub(crate) history_open: bool,
+    /// The open title-bar or rail popover; at most one at a time.
+    pub(crate) popover: Option<Popover>,
+    /// The popover a press outside it just closed, and where; that press's click on its own button keeps it closed.
+    popover_dismissed: Option<(Popover, gpui::Point<Pixels>)>,
     pub(crate) history_modal: bool,
     pub(crate) history_query: Entity<InputState>,
-    pub(crate) bookmarks_open: bool,
     /// The bookmark editor: (bookmark id, pinned); no id adds a new pinned site.
     pub(crate) bookmark_edit: Option<(Option<String>, bool)>,
     pub(crate) bookmark_title: Entity<InputState>,
@@ -102,6 +105,7 @@ pub struct BrowserWindow {
     pub(crate) new_profile_input: Entity<InputState>,
     /// Live (received, total) bytes per download id, fed by the download threads.
     pub(crate) download_progress: HashMap<String, (u64, Option<u64>)>,
+    /// Right-click menu on a rail profile: (profile id, index, click position).
     pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
@@ -415,6 +419,8 @@ impl BrowserWindow {
             model: WindowModel { shared: model, detached },
             space_drag: None,
             gesture_focus: cx.focus_handle(),
+            recording: None,
+            shortcut_focus: cx.focus_handle(),
             tiles: HashMap::new(),
             tab_window,
             close_window: false,
@@ -441,12 +447,10 @@ impl BrowserWindow {
             delete_prompt: None,
             overlay_rects: Vec::new(),
             rail_menu: None,
-            downloads_open: false,
-            extensions_open: false,
-            history_open: false,
+            popover: None,
+            popover_dismissed: None,
             history_modal: false,
             history_query,
-            bookmarks_open: false,
             bookmark_edit: None,
             bookmark_title,
             bookmark_url,
@@ -617,7 +621,7 @@ impl BrowserWindow {
         self.run_self_test();
         self.ticks = self.ticks.wrapping_add(1);
         // Extension errors have no change event; they only show in the popover, so poll them while it is open.
-        if changed || self.self_test.is_some() || (self.extensions_open && self.ticks.is_multiple_of(4)) {
+        if changed || self.self_test.is_some() || (self.popover == Some(Popover::Extensions) && self.ticks.is_multiple_of(4)) {
             cx.notify();
         }
     }
@@ -795,7 +799,7 @@ impl BrowserWindow {
             EngineEvent::ExtensionChanged { .. } => cx.refresh_windows(),
             EngineEvent::ExtensionPrompt { prompt, id, request } => {
                 self.ext_prompts.push((prompt, id, request));
-                self.extensions_open = true;
+                self.popover = Some(Popover::Extensions);
             }
             EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
             EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
@@ -890,6 +894,50 @@ impl BrowserWindow {
                 Some(id) => self.engine.inspect(&id),
                 None => {}
             },
+            Shortcut::HardReload => {
+                if let Some(id) = self.active_tab_id() {
+                    self.engine.hard_reload(&id);
+                }
+            }
+            Shortcut::FocusWindow(dir) => {
+                if let Some(id) = self.window_toward(dir) {
+                    self.focus_window(&id, cx);
+                }
+            }
+            Shortcut::MoveWindow(dir) => self.move_window(dir, cx),
+            Shortcut::CloseWindow => {
+                if let Some(id) = self.active_tab_id() {
+                    self.close_window(&id, cx);
+                }
+            }
+            Shortcut::MaximizeWindow => {
+                if let Some(id) = self.active_tab_id() {
+                    self.toggle_maximize(&id, cx);
+                }
+            }
+            Shortcut::MinimizeWindow => {
+                if let Some(id) = self.active_tab_id() {
+                    self.minimize_window(&id, cx);
+                }
+            }
+            Shortcut::NextSpace => self.step_space(1),
+            Shortcut::PrevSpace => self.step_space(-1),
+            Shortcut::NewSpace => {
+                if self.model.detached.is_none() {
+                    self.with_model(|model| { let _ = model.create_session(); });
+                }
+            }
+            Shortcut::History => self.open_history_modal(cx),
+            Shortcut::Downloads | Shortcut::Bookmarks => {
+                let popover = if shortcut == Shortcut::Downloads { Popover::Downloads } else { Popover::Bookmarks };
+                self.popover = (self.popover != Some(popover)).then_some(popover);
+            }
+            Shortcut::CopyUrl => {
+                if let Some(url) = self.model.lock().active_tab().map(|tab| tab.url.clone()) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    self.status = "Copied page address".into();
+                }
+            }
         }
         self.refresh_url(cx);
     }
@@ -1013,7 +1061,7 @@ impl BrowserWindow {
         let _ = self.model.lock().upsert_extension(id, &manifest.name, path, source);
         self.sync_extension(id);
         self.status = format!("Installed {}", manifest.name).into();
-        self.extensions_open = true;
+        self.popover = Some(Popover::Extensions);
     }
 
     /// Installs from a Chrome Web Store URL or extension id, downloading on a background thread.
@@ -1152,6 +1200,7 @@ impl BrowserWindow {
             user_agent: settings.user_agent.clone(),
             page_zoom: settings.page_zoom,
         });
+        self.engine.set_shortcuts(if self.recording.is_some() { Vec::new() } else { crate::shortcuts::keymap(&settings) });
         self.compact = settings.compact();
         self.reduce_motion = settings.reduce_motion;
         // set_settings reset every page to the default zoom.
@@ -1372,9 +1421,25 @@ impl BrowserWindow {
         }
     }
 
+    /// A popover button: opens its popover, or closes it if open.
+    fn toggle_popover(&mut self, popover: Popover, event: &ClickEvent, cx: &mut Context<Self>) {
+        let press = match event {
+            ClickEvent::Mouse(click) => Some(click.down.position),
+            _ => None,
+        };
+        self.popover = toggled(self.popover, self.popover_dismissed.take(), popover, press);
+        cx.notify();
+    }
+
+    /// Closes the open popover on a press outside it.
+    pub(crate) fn dismiss_popover(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.popover_dismissed = self.popover.take().map(|kind| (kind, event.position));
+        cx.notify();
+    }
+
     pub(crate) fn open_history_url(&mut self, url: &str, cx: &mut Context<Self>) {
         let url = url.to_string();
-        self.history_open = false;
+        self.popover = None;
         self.history_modal = false;
         self.commit_navigation(&url, cx);
     }
@@ -1433,7 +1498,7 @@ impl BrowserWindow {
         self.web_downloads.insert(download, (id, shown));
         self.engine.save_download(download, Some(&path));
         self.status = "Download started".into();
-        self.downloads_open = true;
+        self.popover = Some(Popover::Downloads);
     }
 
     pub(crate) fn export_profile(&mut self) {
@@ -1510,6 +1575,25 @@ impl BrowserWindow {
         };
         if self.engine.attach(handle.ns_view.as_ptr()).is_ok() {
             self.attached = true;
+            // Page clicks never reach GPUI, so popovers and the palette can't see them as outside presses.
+            // They close at once; refocusing waits for the tick, as raising a window mid-press could drop the click.
+            let (wake, mut clicks) = futures::channel::mpsc::unbounded();
+            self.engine.on_page_click(move || {
+                let _ = wake.unbounded_send(());
+            });
+            cx.spawn(async move |this, cx| {
+                while clicks.next().await.is_some() {
+                    let closed = this.update(cx, |view, cx| {
+                        view.popover = None;
+                        view.close_palette(cx);
+                        cx.notify();
+                    });
+                    if closed.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
             let effects = self.model.lock().take_effects();
             self.apply(effects);
         }
@@ -1973,11 +2057,14 @@ impl Render for BrowserWindow {
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
-            .when(self.downloads_open, |root| root.child(self.downloads_popover(cx)))
-            .when(self.extensions_open, |root| root.child(self.extensions_popover(cx)))
-            .when(self.history_open, |root| root.child(self.history_popover(cx)))
+            .map(|root| match self.popover {
+                Some(Popover::Downloads) => root.child(self.downloads_popover(cx)),
+                Some(Popover::Extensions) => root.child(self.extensions_popover(cx)),
+                Some(Popover::History) => root.child(self.history_popover(cx)),
+                Some(Popover::Bookmarks) => root.child(self.bookmarks_popover(cx)),
+                None => root,
+            })
             .when(self.history_modal, |root| root.child(self.history_modal(cx)))
-            .when(self.bookmarks_open, |root| root.child(self.bookmarks_popover(cx)))
             .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
@@ -2133,6 +2220,8 @@ impl BrowserWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
+        // Sized to match the 36px profile badges.
+        let rail_button = |id: &'static str, icon| icon_button(id, icon).box_size(rems(2.25)).icon_size(rems(1.125));
         let mut profile_list = v_stack().w_full().items_center().gap(px(8.)).py(px(4.));
         let ids = profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>();
         let activity = self.profile_activity();
@@ -2206,20 +2295,24 @@ impl BrowserWindow {
                     scroll_area("rail-profiles").vertical().full_height(true).child(profile_list),
                 ),
             )
-            .child(icon_button("new-profile-rail", Icons::plus()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.open_new_profile(cx);
-            })))
-            .child(icon_button("downloads-list", Icons::download()).small().selected(self.downloads_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                // Opens only: a click outside the popover (this one included) already closes it.
-                this.downloads_open = true;
-                cx.notify();
-            })))
-            .child(icon_button("open-settings", Icons::gear()).small().selected(self.settings_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.toggle_settings(cx);
-            })))
-            .child(icon_button("more-actions", Icons::dots_vertical()).small().selected(self.panel == Some(SidebarPage::Profiles)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.toggle_panel(SidebarPage::Profiles, cx);
-            })))
+            .child(div().w(px(28.)).h(px(1.)).flex_none().bg(paint.border))
+            .child(
+                v_stack()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(rail_button("new-profile-rail", Icons::plus()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.open_new_profile(cx);
+                    })))
+                    .child(rail_button("downloads-list", Icons::download()).selected(self.popover == Some(Popover::Downloads)).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        this.toggle_popover(Popover::Downloads, event, cx);
+                    })))
+                    .child(rail_button("open-settings", Icons::gear()).selected(self.settings_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_settings(cx);
+                    })))
+                    .child(rail_button("more-actions", Icons::dots_vertical()).selected(self.panel == Some(SidebarPage::Profiles)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.toggle_panel(SidebarPage::Profiles, cx);
+                    }))),
+            )
     }
 
     fn prepare_frames(&mut self, tabs: &[browser_core::Tab]) {
@@ -3690,7 +3783,7 @@ impl BrowserWindow {
                     .hover(|chip| chip.bg(paint.secondary))
                     .child(format!("{} more", saved.len() - 12))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.bookmarks_open = true;
+                        this.popover = Some(Popover::Bookmarks);
                         cx.notify();
                     })),
             );
@@ -3754,27 +3847,95 @@ impl BrowserWindow {
                 this.bookmark();
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
-            .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, _, cx| {
-                let entry = this.chrome.entry(min_id.clone()).or_default();
-                entry.minimized = true;
-                entry.maximized = false;
-                cx.notify();
-            }))
-            .child(self.tool_button(format!("zoom-{zoom_id}"), zoom_icon, false, cx, move |this, _, cx| {
-                let next = !maximized;
-                for chrome in this.chrome.values_mut() {
-                    chrome.maximized = false;
+            .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, _, cx| this.minimize_window(&min_id, cx)))
+            .child(self.tool_button(format!("zoom-{zoom_id}"), zoom_icon, false, cx, move |this, _, cx| this.toggle_maximize(&zoom_id, cx)))
+            .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, _, cx| this.close_window(&close_id, cx)))
+    }
+
+    fn minimize_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        let entry = self.chrome.entry(id.to_string()).or_default();
+        entry.minimized = true;
+        entry.maximized = false;
+        cx.notify();
+    }
+
+    fn toggle_maximize(&mut self, id: &str, cx: &mut Context<Self>) {
+        let next = !self.chrome.get(id).is_some_and(|chrome| chrome.maximized);
+        for chrome in self.chrome.values_mut() {
+            chrome.maximized = false;
+        }
+        let entry = self.chrome.entry(id.to_string()).or_default();
+        entry.maximized = next;
+        entry.minimized = false;
+        self.focus_window(id, cx);
+    }
+
+    /// Closes every tab of the window holding `id`.
+    fn close_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        let group = self.group_id(id);
+        let members = self.chrome.keys().filter(|other| self.group_id(other) == group).cloned().collect::<Vec<_>>();
+        self.close_tabs(members, cx);
+    }
+
+    /// The shown window nearest the active one in direction `dir`.
+    fn window_toward(&self, dir: Dir) -> Option<String> {
+        let active = self.active_tab_id()?;
+        let from = self.visual_frame(&active)?;
+        let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
+        let others = self
+            .shown_tabs(&tabs)
+            .into_iter()
+            .filter(|tab| tab.id != active)
+            .filter_map(|tab| Some((tab.id.clone(), self.visual_frame(&tab.id)?)))
+            .collect::<Vec<_>>();
+        neighbour(from, &others, dir)
+    }
+
+    /// Tiled: trades places with the neighbour that way. Free: snaps to that half of the stage.
+    fn move_window(&mut self, dir: Dir, cx: &mut Context<Self>) {
+        let Some(active) = self.active_tab_id() else {
+            return;
+        };
+        let session = self.model.lock().active_session_id.clone();
+        let group = self.group_id(&active);
+        if self.tiles.get(&session).is_some_and(|tree| tree.contains(&group)) {
+            if let Some(theirs) = self.window_toward(dir).map(|id| self.group_id(&id)) {
+                if let Some(tree) = self.tiles.get_mut(&session) {
+                    tree.swap(&group, &theirs);
                 }
-                let entry = this.chrome.entry(zoom_id.clone()).or_default();
-                entry.maximized = next;
-                entry.minimized = false;
-                this.focus_window(&zoom_id, cx);
-            }))
-            .child(self.tool_button(format!("close-{close_id}"), Icons::cross_2(), false, cx, move |this, _, cx| {
-                let group = this.group_id(&close_id);
-                let members = this.chrome.keys().filter(|id| this.group_id(id) == group).cloned().collect::<Vec<_>>();
-                this.close_tabs(members, cx);
-            }))
+            }
+        } else if let (Some(stage), Some(snap)) = (self.stage_bounds, match dir {
+            Dir::Left => Some(Snap::Left),
+            Dir::Right => Some(Snap::Right),
+            Dir::Up | Dir::Down => None,
+        }) {
+            let fitted = self.snap_frame(snap, &active, f64::from(stage.size.width) as f32, f64::from(stage.size.height) as f32);
+            if let Some(entry) = self.chrome.get_mut(&active) {
+                if entry.snap.is_none() && !entry.maximized {
+                    entry.restore = entry.frame;
+                }
+                (entry.snap, entry.frame, entry.maximized) = (Some(snap), Some(fitted), false);
+            }
+        }
+        self.place_windows();
+        cx.notify();
+    }
+
+    /// Switches to the next space (`step` 1) or the previous one (-1), in the order the spaces bar shows.
+    fn step_space(&mut self, step: isize) {
+        if self.model.detached.is_some() {
+            return;
+        }
+        let next = {
+            let model = self.model.lock();
+            let detached = [model.settings.detached_spaces.as_slice(), model.settings.detached_windows.as_slice()].concat();
+            let ids = model.profile_sessions().into_iter().filter(|s| !detached.contains(&s.id)).map(|s| s.id.clone()).collect::<Vec<_>>();
+            let at = ids.iter().position(|id| *id == model.active_session_id).unwrap_or(0) as isize;
+            ids.get((at + step).rem_euclid(ids.len().max(1) as isize) as usize).cloned()
+        };
+        if let Some(id) = next {
+            self.with_model(|model| { let _ = model.switch_session(&id); });
+        }
     }
 
     fn tool_button(
@@ -3931,32 +4092,22 @@ impl BrowserWindow {
                         icon_button("history-toggle", Icons::file_text())
                             .box_size(rems(1.375))
                             .icon_size(rems(1.0))
-                            .selected(self.history_open || self.history_modal)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.history_open = true;
-                                cx.notify();
-                            })),
+                            .selected(self.popover == Some(Popover::History) || self.history_modal)
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::History, event, cx))),
                     )
                     .child(
                         icon_button("bookmarks-toggle", Icons::bookmark())
                             .box_size(rems(1.375))
                             .icon_size(rems(0.875))
-                            .selected(self.bookmarks_open)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.bookmarks_open = true;
-                                cx.notify();
-                            })),
+                            .selected(self.popover == Some(Popover::Bookmarks))
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::Bookmarks, event, cx))),
                     )
                     .child(
                         icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
                             .box_size(rems(1.375))
                             .icon_size(rems(1.0))
-                            .selected(self.extensions_open)
-                            // Opens only: a click outside the popover (this one included) already closes it.
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.extensions_open = true;
-                                cx.notify();
-                            })),
+                            .selected(self.popover == Some(Popover::Extensions))
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::Extensions, event, cx))),
                     ),
             )
     }
@@ -5198,6 +5349,21 @@ fn magnet(frame: Frame, edges: Edges, others: &[Frame], sw: f32, sh: f32) -> Fra
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Popover {
+    Downloads,
+    Extensions,
+    History,
+    Bookmarks,
+}
+
+/// What a click on `popover`'s button leaves open. Its press landed outside the popover and so
+/// already closed it (`dismissed` there); that click must not reopen it.
+fn toggled(open: Option<Popover>, dismissed: Option<(Popover, gpui::Point<Pixels>)>, popover: Popover, press: Option<gpui::Point<Pixels>>) -> Option<Popover> {
+    let just_closed = dismissed.is_some_and(|(kind, at)| kind == popover && Some(at) == press);
+    (open != Some(popover) && !just_closed).then_some(popover)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum GestureKind {
     Move,
@@ -5885,6 +6051,22 @@ mod tests {
         assert!(hit(248., 150.));
         // A maximized (non-resizable) window has no rim.
         assert!(grab_zones(&stack, &[]).is_empty());
+    }
+
+    #[test]
+    fn popover_button_toggles() {
+        use Popover::{Bookmarks, History};
+        let (here, there) = (Some(gpui::point(px(5.), px(5.))), Some(gpui::point(px(9.), px(5.))));
+        // Closed: opens.
+        assert_eq!(toggled(None, None, History, here), Some(History));
+        // Open: its press closed it, and the click keeps it closed.
+        assert_eq!(toggled(None, Some((History, here.unwrap())), History, here), None);
+        // Another popover's press closed it: this one opens.
+        assert_eq!(toggled(None, Some((History, here.unwrap())), Bookmarks, here), Some(Bookmarks));
+        // An older outside press doesn't block opening later.
+        assert_eq!(toggled(None, Some((History, there.unwrap())), History, here), Some(History));
+        // Keyboard: plain toggle.
+        assert_eq!(toggled(Some(History), None, History, None), None);
     }
 
     #[test]

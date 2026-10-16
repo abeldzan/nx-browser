@@ -70,15 +70,12 @@ impl BrowserWindow {
             .border_color(paint.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.history_open = false;
-                cx.notify();
-            }))
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
             .child(measure_overlay(10., cx))
             .child(popover_header(
                 "History",
                 h_stack().child(icon_button("history-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.history_open = false;
+                    this.popover = None;
                     cx.notify();
                 }))),
                 paint,
@@ -138,7 +135,7 @@ impl BrowserWindow {
 
     pub(crate) fn open_history_modal(&mut self, cx: &mut Context<Self>) {
         self.history_query.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
-        self.history_open = false;
+        self.popover = None;
         self.history_modal = true;
         self.focus_history = true;
         cx.notify();

@@ -5,6 +5,7 @@ mod history;
 mod palette;
 mod profiles;
 mod settings;
+mod shortcuts;
 mod sidebar;
 mod tabs;
 mod terminal;

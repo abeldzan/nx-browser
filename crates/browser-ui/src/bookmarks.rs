@@ -50,15 +50,12 @@ impl BrowserWindow {
             .border_color(paint.border)
             .shadow_lg()
             .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.bookmarks_open = false;
-                cx.notify();
-            }))
+            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
             .child(measure_overlay(10., cx))
             .child(popover_header(
                 "Bookmarks",
                 h_stack().child(icon_button("bookmarks-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.bookmarks_open = false;
+                    this.popover = None;
                     cx.notify();
                 }))),
                 paint,
@@ -88,7 +85,7 @@ impl BrowserWindow {
             .cursor_pointer()
             .hover(|style| style.bg(paint.secondary))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.bookmarks_open = false;
+                this.popover = None;
                 this.open_history_url(&open, cx);
             }))
             .child(div().flex_none().child(site_icon(&bookmark.url, 16., false)))
@@ -111,7 +108,7 @@ impl BrowserWindow {
                     .child(icon_button(SharedString::from(format!("bookmark-edit-{}", bookmark.id)), Icons::pencil_1()).small().on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            this.bookmarks_open = false;
+                            this.popover = None;
                             this.open_bookmark_editor(Some(&edit), cx);
                         },
                     )))
