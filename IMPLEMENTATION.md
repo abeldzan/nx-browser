@@ -76,6 +76,12 @@ Checked items are implemented in this repository. The spec stays in `plan.md`.
 - [x] Address bar suggestions from bookmarks and history (↑/↓/Enter/Esc)
 - [x] ⌘1…9 and ⌃Tab / ⌃⇧Tab tab switching, ⌘P print, page load progress bar
 - [x] Status toasts
+- [x] HTML5 element fullscreen (video players)
+- [x] Private profiles (palette: New private profile): in-memory WebKit store, no history, purged at launch; extensions don't run there
+- [x] Mute tab (palette) and a speaker on tabs playing sound (private `_setPageMuted:` / `_isPlayingAudio`)
+- [x] Focus mode (⌘⇧F) hides the title bar, profile rail and dock
+- [x] Built-in ad/tracker blocking: WebKit content rules from Peter Lowe's list (`scripts/update-blocklist.sh`), third-party requests only; network blocking, no cosmetic filtering
+- [x] Peek: ⌥-click a link opens a floating preview; Esc closes it, the window button keeps it
 
 ## Phase 7 — customization and motion
 

@@ -771,6 +771,7 @@ impl BrowserWindow {
             }
             EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
             EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
+            EngineEvent::Peek { url } => self.open_peek(&url, cx),
             EngineEvent::Audio { tab_id, playing } => {
                 if playing { self.playing.insert(tab_id) } else { self.playing.remove(&tab_id) };
                 cx.notify();
@@ -840,6 +841,11 @@ impl BrowserWindow {
                 }
             }
             Shortcut::CommandPalette => self.open_palette(cx),
+            Shortcut::Dismiss => {
+                if let Some(id) = self.active_tab_id().filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.peek)) {
+                    self.close_tabs(vec![id], cx);
+                }
+            }
             Shortcut::FocusMode => {
                 self.focus_mode = !self.focus_mode;
                 self.status = if self.focus_mode { "Focus mode: ⌘⇧F to exit" } else { "Focus mode off" }.into();
@@ -1063,6 +1069,21 @@ impl BrowserWindow {
     fn panel_url(&self, id: &str) -> Option<String> {
         let path = self.ext_meta.get(id)?.side_panel.clone()?;
         Some(format!("{EXTENSION_SCHEME}{id}/{}", path.trim_start_matches('/')))
+    }
+
+    /// A floating window centred over the stage, out of the tiling, for a quick look at a link.
+    fn open_peek(&mut self, url: &str, cx: &mut Context<Self>) {
+        let Ok(tab_id) = self.with_model(|model| model.create_tab(url)) else {
+            return;
+        };
+        let entry = self.chrome.entry(tab_id.clone()).or_default();
+        entry.peek = true;
+        if let Some(bounds) = self.stage_bounds {
+            let (sw, sh) = (f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32);
+            let (w, h) = (sw * 0.8, sh * 0.85);
+            entry.frame = Some(Frame { x: (sw - w) / 2.0, y: (sh - h) / 2.0, w, h });
+        }
+        self.focus_window(&tab_id, cx);
     }
 
     /// A side panel: a narrow window docked right, titled with just the extension. One per space.
@@ -2166,7 +2187,7 @@ impl BrowserWindow {
             .iter()
             .rev()
             .filter(|id| tabs.iter().any(|tab| tab.id == **id))
-            .find_map(|id| self.chrome.get(id).filter(|entry| !entry.minimized && entry.panel.is_none())?.frame);
+            .find_map(|id| self.chrome.get(id).filter(|entry| !entry.minimized && entry.panel.is_none() && !entry.peek)?.frame);
         for tab in tabs {
             if !self.order.iter().any(|id| id == &tab.id) {
                 self.order.push(tab.id.clone());
@@ -2202,7 +2223,7 @@ impl BrowserWindow {
             // Tile windows: every window on the stage joins, rebuilt from where each one is and how big.
             let fronts = tabs.iter().filter(|tab| self.is_front(&tab.id)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
             for id in fronts {
-                if let Some(entry) = self.chrome.get_mut(&id).filter(|entry| !entry.minimized && entry.panel.is_none()) {
+                if let Some(entry) = self.chrome.get_mut(&id).filter(|entry| !entry.minimized && entry.panel.is_none() && !entry.peek) {
                     if entry.snap.is_none() && !entry.maximized {
                         entry.restore = entry.frame;
                     }
@@ -3378,9 +3399,18 @@ impl BrowserWindow {
         let close_id = tab_id.to_string();
         let maximized = self.chrome.get(tab_id).is_some_and(|chrome| chrome.maximized);
         let zoom_icon = if maximized { Icons::exit_full_screen() } else { Icons::enter_full_screen() };
+        let keep_id = tab_id.to_string();
+        let peek = self.chrome.get(tab_id).is_some_and(|chrome| chrome.peek);
         h_stack()
             .items_center()
             .gap(px(2.))
+            .when(peek, |row| row.child(self.tool_button(format!("keep-{keep_id}"), Icons::open_in_new_window(), false, cx, move |this, _, cx| {
+                // Placed afresh like any new window: tiled, or cascaded in a free space.
+                if let Some(entry) = this.chrome.get_mut(&keep_id) {
+                    (entry.peek, entry.frame) = (false, None);
+                }
+                this.focus_window(&keep_id, cx);
+            })))
             .child(self.tool_button(format!("reload-{reload_id}"), Icons::reload(), false, cx, move |this, _, cx| {
                 this.focus_window(&reload_id, cx);
                 this.reload();
@@ -4573,6 +4603,9 @@ struct TabChrome {
     /// Extension id when this window is that extension's side panel.
     #[serde(default)]
     panel: Option<String>,
+    /// A link preview floating over the stage; Escape closes it, "Open as window" keeps it.
+    #[serde(default)]
+    peek: bool,
     /// Frame, snap and restore frame it had in the main window before being torn off, given back when it returns.
     #[serde(default)]
     home: Option<(Frame, Option<Snap>, Option<Frame>)>,

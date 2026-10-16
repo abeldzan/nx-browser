@@ -59,6 +59,10 @@ pub enum EngineEvent {
     CloseTab {
         tab_id: String,
     },
+    /// ⌥-clicked link, to show in a floating preview over its page.
+    Peek {
+        url: String,
+    },
     Audio {
         tab_id: String,
         playing: bool,
@@ -119,6 +123,8 @@ pub enum Shortcut {
     /// Re-splits the space's windows among the stage; palette and dock only, no key.
     TileWindows,
     FocusMode,
+    /// Escape; the page still gets the key.
+    Dismiss,
 }
 
 pub trait WebEngine {

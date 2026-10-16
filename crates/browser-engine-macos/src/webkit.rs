@@ -27,7 +27,7 @@ use objc2_web_kit::{
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
     WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
-    WKAudiovisualMediaTypes, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
 };
 use uuid::Uuid;
 
@@ -134,6 +134,14 @@ define_class!(
             let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
             let from_extension = web_view.URL().and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
             let target = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
+            // ⌥-click (WebKit's default would download the link) previews it instead, as Zen's Glance.
+            let peek = navigation_action.navigationType() == WKNavigationType::LinkActivated
+                && navigation_action.modifierFlags().contains(NSEventModifierFlags::Option);
+            if let (true, Some(url)) = (peek, target.clone().filter(|url| url.starts_with("https://") || url.starts_with("http://"))) {
+                decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                let _ = self.ivars().events.borrow().send(EngineEvent::Peek { url });
+                return;
+            }
             if let (true, true, Some(url)) = (main_frame, from_extension, target.filter(|url| url.starts_with("https://") || url.starts_with("http://"))) {
                 decision_handler.call((WKNavigationActionPolicy::Cancel,));
                 let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url, from: None });
@@ -1443,6 +1451,10 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
         };
         let flags = event_ref.modifierFlags();
         let shift = flags.contains(NSEventModifierFlags::Shift);
+        const ESCAPE: u16 = 53;
+        if event_ref.keyCode() == ESCAPE {
+            let _ = events.send(EngineEvent::Shortcut(Shortcut::Dismiss));
+        }
         if flags.contains(NSEventModifierFlags::Control) && !flags.contains(NSEventModifierFlags::Command)
             && event_ref.charactersIgnoringModifiers().is_some_and(|chars| ns_string(&chars) == "\t") {
                 let _ = events.send(EngineEvent::Shortcut(if shift { Shortcut::PrevTab } else { Shortcut::NextTab }));
