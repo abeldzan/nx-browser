@@ -45,6 +45,12 @@ const HOME_HTML: &str = r#"<!doctype html>
 
 const OBSERVED_KEYS: [&str; 2] = ["URL", "title"];
 
+thread_local! {
+    /// Popup views WebKit is already loading, keyed by the URL their new tab is created with.
+    /// shortcut: a popup whose tab is never created stays here; evict if that ever matters.
+    static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
+}
+
 define_class!(
     /// WebKit's page view, with the right-click menu's "… in New Window" items saying "… in New Tab":
     /// they open in the page's own window (see `OpenInNewTab::from`).
@@ -208,17 +214,12 @@ define_class!(
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         unsafe fn webView_createWebViewWithConfiguration_forNavigationAction_windowFeatures(
             &self,
-            _web_view: &WKWebView,
-            _configuration: &WKWebViewConfiguration,
+            web_view: &WKWebView,
+            configuration: &WKWebViewConfiguration,
             navigation_action: &WKNavigationAction,
             _window_features: &WKWindowFeatures,
         ) -> Option<Retained<WKWebView>> {
-            if navigation_action.targetFrame().is_none() {
-                if let Some(url) = navigation_action.request().URL().and_then(|url| url.absoluteString()) {
-                    let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url: ns_string(&url), from: Some(self.ivars().tab_id.clone()) });
-                }
-            }
-            None
+            self.open_popup(web_view, configuration, navigation_action)
         }
 
         #[unsafe(method(webViewDidClose:))]
@@ -330,6 +331,30 @@ impl NxWebDelegate {
     fn new(mtm: MainThreadMarker, ivars: DelegateIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn open_popup(&self, web_view: &WKWebView, configuration: &WKWebViewConfiguration, navigation_action: &WKNavigationAction) -> Option<Retained<WKWebView>> {
+        if unsafe { navigation_action.targetFrame() }.is_some() {
+            return None;
+        }
+        let Some(url) = unsafe { navigation_action.request() }.URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url)) else {
+            return None;
+        };
+        let from_extension = unsafe { web_view.URL() }.and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
+        // Web popups get a real view built from WebKit's configuration so `window.opener` works:
+        // OAuth sign-ins (Figma, Google, ...) post their result back through it. `ensure_tab` adopts it.
+        let popup = (!from_extension).then(|| {
+            let frame = objc2_core_foundation::CGRect {
+                origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
+                size: objc2_core_foundation::CGSize { width: 100.0, height: 100.0 },
+            };
+            let view: Retained<NxWebView> = unsafe { msg_send![NxWebView::alloc(MainThreadMarker::from(self)), initWithFrame: frame, configuration: configuration] };
+            let view = Retained::into_super(view);
+            POPUPS.with_borrow_mut(|popups| popups.insert(url.clone(), view.clone()));
+            view
+        });
+        let _ = self.ivars().events.borrow().send(EngineEvent::OpenInNewTab { url, from: Some(self.ivars().tab_id.clone()) });
+        popup
     }
 
     fn emit_page(&self, web_view: &WKWebView, loading: bool) {
@@ -836,45 +861,27 @@ impl WebEngine for MacEngine {
         }
         let mtm = MainThreadMarker::new().ok_or_else(|| anyhow::anyhow!("WebKit must be created on the main thread"))?;
         let store = data_store(data_store_id, mtm)?;
-        let configuration = if url.starts_with(SCHEME) {
-            // Retried every tick by the caller until the extension has loaded.
-            self.extensions.page_configuration(url, data_store_id).context("extension not loaded yet")?
-        } else {
-            let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
-            let controller = self.extensions.controller(&store, data_store_id, mtm);
-            unsafe { configuration.setWebExtensionController(controller.as_deref()) };
-            configuration
+        let popup = POPUPS.with_borrow_mut(|popups| popups.remove(url));
+        let adopted = popup.is_some();
+        let view = match popup {
+            Some(view) => view,
+            None => self.new_view(tab_id, data_store_id, url, &store, mtm)?,
         };
-        // Sites like YouTube Music sniff for the Safari suffix that bare WKWebView omits.
-        unsafe { configuration.setApplicationNameForUserAgent(Some(&NSString::from_str(&safari_ua_suffix()))) };
-        unsafe {
-            configuration.setWebsiteDataStore(&store);
-            let preferences = configuration.preferences();
-            preferences.setJavaScriptCanOpenWindowsAutomatically(!self.settings.block_popups);
-            preferences.setFraudulentWebsiteWarningEnabled(self.settings.fraud_warnings);
-            configuration.defaultWebpagePreferences().setAllowsContentJavaScript(self.settings.javascript);
-            if self.hold_media.remove(tab_id) {
-                configuration.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::All);
-            }
-        }
-        let frame = objc2_core_foundation::CGRect {
-            origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
-            size: objc2_core_foundation::CGSize { width: 100.0, height: 100.0 },
-        };
-        let view: Retained<NxWebView> = unsafe { msg_send![NxWebView::alloc(mtm), initWithFrame: frame, configuration: &*configuration] };
-        let view = Retained::into_super(view);
         apply_view_settings(&view, &self.settings);
         detach_inspector(&view, mtm);
         let delegate = self.page_delegate(tab_id, mtm);
         unsafe {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             view.setUIDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-            view.configuration().userContentController().addScriptMessageHandler_contentWorld_name(
-                ProtocolObject::from_ref(&*delegate),
-                &key_world(mtm),
-                ns_string!("nxShortcut"),
-            );
-            add_key_script(&view.configuration().userContentController(), mtm);
+            // A popup shares its opener's content controller, which already has the handler and script.
+            if !adopted {
+                view.configuration().userContentController().addScriptMessageHandler_contentWorld_name(
+                    ProtocolObject::from_ref(&*delegate),
+                    &key_world(mtm),
+                    ns_string!("nxShortcut"),
+                );
+                add_key_script(&view.configuration().userContentController(), mtm);
+            }
         }
         observe(&view, &delegate);
         self.extensions.opened(tab_id, data_store_id, url, &view, mtm);
@@ -883,7 +890,8 @@ impl WebEngine for MacEngine {
         if self.cookie_restore.remove(data_store_id) {
             self.begin_cookie_restore(data_store_id, &store);
         }
-        let held = self.held_loads.borrow_mut().get_mut(data_store_id).map(|loads| loads.push((view.clone(), url.to_string()))).is_some();
+        // An adopted popup is already loading its page.
+        let held = adopted || self.held_loads.borrow_mut().get_mut(data_store_id).map(|loads| loads.push((view.clone(), url.to_string()))).is_some();
         if !held {
             self.navigate(tab_id, url)?;
         }
@@ -1079,6 +1087,37 @@ impl MacEngine {
         if self.visible.as_deref() == Some(tab_id) {
             self.visible = None;
         }
+    }
+
+    fn new_view(&mut self, tab_id: &str, data_store_id: &str, url: &str, store: &WKWebsiteDataStore, mtm: MainThreadMarker) -> anyhow::Result<Retained<WKWebView>> {
+        let configuration = if url.starts_with(SCHEME) {
+            // Retried every tick by the caller until the extension has loaded.
+            self.extensions.page_configuration(url, data_store_id).context("extension not loaded yet")?
+        } else {
+            let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+            let controller = self.extensions.controller(store, data_store_id, mtm);
+            unsafe { configuration.setWebExtensionController(controller.as_deref()) };
+            configuration
+        };
+        // Sites like YouTube Music sniff for the Safari suffix that bare WKWebView omits.
+        unsafe { configuration.setApplicationNameForUserAgent(Some(&NSString::from_str(&safari_ua_suffix()))) };
+        unsafe {
+            configuration.setWebsiteDataStore(store);
+            let preferences = configuration.preferences();
+            preferences.setJavaScriptCanOpenWindowsAutomatically(!self.settings.block_popups);
+            preferences.setFraudulentWebsiteWarningEnabled(self.settings.fraud_warnings);
+            preferences.setElementFullscreenEnabled(true);
+            configuration.defaultWebpagePreferences().setAllowsContentJavaScript(self.settings.javascript);
+            if self.hold_media.remove(tab_id) {
+                configuration.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::All);
+            }
+        }
+        let frame = objc2_core_foundation::CGRect {
+            origin: objc2_core_foundation::CGPoint { x: 0.0, y: 0.0 },
+            size: objc2_core_foundation::CGSize { width: 100.0, height: 100.0 },
+        };
+        let view: Retained<NxWebView> = unsafe { msg_send![NxWebView::alloc(mtm), initWithFrame: frame, configuration: &*configuration] };
+        Ok(Retained::into_super(view))
     }
 
     fn page_delegate(&self, tab_id: &str, mtm: MainThreadMarker) -> Retained<NxWebDelegate> {
@@ -1409,11 +1448,61 @@ fn install_hit_proxy(chrome: &NSView) {
         unsafe {
             builder.add_method(sel!(hitTest:), hit_test as extern "C-unwind" fn(_, _, _) -> _);
             builder.add_method(sel!(performKeyEquivalent:), key_equivalent as extern "C-unwind" fn(_, _, _) -> _);
+            // AppKit picks a drop target with `_hitTest:dragTypes:`, not `hitTest:`, so pages beneath the chrome
+            // took every file drop. Without that private selector drops just fall back to the window as before.
+            builder.add_method(sel!(_hitTest:dragTypes:), drag_hit_test as extern "C-unwind" fn(_, _, _, _) -> _);
+            builder.add_method(sel!(draggingEntered:), drag_entered as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(draggingUpdated:), drag_updated as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(draggingExited:), drag_exited as extern "C-unwind" fn(_, _, _));
+            builder.add_method(sel!(performDragOperation:), drag_perform as extern "C-unwind" fn(_, _, _) -> _);
+            builder.add_method(sel!(concludeDragOperation:), drag_conclude as extern "C-unwind" fn(_, _, _));
         }
         builder.register()
     });
     unsafe {
         objc2::ffi::object_setClass(std::ptr::from_ref(chrome).cast_mut().cast(), *class);
+        let types = NSArray::from_slice(&[ns_string!("public.file-url")]);
+        let _: () = msg_send![chrome, registerForDraggedTypes: &*types];
+    }
+}
+
+/// The chrome takes file drags except over a page showing through it; GPUI handles them on the window.
+extern "C-unwind" fn drag_hit_test(this: &AnyObject, _cmd: Sel, point: *mut NSPoint, _types: *mut AnyObject) -> *mut AnyObject {
+    let view = unsafe { &*std::ptr::from_ref(this).cast::<NSView>() };
+    let (Some(window), Some(point)) = (view.window(), unsafe { point.as_ref() }) else {
+        return std::ptr::null_mut();
+    };
+    if !hole_contains(view.frame(), *point) || with_window(window.windowNumber(), |state| over_page(state, *point).is_some()) == Some(true) {
+        return std::ptr::null_mut();
+    }
+    std::ptr::from_ref(this).cast_mut()
+}
+
+fn drag_window(this: &AnyObject) -> Option<Retained<objc2_app_kit::NSWindow>> {
+    unsafe { &*std::ptr::from_ref(this).cast::<NSView>() }.window()
+}
+
+extern "C-unwind" fn drag_entered(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> usize {
+    drag_window(this).map_or(0, |window| unsafe { msg_send![&*window, draggingEntered: info] })
+}
+
+extern "C-unwind" fn drag_updated(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> usize {
+    drag_window(this).map_or(0, |window| unsafe { msg_send![&*window, draggingUpdated: info] })
+}
+
+extern "C-unwind" fn drag_exited(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) {
+    if let Some(window) = drag_window(this) {
+        let _: () = unsafe { msg_send![&*window, draggingExited: info] };
+    }
+}
+
+extern "C-unwind" fn drag_perform(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> Bool {
+    drag_window(this).map_or(Bool::NO, |window| unsafe { msg_send![&*window, performDragOperation: info] })
+}
+
+extern "C-unwind" fn drag_conclude(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) {
+    if let Some(window) = drag_window(this) {
+        let _: () = unsafe { msg_send![&*window, concludeDragOperation: info] };
     }
 }
 

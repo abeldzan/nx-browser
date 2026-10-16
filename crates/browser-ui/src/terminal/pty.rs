@@ -24,6 +24,10 @@ pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Unb
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "nxbrowser");
+    // A Finder-launched app has no locale, which garbles non-ASCII in zsh and agent CLIs.
+    if std::env::var_os("LANG").is_none() {
+        cmd.env("LANG", "en_US.UTF-8");
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if let Some(dir) = Some(cwd).filter(|dir| dir.is_dir()).map(Path::to_path_buf).or(home) {
         cmd.cwd(dir);

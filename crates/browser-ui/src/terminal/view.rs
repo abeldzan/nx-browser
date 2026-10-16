@@ -277,9 +277,15 @@ impl TerminalView {
             return;
         }
         if paste {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let bytes = paste_bytes(&text, self.emu.bracketed_paste());
-                self.write_input(&bytes, cx);
+            if let Some(item) = cx.read_from_clipboard() {
+                match item.text() {
+                    Some(text) => {
+                        let bytes = paste_bytes(&text, self.emu.bracketed_paste());
+                        self.write_input(&bytes, cx);
+                    }
+                    // An image (a screenshot): Ctrl+V makes agent CLIs read it from the clipboard and attach it.
+                    None => self.write_input(&[0x16], cx),
+                }
             }
             cx.stop_propagation();
             return;
@@ -643,7 +649,8 @@ fn dropped_paths(paths: &[std::path::PathBuf]) -> String {
 }
 
 fn paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
-    if bracketed_paste { format!("\x1b[200~{text}\x1b[201~").into_bytes() } else { text.as_bytes().to_vec() }
+    // An end marker inside the text would end the paste early and run what follows as typed commands.
+    if bracketed_paste { format!("\x1b[200~{}\x1b[201~", text.replace("\x1b[201~", "")).into_bytes() } else { text.as_bytes().to_vec() }
 }
 
 struct TermBgRun {
@@ -900,6 +907,12 @@ mod tests {
     fn dropped_paths_are_shell_escaped() {
         let paths = [std::path::PathBuf::from("/tmp/Screen Shot (1).png"), std::path::PathBuf::from("/a/b.jpg")];
         assert_eq!(dropped_paths(&paths), "/tmp/Screen\\ Shot\\ \\(1\\).png /a/b.jpg ");
+    }
+
+    #[test]
+    fn paste_cannot_end_bracketed_mode_early() {
+        assert_eq!(paste_bytes("a\x1b[201~rm -rf ~\n", true), b"\x1b[200~arm -rf ~\n\x1b[201~");
+        assert_eq!(paste_bytes("a", false), b"a");
     }
 
     #[test]
