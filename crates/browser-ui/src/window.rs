@@ -137,6 +137,9 @@ pub struct BrowserWindow {
     loading: bool,
     /// Tabs whose page is playing sound, for the speaker beside their title.
     playing: HashSet<String>,
+    /// Tabs a page opened (popup → opener). An opener stays live while its popup is in front:
+    /// suspending it would drop the page an OAuth popup reports back to.
+    openers: HashMap<String, String>,
     /// Hides the title bar, profile rail and dock so only pages show (Orion/Zen focus mode).
     focus_mode: bool,
     started: Instant,
@@ -464,6 +467,7 @@ impl BrowserWindow {
             attached: false,
             loading: false,
             playing: HashSet::new(),
+            openers: HashMap::new(),
             focus_mode: false,
             started,
             metrics: "Measuring…".into(),
@@ -677,8 +681,9 @@ impl BrowserWindow {
             // Every window on the stage is showing its page; suspending one makes it reload in place.
             let entry = self.chrome.get(&tab_id);
             let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized)) || !self.is_front(&tab_id);
+            let popup_in_front = self.openers.iter().any(|(child, opener)| opener == &tab_id && self.is_front(child));
             let mut model = self.model.lock();
-            if hidden {
+            if hidden && !popup_in_front {
                 let _ = model.mark_suspended(&tab_id);
             } else {
                 model.keep_alive(&tab_id);
@@ -727,7 +732,12 @@ impl BrowserWindow {
                 let from = from.filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_none()));
                 match (panel, from) {
                     (Some(id), _) => self.open_extension_panel(&id, &url, cx),
-                    (None, Some(from)) => self.new_tab_in(&from, Some(&url), cx),
+                    (None, Some(from)) => {
+                        self.new_tab_in(&from, Some(&url), cx);
+                        if let Some(child) = self.model.lock().active_tab().map(|tab| tab.id.clone()) {
+                            self.openers.insert(child, from);
+                        }
+                    }
                     (None, None) => self.with_model(|model| {
                         let _ = model.create_tab(&url);
                     }),
@@ -1086,6 +1096,7 @@ impl BrowserWindow {
             block_popups: settings.block_popups,
             fraud_warnings: settings.fraud_warnings,
             https_only: settings.https_only,
+            block_ads: settings.block_ads,
             inspectable: settings.inspector,
             user_agent: settings.user_agent.clone(),
             page_zoom: settings.page_zoom,
@@ -1154,6 +1165,7 @@ impl BrowserWindow {
             cx.notify();
             return;
         }
+        self.openers.retain(|child, _| !ids.contains(child));
         self.with_model(|model| {
             for id in &ids {
                 let _ = model.close_tab(id);

@@ -22,6 +22,8 @@ pub struct Settings {
     pub search_engine: String,
     pub save_history: bool,
     pub https_only: bool,
+    /// Built-in ad and tracker blocking (WebKit content rules).
+    pub block_ads: bool,
     pub block_popups: bool,
     pub fraud_warnings: bool,
     pub javascript: bool,
@@ -65,6 +67,7 @@ impl Default for Settings {
             search_engine: "DuckDuckGo".into(),
             save_history: true,
             https_only: false,
+            block_ads: true,
             block_popups: true,
             fraud_warnings: true,
             javascript: true,

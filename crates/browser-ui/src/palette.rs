@@ -239,7 +239,7 @@ impl BrowserWindow {
             }
             // Zen-style toggles; the label says what picking it will do.
             let on_off = |on: bool| if on { "Turn off" } else { "Turn on" };
-            let toggles: [(String, fn(&mut Settings)); 7] = [
+            let toggles: [(String, fn(&mut Settings)); 8] = [
                 ("Use dark theme".into(), |s| s.theme = "dark".into()),
                 ("Use light theme".into(), |s| s.theme = "light".into()),
                 ("Use system theme".into(), |s| s.theme = "system".into()),
@@ -249,6 +249,7 @@ impl BrowserWindow {
                 (format!("{} reduced motion", on_off(settings.reduce_motion)), |s| s.reduce_motion = !s.reduce_motion),
                 (format!("{} HTTPS-only mode", on_off(settings.https_only)), |s| s.https_only = !s.https_only),
                 (format!("{} JavaScript", on_off(settings.javascript)), |s| s.javascript = !s.javascript),
+                (format!("{} ad blocking", on_off(settings.block_ads)), |s| s.block_ads = !s.block_ads),
             ];
             for (label, change) in toggles {
                 add(&label, item("Settings", label.clone(), "", Run::Pref(change)));

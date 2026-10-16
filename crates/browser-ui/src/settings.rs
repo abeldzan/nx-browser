@@ -523,6 +523,12 @@ impl BrowserWindow {
                     paint,
                 ))
                 .child(row(
+                    "Block ads and trackers",
+                    Some("Blocks requests to known ad and tracking hosts."),
+                    switch("ads", settings.block_ads, |s, v| s.block_ads = v, paint, cx),
+                    paint,
+                ))
+                .child(row(
                     "Block pop-ups",
                     Some("Stops pages opening windows on their own. Applies to new tabs."),
                     switch("popups", settings.block_popups, |s, v| s.block_popups = v, paint, cx),

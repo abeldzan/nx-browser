@@ -27,7 +27,7 @@ use objc2_web_kit::{
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
     WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
-    WKAudiovisualMediaTypes, WKWebsiteDataStore, WKWindowFeatures,
+    WKAudiovisualMediaTypes, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
 };
 use uuid::Uuid;
 
@@ -52,6 +52,8 @@ thread_local! {
     static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
     /// Muted tabs, kept across windows and page re-creation (a suspended tab comes back muted).
     static MUTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// The compiled block list, once WebKit has it; `views` waits for it with each view's wanted state.
+    static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
 }
 
@@ -1210,6 +1212,7 @@ fn detach_inspector(view: &WKWebView, mtm: MainThreadMarker) {
 }
 
 fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
+    set_blocking(view, settings.block_ads);
     let agent = (!settings.user_agent.trim().is_empty()).then(|| NSString::from_str(settings.user_agent.trim()));
     unsafe {
         view.setInspectable(settings.inspectable);
@@ -1218,6 +1221,79 @@ fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
         view.setCustomUserAgent(agent.as_deref());
         view.setPageZoom(settings.page_zoom);
     }
+}
+
+const BLOCKLIST_JSON: &str = include_str!("blocklist.json");
+
+#[derive(Default)]
+struct Blocklist {
+    list: Option<Retained<WKContentRuleList>>,
+    started: bool,
+    /// Views asked for before compiling finished, applied when it does.
+    waiting: Vec<(Retained<WKWebView>, bool)>,
+}
+
+/// Adds or removes the built-in block list on a page; the first call compiles it (cached by WebKit across launches).
+fn set_blocking(view: &WKWebView, on: bool) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let list = BLOCKLIST.with_borrow_mut(|state| {
+        if state.list.is_none() {
+            state.waiting.retain(|(waiting, _)| !std::ptr::eq(&**waiting, view));
+            state.waiting.push((objc2::Message::retain(view), on));
+        }
+        let start = !state.started;
+        state.started = true;
+        (state.list.clone(), start)
+    });
+    match list {
+        (Some(list), _) => unsafe {
+            let controller = view.configuration().userContentController();
+            controller.removeContentRuleList(&list);
+            if on {
+                controller.addContentRuleList(&list);
+            }
+        },
+        (None, true) => compile_blocklist(mtm),
+        (None, false) => {}
+    }
+}
+
+fn compile_blocklist(mtm: MainThreadMarker) {
+    let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else { return };
+    // The id changes with the list, so an updated list compiles instead of reusing the stale cache.
+    let id = NSString::from_str(&format!("nx-blocklist-{}", BLOCKLIST_JSON.len()));
+    let done = RcBlock::new(|list: *mut WKContentRuleList, error: *mut NSError| {
+        let Some(list) = (unsafe { Retained::retain(list) }) else {
+            if let Some(error) = unsafe { error.as_ref() } {
+                eprintln!("block list failed to compile: {}", error.localizedDescription());
+            }
+            return;
+        };
+        let waiting = BLOCKLIST.with_borrow_mut(|state| {
+            state.list = Some(list);
+            std::mem::take(&mut state.waiting)
+        });
+        for (view, on) in waiting {
+            set_blocking(&view, on);
+        }
+    });
+    let compile_store = store.clone();
+    let compile_id = id.clone();
+    let compile_done = done.clone();
+    let lookup = RcBlock::new(move |list: *mut WKContentRuleList, _error: *mut NSError| {
+        if list.is_null() {
+            unsafe {
+                compile_store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+                    Some(&compile_id),
+                    Some(&NSString::from_str(BLOCKLIST_JSON)),
+                    Some(&compile_done),
+                );
+            }
+        } else {
+            compile_done.call((list, std::ptr::null_mut()));
+        }
+    });
+    unsafe { store.lookUpContentRuleListForIdentifier_completionHandler(Some(&id), Some(&lookup)) };
 }
 
 pub(crate) fn safari_ua_suffix() -> String {
