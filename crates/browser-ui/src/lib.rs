@@ -75,15 +75,19 @@ pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: i
     .expect("open window");
 }
 
-/// gpuikit's assets plus the app's own icons (Radix has no puzzle piece for extensions).
+/// gpuikit's assets plus the app's own icons (Radix has no puzzle piece or microphone).
 struct Assets;
 
 pub(crate) const PUZZLE_ICON: &str = "icons/app/puzzle.svg";
+pub(crate) const MIC_ICON: &str = "icons/app/mic.svg";
 
 impl gpui::AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
         if path == PUZZLE_ICON {
             return Ok(Some(include_bytes!("../assets/puzzle.svg").as_slice().into()));
+        }
+        if path == MIC_ICON {
+            return Ok(Some(include_bytes!("../assets/mic.svg").as_slice().into()));
         }
         gpuikit::assets().load(path)
     }

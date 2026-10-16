@@ -44,7 +44,7 @@ const HOME_HTML: &str = r#"<!doctype html>
 </html>"#;
 
 /// `_isPlayingAudio` is private but KVO-observable, as Safari's tab speaker uses it.
-const OBSERVED_KEYS: [&str; 3] = ["URL", "title", "_isPlayingAudio"];
+const OBSERVED_KEYS: [&str; 5] = ["URL", "title", "_isPlayingAudio", "cameraCaptureState", "microphoneCaptureState"];
 
 thread_local! {
     /// Popup views WebKit is already loading, keyed by the URL their new tab is created with.
@@ -323,6 +323,15 @@ define_class!(
                 if let Some(web_view) = object {
                     let playing: Bool = unsafe { msg_send![web_view, _isPlayingAudio] };
                     let _ = self.ivars().events.borrow().send(EngineEvent::Audio { tab_id: self.ivars().tab_id.clone(), playing: playing.as_bool() });
+                }
+                return;
+            }
+            if key_path.is_some_and(|key| ns_string(key).ends_with("CaptureState")) {
+                if let Some(web_view) = object {
+                    // WKMediaCaptureState: 0 none, 1 active, 2 muted; muted counts as off.
+                    let camera: isize = unsafe { msg_send![web_view, cameraCaptureState] };
+                    let microphone: isize = unsafe { msg_send![web_view, microphoneCaptureState] };
+                    let _ = self.ivars().events.borrow().send(EngineEvent::Capture { tab_id: self.ivars().tab_id.clone(), camera: camera == 1, microphone: microphone == 1 });
                 }
                 return;
             }

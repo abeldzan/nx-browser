@@ -67,6 +67,12 @@ pub enum EngineEvent {
         tab_id: String,
         playing: bool,
     },
+    /// The page is recording from the camera or microphone.
+    Capture {
+        tab_id: String,
+        camera: bool,
+        microphone: bool,
+    },
 }
 
 /// Browser settings the engine applies to web views.

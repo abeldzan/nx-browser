@@ -137,6 +137,8 @@ pub struct BrowserWindow {
     loading: bool,
     /// Tabs whose page is playing sound, for the speaker beside their title.
     playing: HashSet<String>,
+    /// Tabs whose page is recording: (camera, microphone).
+    capturing: HashMap<String, (bool, bool)>,
     /// Tabs a page opened (popup → opener). An opener stays live while its popup is in front:
     /// suspending it would drop the page an OAuth popup reports back to.
     openers: HashMap<String, String>,
@@ -465,6 +467,7 @@ impl BrowserWindow {
             attached: false,
             loading: false,
             playing: HashSet::new(),
+            capturing: HashMap::new(),
             openers: HashMap::new(),
             started,
             metrics: "Measuring…".into(),
@@ -771,6 +774,10 @@ impl BrowserWindow {
             EngineEvent::Peek { url } => self.open_peek(&url, cx),
             EngineEvent::Audio { tab_id, playing } => {
                 if playing { self.playing.insert(tab_id) } else { self.playing.remove(&tab_id) };
+                cx.notify();
+            }
+            EngineEvent::Capture { tab_id, camera, microphone } => {
+                if camera || microphone { self.capturing.insert(tab_id, (camera, microphone)) } else { self.capturing.remove(&tab_id) };
                 cx.notify();
             }
         }
@@ -2041,6 +2048,24 @@ impl BrowserWindow {
         cx.notify();
     }
 
+    /// What each profile's pages are doing across this window's tabs, for the rail.
+    fn profile_activity(&self) -> HashMap<String, Activity> {
+        let model = self.model.lock();
+        let mut out = HashMap::<String, Activity>::new();
+        for tab in &model.tabs {
+            let Some(session) = model.sessions.iter().find(|session| session.id == tab.session_id) else {
+                continue;
+            };
+            let (camera, microphone) = self.capturing.get(&tab.id).copied().unwrap_or_default();
+            let sound = self.playing.contains(&tab.id) && !self.engine.is_muted(&tab.id);
+            let entry = out.entry(session.profile_id.clone()).or_default();
+            entry.camera |= camera;
+            entry.microphone |= microphone;
+            entry.sound |= sound;
+        }
+        out
+    }
+
     fn rail(
         &self,
         profiles: &[browser_core::Profile],
@@ -2048,18 +2073,34 @@ impl BrowserWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
-        let mut profile_list = v_stack().w_full().items_center().gap(px(6.)).py(px(4.));
+        let mut profile_list = v_stack().w_full().items_center().gap(px(8.)).py(px(4.));
         let ids = profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>();
+        let activity = self.profile_activity();
         for profile in shown_row(self.reorder.as_ref(), RAIL_ROW, &ids).iter().filter_map(|id| profiles.iter().find(|profile| profile.id == *id)) {
             let index = profiles.iter().position(|other| other.id == profile.id).unwrap_or(0);
             let id = profile.id.clone();
             let active = profile.id == active_profile;
             let dragged = RailDrag(profile.clone());
             let (grab, offset) = (self.rail_grab.clone(), self.slide_offset(&id));
-            let badge = profile_badge(profile, active, 32., paint)
-                .relative()
+            let tint = profile_tint(profile, paint);
+            let badge = profile_badge(profile, active, 36., paint)
                 .left(offset.x)
                 .top(offset.y)
+                .group(SharedString::from(format!("rail-{id}")))
+                // The pill at the rail's edge marks the open profile, and peeks out on hover for the rest.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(-10.))
+                        .top(px(if active { 8. } else { 14. }))
+                        .w(px(3.))
+                        .h(px(if active { 20. } else { 8. }))
+                        .rounded_r(px(3.))
+                        .bg(tint)
+                        .when(!active, |pill| pill.opacity(0.).group_hover(format!("rail-{id}"), |style| style.opacity(0.6))),
+                )
+                .when(!active, |badge| badge.hover(|style| style.bg(tint.opacity(0.24))))
+                .when_some(activity.get(&profile.id).filter(|state| state.any()), |badge, state| badge.child(activity_chip(*state, paint)))
                 .when(self.picked(&id, cx), |badge| badge.opacity(0.))
                 .child(self.measure_slot(&id, cx))
                 .id(SharedString::from(format!("rail-{id}")))
@@ -5407,38 +5448,67 @@ struct RailDragPreview(browser_core::Profile, Paint);
 
 impl Render for RailDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        profile_badge(&self.0, false, 32., self.1).opacity(0.85)
+        profile_badge(&self.0, false, 36., self.1).opacity(0.85)
     }
 }
 
-/// Profile icon (emoji, Radix icon, or initial); the accent marks the active profile and a corner dot shows its color.
+/// The profile's color, or the theme accent when it has none.
+pub(crate) fn profile_tint(profile: &browser_core::Profile, paint: Paint) -> gpui::Hsla {
+    if profile.color.is_empty() { paint.accent } else { parse_hex(&profile.color) }
+}
+
+/// Profile icon (emoji, Radix icon, or initial) on a wash of its color; the active one gets a stronger wash and a ring.
 pub(crate) fn profile_badge(profile: &browser_core::Profile, active: bool, size: f32, paint: Paint) -> gpui::Div {
-    let fg = if active { paint.bg } else { paint.fg };
+    let tint = profile_tint(profile, paint);
     div()
         .relative()
         .size(px(size))
         .flex_none()
-        .rounded(px(size / 4.))
+        .rounded(px(size * 0.3))
         .flex()
         .items_center()
         .justify_center()
         .text_size(px(size * 0.45))
-        .bg(if active { paint.accent } else { paint.secondary })
-        .text_color(fg)
-        .child(profile_glyph(&profile.icon, &profile.name, size * 0.5, fg))
-        .when(!profile.color.is_empty(), |badge| {
-            badge.child(
-                div()
-                    .absolute()
-                    .right(px(-3.))
-                    .bottom(px(-3.))
-                    .size(px(size * 0.32))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(paint.surface)
-                    .bg(parse_hex(&profile.color)),
-            )
-        })
+        .bg(tint.opacity(if active { 0.3 } else { 0.12 }))
+        .border_1()
+        .border_color(if active { tint.opacity(0.9) } else { tint.opacity(0.18) })
+        .text_color(paint.fg)
+        .child(profile_glyph(&profile.icon, &profile.name, size * 0.5, if active { tint } else { paint.fg }))
+}
+
+/// Media in use by a profile's pages.
+#[derive(Clone, Copy, Default)]
+struct Activity {
+    camera: bool,
+    microphone: bool,
+    sound: bool,
+}
+
+impl Activity {
+    fn any(self) -> bool {
+        self.camera || self.microphone || self.sound
+    }
+}
+
+/// A capsule on the badge's corner: red camera, orange microphone (macOS's recording colors), and a speaker.
+fn activity_chip(state: Activity, paint: Paint) -> gpui::Div {
+    let glyph = |icon: gpui::Svg, color: gpui::Hsla| icon.size(px(9.)).text_color(color);
+    h_stack()
+        .absolute()
+        .right(px(-6.))
+        .bottom(px(-5.))
+        .h(px(16.))
+        .px(px(4.))
+        .gap(px(3.))
+        .items_center()
+        .rounded_full()
+        .bg(paint.bg)
+        .border_2()
+        .border_color(paint.surface)
+        .shadow_sm()
+        .when(state.camera, |chip| chip.child(glyph(Icons::video(), parse_hex("#ff453a"))))
+        .when(state.microphone, |chip| chip.child(glyph(gpui::svg().path(crate::MIC_ICON), parse_hex("#ff9f0a"))))
+        .when(state.sound, |chip| chip.child(glyph(Icons::speaker_loud(), paint.fg)))
 }
 
 /// Draws an icon value: a `.svg` asset path, an emoji, or (empty) the name's initial.
