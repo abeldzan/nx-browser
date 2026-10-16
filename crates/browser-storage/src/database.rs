@@ -128,6 +128,7 @@ impl Storage {
             ("sessions", "free", "INTEGER NOT NULL DEFAULT 0"),
             ("extensions", "source", "TEXT NOT NULL DEFAULT 'bundled'"),
             ("extensions", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("bookmarks", "pinned", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let has = self
                 .conn

@@ -1,3 +1,4 @@
+mod bookmarks;
 mod downloads;
 mod extensions;
 mod history;

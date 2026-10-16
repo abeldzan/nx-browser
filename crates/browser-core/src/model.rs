@@ -70,6 +70,8 @@ pub struct Bookmark {
     pub url: String,
     pub title: String,
     pub created_at: i64,
+    /// Shown as a tile on the new-tab page.
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +183,7 @@ pub struct Model {
     /// Last history and suggestion answers; render asks the same LIKE scan every frame while a list is open.
     history_memo: Memo<Vec<HistoryEntry>>,
     suggest_memo: Memo<Vec<(String, String)>>,
+    bookmarks_memo: Memo<Vec<Bookmark>>,
 }
 
 /// (storage generation, profile, query, limit): any write or a different question misses.
@@ -218,6 +221,7 @@ impl Model {
             ext_cache: HashMap::new(),
             history_memo: RefCell::new(None),
             suggest_memo: RefCell::new(None),
+            bookmarks_memo: RefCell::new(None),
         };
         model.reload()?;
         // A private profile left by the last run (quit or crash) has nothing worth keeping.
@@ -821,20 +825,45 @@ impl Model {
         Ok(true)
     }
 
+    /// Newest first. Memoized: the star button and new-tab page ask every frame.
     pub fn bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
-        let mut stmt = self.storage.conn().prepare_cached(
-            "SELECT id, profile_id, url, title, created_at FROM bookmarks WHERE profile_id = ?1 ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map(params![self.active_profile_id], |row| {
-            Ok(Bookmark {
-                id: row.get(0)?,
-                profile_id: row.get(1)?,
-                url: row.get(2)?,
-                title: row.get(3)?,
-                created_at: row.get(4)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        memo(&self.bookmarks_memo, self.memo_key("", 0), || {
+            let mut stmt = self.storage.conn().prepare_cached(
+                "SELECT id, profile_id, url, title, created_at, pinned FROM bookmarks WHERE profile_id = ?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map(params![self.active_profile_id], |row| {
+                Ok(Bookmark {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    url: row.get(2)?,
+                    title: row.get(3)?,
+                    created_at: row.get(4)?,
+                    pinned: row.get(5)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Edits bookmark `id`, or the one already saved for `url`, or adds a new one.
+    pub fn save_bookmark(&mut self, id: Option<&str>, url: &str, title: &str, pinned: bool) -> anyhow::Result<()> {
+        let existing = id.map(str::to_string).or_else(|| self.bookmarks().ok()?.into_iter().find(|b| b.url == url).map(|b| b.id));
+        match existing {
+            Some(id) => self.storage.execute(
+                "UPDATE bookmarks SET url = ?2, title = ?3, pinned = ?4 WHERE id = ?1",
+                params![id, url, title, pinned],
+            )?,
+            None => self.storage.execute(
+                "INSERT INTO bookmarks (id, profile_id, url, title, created_at, pinned) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![Uuid::new_v4().to_string(), self.active_profile_id, url, title, now_secs(), pinned],
+            )?,
+        };
+        Ok(())
+    }
+
+    pub fn delete_bookmark(&mut self, id: &str) -> anyhow::Result<()> {
+        self.storage.execute("DELETE FROM bookmarks WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     pub fn history(&self) -> anyhow::Result<Vec<HistoryEntry>> {
@@ -1516,6 +1545,20 @@ mod tests {
         let urls: Vec<String> = model.suggest("rust", 5).unwrap().into_iter().map(|(url, _)| url).collect();
         assert_eq!(urls, ["https://rust-lang.org/", "https://docs.rs/"]);
         assert!(model.suggest("100%", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinning_reuses_the_bookmark_and_edits_stick() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.save_bookmark(None, "https://a.com/", "A", false).unwrap();
+        model.save_bookmark(None, "https://a.com/", "A", true).unwrap();
+        let saved = model.bookmarks().unwrap();
+        assert_eq!(saved.len(), 1, "same url is one bookmark");
+        assert!(saved[0].pinned);
+        model.save_bookmark(Some(&saved[0].id), "https://b.com/", "B", true).unwrap();
+        assert_eq!(model.bookmarks().unwrap()[0].url, "https://b.com/");
+        model.delete_bookmark(&saved[0].id).unwrap();
+        assert!(model.bookmarks().unwrap().is_empty());
     }
 
     #[test]

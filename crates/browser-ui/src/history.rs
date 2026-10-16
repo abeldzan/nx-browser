@@ -88,7 +88,7 @@ impl BrowserWindow {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(scroll_area("history-list").vertical().child(self.history_groups(&entries, "No history yet", cx))),
+                    .child(scroll_area("history-list").vertical().full_height(true).child(self.history_groups(&entries, "No history yet", cx))),
             )
             .child(
                 h_stack()
@@ -131,7 +131,7 @@ impl BrowserWindow {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .child(scroll_area("history-modal-list").vertical().child(self.history_groups(&entries, empty, cx))),
+                    .child(scroll_area("history-modal-list").vertical().full_height(true).child(self.history_groups(&entries, empty, cx))),
             );
         self.modal_shell("history-modal", card, Self::close_history_modal, cx)
     }

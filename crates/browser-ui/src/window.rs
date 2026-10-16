@@ -91,6 +91,11 @@ pub struct BrowserWindow {
     pub(crate) history_open: bool,
     pub(crate) history_modal: bool,
     pub(crate) history_query: Entity<InputState>,
+    pub(crate) bookmarks_open: bool,
+    /// The bookmark editor: (bookmark id, pinned); no id adds a new pinned site.
+    pub(crate) bookmark_edit: Option<(Option<String>, bool)>,
+    pub(crate) bookmark_title: Entity<InputState>,
+    pub(crate) bookmark_url: Entity<InputState>,
     pub(crate) focus_history: bool,
     /// Icon and color picked in the new-profile modal while it is open.
     pub(crate) new_profile: Option<(String, String)>,
@@ -282,6 +287,8 @@ impl BrowserWindow {
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let history_query = cx.new(InputState::new_singleline);
+        let bookmark_title = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let bookmark_url = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -385,6 +392,16 @@ impl BrowserWindow {
                 InputStateEvent::TextChanged => cx.notify(),
                 _ => {}
             }),
+            cx.subscribe(&bookmark_title, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit => this.save_bookmark_edit(cx),
+                _ => {}
+            }),
+            cx.subscribe(&bookmark_url, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::Submit => this.save_bookmark_edit(cx),
+                _ => {}
+            }),
             cx.subscribe(&name_input, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::Submit => this.save_profile_name(cx),
@@ -430,6 +447,10 @@ impl BrowserWindow {
             history_open: false,
             history_modal: false,
             history_query,
+            bookmarks_open: false,
+            bookmark_edit: None,
+            bookmark_title,
+            bookmark_url,
             focus_history: false,
             new_profile: None,
             new_profile_input,
@@ -1812,12 +1833,6 @@ impl Render for BrowserWindow {
         }
         let active_session = self.model.lock().active_session_id.clone();
         let all_tabs = self.model.lock().tabs.clone();
-        // Bookmarks are a SQLite query; render runs every frame while dragging, so only fetch them when shown.
-        let bookmarks = if self.shown_panel == Some(SidebarPage::Bookmarks) {
-            self.model.lock().bookmarks().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         let colors = paint(cx);
         if !cx.has_active_drag() {
             self.tab_drag = None;
@@ -1900,7 +1915,6 @@ impl Render for BrowserWindow {
                             &profiles,
                             &active_profile,
                             &sessions,
-                            &bookmarks,
                             cx,
                         ))
                     }),
@@ -1933,6 +1947,8 @@ impl Render for BrowserWindow {
             .when(self.extensions_open, |root| root.child(self.extensions_popover(cx)))
             .when(self.history_open, |root| root.child(self.history_popover(cx)))
             .when(self.history_modal, |root| root.child(self.history_modal(cx)))
+            .when(self.bookmarks_open, |root| root.child(self.bookmarks_popover(cx)))
+            .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
 }
@@ -2750,7 +2766,7 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal;
+        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some();
         self.engine.set_modal(modal);
         let Some(stage) = self.stage_bounds else {
             return;
@@ -3437,7 +3453,7 @@ impl BrowserWindow {
             )
     }
 
-    /// Drawn in place of a blank tab's page: a big address field over bookmarks and recently visited sites.
+    /// Drawn in place of a blank tab's page: bookmarks along the top, then a big address field over pinned and recently visited sites.
     fn new_tab_page(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         let id = tab.id.clone();
@@ -3473,48 +3489,150 @@ impl BrowserWindow {
         };
         let (bookmarks, recent) = {
             let model = self.model.lock();
-            let bookmarks = model.bookmarks().unwrap_or_default().into_iter().map(|entry| (entry.title, entry.url)).take(8).collect::<Vec<_>>();
-            let mut hosts = HashSet::new();
+            let bookmarks = model.bookmarks().unwrap_or_default();
+            // Pinned sites already have a tile; recent skips them too.
+            let mut hosts = bookmarks.iter().filter(|b| b.pinned).map(|b| site_host(&b.url)).collect::<HashSet<_>>();
             let recent = model
                 .history()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|entry| hosts.insert(site_host(&entry.url)))
-                .map(|entry| (entry.title, entry.url))
                 .take(8)
                 .collect::<Vec<_>>();
             (bookmarks, recent)
         };
+        let (pinned, saved): (Vec<_>, Vec<_>) = bookmarks.into_iter().partition(|b| b.pinned);
+        let action = |key: String, icon: gpui::Svg, run: Box<dyn Fn(&mut Self, &mut Context<Self>)>, cx: &mut Context<Self>| {
+            div()
+                .id(SharedString::from(key))
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .hover(|style| style.bg(paint.secondary))
+                .child(icon.size(px(10.)).text_color(paint.fg))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    run(this, cx);
+                    cx.notify();
+                }))
+        };
+        let tile = |key: String, url: &str, title: &str, actions: gpui::Div, cx: &mut Context<Self>| {
+            let (window_id, open) = (id.clone(), url.to_string());
+            let name = if title.is_empty() { site_host(url) } else { title.to_string() };
+            v_stack()
+                .id(SharedString::from(key.clone()))
+                .group(SharedString::from(key.clone()))
+                .relative()
+                .w(px(72.))
+                .p(px(8.))
+                .gap(px(6.))
+                .items_center()
+                .rounded(px(10.))
+                .cursor_pointer()
+                .hover(|tile| tile.bg(paint.secondary))
+                .child(site_icon(url, 32., false))
+                .child(div().w_full().text_size(px(11.)).text_center().truncate().child(name))
+                .child(h_stack().absolute().top(px(2.)).right(px(2.)).gap(px(2.)).opacity(0.).group_hover(SharedString::from(key), |style| style.opacity(1.)).child(actions))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.focus_window(&window_id, cx);
+                    this.commit_navigation(&open, cx);
+                }))
+        };
         let mut column = v_stack().w_full().max_w(px(640.)).gap(px(20.)).child(field);
-        for (label, sites) in [("Bookmarks", bookmarks), ("Recent", recent)] {
-            if sites.is_empty() {
-                continue;
-            }
-            let mut grid = div().flex().flex_wrap().gap(px(8.));
-            for (index, (title, url)) in sites.into_iter().enumerate() {
-                let (window_id, open) = (id.clone(), url.clone());
-                let name = if title.is_empty() { site_host(&url) } else { title };
-                grid = grid.child(
-                    v_stack()
-                        .id(SharedString::from(format!("home-{label}-{index}-{id}")))
-                        .w(px(72.))
-                        .p(px(8.))
-                        .gap(px(6.))
-                        .items_center()
-                        .rounded(px(10.))
-                        .cursor_pointer()
-                        .hover(|tile| tile.bg(paint.secondary))
-                        .child(site_icon(&url, 32., false))
-                        .child(div().w_full().text_size(px(11.)).text_center().truncate().child(name))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.focus_window(&window_id, cx);
-                            this.commit_navigation(&open, cx);
-                        })),
-                );
-            }
-            column = column.child(v_stack().gap(px(6.)).child(self.section_label(label, paint)).child(grid));
+        let mut grid = div().flex().flex_wrap().gap(px(8.));
+        for bookmark in pinned.iter().rev() {
+            let (edit, unpin) = (bookmark.clone(), bookmark.clone());
+            let actions = h_stack()
+                .gap(px(2.))
+                .child(action(format!("home-edit-{}-{id}", bookmark.id), Icons::pencil_1(), Box::new(move |this, cx| this.open_bookmark_editor(Some(&edit), cx)), cx))
+                .child(action(format!("home-unpin-{}-{id}", bookmark.id), Icons::cross_2(), Box::new(move |this, _| {
+                    let _ = this.model.lock().save_bookmark(Some(&unpin.id), &unpin.url, &unpin.title, false);
+                }), cx));
+            grid = grid.child(tile(format!("home-pin-{}-{id}", bookmark.id), &bookmark.url, &bookmark.title, actions, cx));
         }
-        div().size_full().flex().justify_center().pt(relative(0.18)).px(px(24.)).child(column)
+        grid = grid.child(
+            v_stack()
+                .id(SharedString::from(format!("home-add-{id}")))
+                .w(px(72.))
+                .p(px(8.))
+                .gap(px(6.))
+                .items_center()
+                .rounded(px(10.))
+                .cursor_pointer()
+                .text_color(paint.muted)
+                .hover(|tile| tile.bg(paint.secondary))
+                .child(div().size(px(32.)).flex().items_center().justify_center().rounded_full().bg(paint.secondary).child(Icons::plus().size(px(14.))))
+                .child(div().text_size(px(11.)).child("Add"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_bookmark_editor(None, cx))),
+        );
+        column = column.child(v_stack().gap(px(6.)).child(self.section_label("Pinned", paint)).child(grid));
+        if !recent.is_empty() {
+            let mut grid = div().flex().flex_wrap().gap(px(8.));
+            for (index, entry) in recent.into_iter().enumerate() {
+                let (url, title) = (entry.url.clone(), entry.title.clone());
+                let actions = h_stack().child(action(format!("home-pin-recent-{index}-{id}"), Icons::drawing_pin(), Box::new(move |this, _| {
+                    let _ = this.model.lock().save_bookmark(None, &url, &title, true);
+                }), cx));
+                grid = grid.child(tile(format!("home-recent-{index}-{id}"), &entry.url, &entry.title, actions, cx));
+            }
+            column = column.child(v_stack().gap(px(6.)).child(self.section_label("Recent", paint)).child(grid));
+        }
+        // Bookmarks as a bar of chips along the top, like a bookmarks bar.
+        let mut bar = div().w_full().flex().flex_wrap().justify_center().gap(px(6.)).px(px(16.)).pt(px(12.));
+        for bookmark in saved.iter().take(12) {
+            let (window_id, open) = (id.clone(), bookmark.url.clone());
+            let name = if bookmark.title.is_empty() { site_host(&bookmark.url) } else { bookmark.title.clone() };
+            bar = bar.child(
+                h_stack()
+                    .id(SharedString::from(format!("home-mark-{}-{id}", bookmark.id)))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .gap(px(6.))
+                    .items_center()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(paint.border)
+                    .bg(paint.secondary)
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .hover(|chip| chip.border_color(paint.accent.opacity(0.5)))
+                    .child(site_icon(&bookmark.url, 14., false))
+                    .child(div().max_w(px(160.)).truncate().child(name))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.focus_window(&window_id, cx);
+                        this.commit_navigation(&open, cx);
+                    })),
+            );
+        }
+        if saved.len() > 12 {
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(format!("home-marks-more-{id}")))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .text_size(px(12.))
+                    .text_color(paint.muted)
+                    .cursor_pointer()
+                    .hover(|chip| chip.bg(paint.secondary))
+                    .child(format!("{} more", saved.len() - 12))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.bookmarks_open = true;
+                        cx.notify();
+                    })),
+            );
+        }
+        v_stack()
+            .size_full()
+            .when(!saved.is_empty(), |page| page.child(bar))
+            .child(div().flex_1().flex().justify_center().pt(relative(0.14)).px(px(24.)).child(column))
     }
 
     fn nav_controls(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
@@ -3546,6 +3664,11 @@ impl BrowserWindow {
         let zoom_icon = if maximized { Icons::exit_full_screen() } else { Icons::enter_full_screen() };
         let keep_id = tab_id.to_string();
         let peek = self.chrome.get(tab_id).is_some_and(|chrome| chrome.peek);
+        let bookmarked = {
+            let model = self.model.lock();
+            let url = model.tabs.iter().find(|tab| tab.id == tab_id).map(|tab| tab.url.clone());
+            url.is_some_and(|url| model.bookmarks().unwrap_or_default().iter().any(|bookmark| bookmark.url == url))
+        };
         h_stack()
             .items_center()
             .gap(px(2.))
@@ -3560,7 +3683,7 @@ impl BrowserWindow {
                 this.focus_window(&reload_id, cx);
                 this.reload();
             }))
-            .child(self.tool_button(format!("bookmark-{bookmark_id}"), Icons::star(), false, cx, move |this, _, cx| {
+            .child(self.tool_button(format!("bookmark-{bookmark_id}"), if bookmarked { Icons::star_filled() } else { Icons::star() }, false, cx, move |this, _, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
             }))
@@ -3748,7 +3871,16 @@ impl BrowserWindow {
                                 cx.notify();
                             })),
                     )
-                    .child(self.panel_icon("bookmarks-toggle", Icons::bookmark(), Some(SidebarPage::Bookmarks), cx))
+                    .child(
+                        icon_button("bookmarks-toggle", Icons::bookmark())
+                            .box_size(rems(1.375))
+                            .icon_size(rems(0.875))
+                            .selected(self.bookmarks_open)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.bookmarks_open = true;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
                             .box_size(rems(1.375))
@@ -4529,7 +4661,6 @@ impl BrowserWindow {
         profiles: &[browser_core::Profile],
         active_profile: &str,
         sessions: &[browser_core::Session],
-        bookmarks: &[browser_core::Bookmark],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
@@ -4549,7 +4680,7 @@ impl BrowserWindow {
                 scroll_area("library-panel")
                     .vertical()
                     .full_height(true)
-                    .child(self.library_page(page, profiles, active_profile, sessions, bookmarks, cx)),
+                    .child(self.library_page(page, profiles, active_profile, sessions, cx)),
             )
     }
 
@@ -4588,12 +4719,10 @@ impl BrowserWindow {
         profiles: &[browser_core::Profile],
         active_profile: &str,
         sessions: &[browser_core::Session],
-        bookmarks: &[browser_core::Bookmark],
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         match page {
             SidebarPage::Profiles => self.profile_page(profiles, active_profile, sessions, cx),
-            SidebarPage::Bookmarks => self.link_list("No bookmarks yet", bookmarks.iter().map(|entry| (entry.title.clone(), entry.url.clone())).collect(), cx),
         }
     }
 
@@ -4677,35 +4806,6 @@ impl BrowserWindow {
                 this.import_profile();
                 this.refresh_url(cx);
             }))
-    }
-
-    fn link_list(&self, empty: &'static str, rows: Vec<(String, String)>, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        if rows.is_empty() {
-            return div().py(px(8.)).text_color(paint.muted).child(empty);
-        }
-        let mut column = v_stack().gap(px(4.)).w_full();
-        for (index, (title, url)) in rows.into_iter().enumerate() {
-            let open = url.clone();
-            let label = if title.is_empty() { url.clone() } else { title };
-            column = column.child(
-                v_stack()
-                    .id(SharedString::from(format!("link-{index}")))
-                    .w_full()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(paint.secondary))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.address.update(cx, |input, cx| input.set_content_silent(open.clone(), cx));
-                        this.commit_navigation(&open, cx);
-                    }))
-                    .child(label)
-                    .child(div().text_size(px(11.)).text_color(paint.muted).child(url)),
-            );
-        }
-        column
     }
 
     /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
