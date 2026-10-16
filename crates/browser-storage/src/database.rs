@@ -1,9 +1,12 @@
 use anyhow::Context;
 use rusqlite::{params, Connection};
+use std::cell::Cell;
 use std::path::Path;
 
 pub struct Storage {
     conn: Connection,
+    /// Bumped on every write, so cached reads can tell they went stale.
+    writes: Cell<u64>,
 }
 
 impl Storage {
@@ -14,7 +17,9 @@ impl Storage {
         let conn = Connection::open(path)?;
         // WAL + NORMAL: writes run on the UI thread, so skip the per-commit fsync of the rollback journal.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-        let storage = Self { conn };
+        // `execute` caches every statement; the default 16 slots would thrash across the model's ~60 queries.
+        conn.set_prepared_statement_cache_capacity(128);
+        let storage = Self { conn, writes: Cell::new(0) };
         storage.migrate()?;
         Ok(storage)
     }
@@ -22,6 +27,7 @@ impl Storage {
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let storage = Self {
             conn: Connection::open_in_memory()?,
+            writes: Cell::new(0),
         };
         storage.migrate()?;
         Ok(storage)
@@ -150,7 +156,7 @@ impl Storage {
     pub fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT value FROM settings WHERE key = ?1")?;
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         if let Some(row) = rows.next()? {
             Ok(Some(row.get(0)?))
@@ -160,6 +166,7 @@ impl Storage {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.writes.set(self.writes.get() + 1);
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -168,7 +175,13 @@ impl Storage {
         Ok(())
     }
 
+    /// Count of writes so far; any change means rows may differ from an earlier read.
+    pub fn generation(&self) -> u64 {
+        self.writes.get()
+    }
+
     pub fn execute(&self, sql: &str, params: impl rusqlite::Params) -> anyhow::Result<usize> {
+        self.writes.set(self.writes.get() + 1);
         self.conn.prepare_cached(sql)?.execute(params).context("sqlite execute")
     }
 }
@@ -187,7 +200,7 @@ mod tests {
              INSERT INTO tabs VALUES ('t', 's', 'u', 'T', 1, 0, 'active');",
         )
         .unwrap();
-        let storage = Storage { conn };
+        let storage = Storage { conn, writes: Cell::new(0) };
         storage.migrate().unwrap();
         storage.migrate().unwrap();
         let (icon, color): (String, String) = storage

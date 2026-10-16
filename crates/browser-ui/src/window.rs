@@ -38,7 +38,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -275,7 +275,7 @@ impl BrowserWindow {
         let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let history_query = cx.new(|cx| InputState::new_singleline(cx));
+        let history_query = cx.new(InputState::new_singleline);
         let subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -1393,7 +1393,7 @@ impl BrowserWindow {
             let tab_window = self.tab_window;
             // A closed space comes back to the main window; a closed window closes its tabs, like any window.
             window.on_window_should_close(cx, move |_, _| {
-                forget_detached(&mut model.lock().expect("model"), &id, tab_window);
+                forget_detached(&mut model.lock().unwrap_or_else(PoisonError::into_inner), &id, tab_window);
                 true
             });
         } else if self.self_test.is_none() {
@@ -1738,7 +1738,7 @@ impl Render for BrowserWindow {
         };
         if let Some(own) = self.model.detached.clone().filter(|_| self.close_window) {
             // Its last tab closed: the window and its space go, tabs and all.
-            forget_detached(&mut self.model.shared.lock().expect("model"), &own, true);
+            forget_detached(&mut self.model.shared.lock().unwrap_or_else(PoisonError::into_inner), &own, true);
             window.remove_window();
         }
         if let Some(own) = &self.model.detached {
@@ -2982,7 +2982,7 @@ impl BrowserWindow {
             shell.left(px(GRIP_OUT)).top(px(GRIP_OUT)).right(px(GRIP_OUT)).bottom(px(GRIP_OUT))
         };
         let target = tab.id.clone();
-        let mut body = div().relative().size_full().child(
+        let body = div().relative().size_full().child(
             v_stack()
                 .id(SharedString::from(format!("window-{}", tab.id)))
                 .size_full()
@@ -5281,7 +5281,7 @@ pub(crate) struct WindowModel {
 impl WindowModel {
     /// The model pointed at this window's space for as long as the guard lives.
     pub(crate) fn lock(&self) -> Pinned<'_> {
-        let mut model = self.shared.lock().expect("model");
+        let mut model = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         let back = self.detached.as_ref().filter(|id| **id != model.active_session_id).map(|id| {
             let back = model.active_session_id.clone();
             let _ = model.set_active(id);

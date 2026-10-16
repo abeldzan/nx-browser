@@ -30,26 +30,6 @@ impl TabState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum LifeEvent {
-    Activate,
-    Background,
-    Suspend,
-    Close,
-}
-
-pub fn transition(state: TabState, event: LifeEvent) -> TabState {
-    match (state, event) {
-        (TabState::Closed, _) => TabState::Closed,
-        (_, LifeEvent::Close) => TabState::Closed,
-        (_, LifeEvent::Suspend) => TabState::Suspended,
-        (_, LifeEvent::Activate) => TabState::Active,
-        (TabState::Active, LifeEvent::Background) => TabState::Background,
-        (TabState::Suspended, LifeEvent::Background) => TabState::Suspended,
-        (state, LifeEvent::Background) => state,
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct LiveTab {
     pub id: String,
@@ -93,13 +73,6 @@ pub fn suspend_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn active_tab_moves_to_background_then_suspended() {
-        let state = transition(TabState::Active, LifeEvent::Background);
-        assert_eq!(state, TabState::Background);
-        assert!(!transition(state, LifeEvent::Suspend).keeps_webview());
-    }
 
     #[test]
     fn old_background_tabs_are_suspended_and_live_count_is_capped() {

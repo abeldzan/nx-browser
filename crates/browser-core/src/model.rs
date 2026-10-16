@@ -4,6 +4,8 @@ use anyhow::Context;
 use browser_storage::Storage;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -165,6 +167,29 @@ pub struct Model {
     /// Recently closed tabs as (session, url, layout), newest last.
     // shortcut: in-memory only, lost on quit; persist to SQLite if users want it across restarts.
     closed: Vec<(String, String, String)>,
+    /// Extension lists of inactive profiles, so flipping profiles (a detached window's every lock) skips SQLite.
+    ext_cache: HashMap<String, Vec<ExtensionRecord>>,
+    /// Last history and suggestion answers; render asks the same LIKE scan every frame while a list is open.
+    history_memo: Memo<Vec<HistoryEntry>>,
+    suggest_memo: Memo<Vec<(String, String)>>,
+}
+
+/// (storage generation, profile, query, limit): any write or a different question misses.
+/// Visits older than this are dropped at startup.
+const HISTORY_DAYS: i64 = 90;
+
+type MemoKey = (u64, String, String, usize);
+type Memo<T> = RefCell<Option<(MemoKey, T)>>;
+
+fn memo<T: Clone>(slot: &Memo<T>, key: MemoKey, load: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Some((cached, value)) = &*slot.borrow() {
+        if *cached == key {
+            return Ok(value.clone());
+        }
+    }
+    let value = load()?;
+    *slot.borrow_mut() = Some((key, value.clone()));
+    Ok(value)
 }
 
 impl Model {
@@ -181,6 +206,9 @@ impl Model {
             background_since: Vec::new(),
             effects: Vec::new(),
             closed: Vec::new(),
+            ext_cache: HashMap::new(),
+            history_memo: RefCell::new(None),
+            suggest_memo: RefCell::new(None),
         };
         model.reload()?;
         if model.profiles.is_empty() {
@@ -189,6 +217,11 @@ impl Model {
         if let Some(value) = model.storage.setting("prefs")? {
             model.settings = serde_json::from_str(&value).unwrap_or_default();
         }
+        // Bounds the LIKE scans behind suggestions and history search.
+        model.storage.execute(
+            "DELETE FROM history WHERE visited_at < ?1",
+            params![now_secs() - HISTORY_DAYS * 24 * 60 * 60],
+        )?;
         Ok(model)
     }
 
@@ -281,9 +314,11 @@ impl Model {
         };
         let moved = ids.remove(from);
         ids.insert(index.min(ids.len()), moved);
+        let tx = self.storage.conn().unchecked_transaction()?;
         for (position, id) in ids.iter().enumerate() {
             self.storage.execute("UPDATE profiles SET position = ?1 WHERE id = ?2", params![position as i64, id])?;
         }
+        tx.commit()?;
         self.reload()?;
         Ok(())
     }
@@ -296,9 +331,11 @@ impl Model {
         };
         let moved = ids.remove(from);
         ids.insert(index.min(ids.len()), moved);
+        let tx = self.storage.conn().unchecked_transaction()?;
         for (position, id) in ids.iter().enumerate() {
             self.storage.execute("UPDATE tabs SET position = ?1 WHERE id = ?2", params![position as i32, id])?;
         }
+        tx.commit()?;
         self.reload()?;
         Ok(())
     }
@@ -348,6 +385,7 @@ impl Model {
         self.reload()?;
         if self.active_profile_id == id {
             self.active_profile_id = self.profiles[0].id.clone();
+            self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
             self.active_session_id = self
                 .sessions
                 .iter()
@@ -475,8 +513,12 @@ impl Model {
         };
         self.active_session_id = session_id.to_string();
         if profile_id != self.active_profile_id {
-            self.active_profile_id = profile_id;
-            self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
+            let extensions = match self.ext_cache.remove(&profile_id) {
+                Some(extensions) => extensions,
+                None => query_extensions(&self.storage, &profile_id)?,
+            };
+            let old = std::mem::replace(&mut self.active_profile_id, profile_id);
+            self.ext_cache.insert(old, std::mem::replace(&mut self.extensions, extensions));
         }
         Ok(())
     }
@@ -741,7 +783,7 @@ impl Model {
     }
 
     pub fn bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
-        let mut stmt = self.storage.conn().prepare(
+        let mut stmt = self.storage.conn().prepare_cached(
             "SELECT id, profile_id, url, title, created_at FROM bookmarks WHERE profile_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![self.active_profile_id], |row| {
@@ -763,22 +805,25 @@ impl Model {
     /// Recent visits, or those whose title or URL contains `query`. Blank query skips the filter.
     pub fn search_history(&self, query: &str, limit: usize) -> anyhow::Result<Vec<HistoryEntry>> {
         let query = query.trim();
-        let limit = limit as i64;
-        let rows = if query.is_empty() {
-            let mut stmt = self.storage.conn().prepare(
-                "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 ORDER BY visited_at DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![self.active_profile_id, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
-            rows
-        } else {
-            let pattern = like_pattern(query);
-            let mut stmt = self.storage.conn().prepare(
-                "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 AND (url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\') ORDER BY visited_at DESC LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![self.active_profile_id, pattern, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-        Ok(rows)
+        let key = self.memo_key(query, limit);
+        memo(&self.history_memo, key, || {
+            let limit = limit as i64;
+            let rows = if query.is_empty() {
+                let mut stmt = self.storage.conn().prepare_cached(
+                    "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 ORDER BY visited_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![self.active_profile_id, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
+                rows
+            } else {
+                let pattern = like_pattern(query);
+                let mut stmt = self.storage.conn().prepare_cached(
+                    "SELECT id, profile_id, url, title, visited_at FROM history WHERE profile_id = ?1 AND (url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\') ORDER BY visited_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![self.active_profile_id, pattern, limit], read_history)?.collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            Ok(rows)
+        })
     }
 
     /// Address bar matches as (url, title): bookmarks first, then history by recency, one row per url.
@@ -787,21 +832,28 @@ impl Model {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let pattern = like_pattern(query);
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT url, title, MIN(rank), MAX(at) FROM (
-                SELECT url, title, 0 AS rank, created_at AS at FROM bookmarks WHERE profile_id = ?1
-                UNION ALL
-                SELECT url, title, 1 AS rank, visited_at AS at FROM history WHERE profile_id = ?1
-             ) WHERE url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\'
-             GROUP BY url ORDER BY MIN(rank), MAX(at) DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![self.active_profile_id, pattern, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let key = self.memo_key(query, limit);
+        memo(&self.suggest_memo, key, || {
+            let pattern = like_pattern(query);
+            let mut stmt = self.storage.conn().prepare_cached(
+                "SELECT url, title, MIN(rank), MAX(at) FROM (
+                    SELECT url, title, 0 AS rank, created_at AS at FROM bookmarks WHERE profile_id = ?1
+                    UNION ALL
+                    SELECT url, title, 1 AS rank, visited_at AS at FROM history WHERE profile_id = ?1
+                 ) WHERE url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\'
+                 GROUP BY url ORDER BY MIN(rank), MAX(at) DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![self.active_profile_id, pattern, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    fn memo_key(&self, query: &str, limit: usize) -> MemoKey {
+        (self.storage.generation(), self.active_profile_id.clone(), query.to_string(), limit)
     }
 
     pub fn downloads(&self) -> anyhow::Result<Vec<DownloadRecord>> {
-        let mut stmt = self.storage.conn().prepare(
+        let mut stmt = self.storage.conn().prepare_cached(
             "SELECT id, profile_id, url, path, status, created_at FROM downloads WHERE profile_id = ?1 ORDER BY created_at DESC LIMIT 30",
         )?;
         let rows = stmt.query_map(params![self.active_profile_id], |row| {
@@ -873,7 +925,7 @@ impl Model {
     }
 
     pub fn permissions_map(&self) -> anyhow::Result<Vec<(String, String, String)>> {
-        let mut stmt = self.storage.conn().prepare(
+        let mut stmt = self.storage.conn().prepare_cached(
             "SELECT origin, permission, decision FROM permissions WHERE profile_id = ?1",
         )?;
         let rows = stmt.query_map(params![self.active_profile_id], |row| {
@@ -907,7 +959,7 @@ impl Model {
         let last = !self
             .storage
             .conn()
-            .prepare("SELECT 1 FROM profile_extensions WHERE extension_id = ?1")?
+            .prepare_cached("SELECT 1 FROM profile_extensions WHERE extension_id = ?1")?
             .exists(params![id])?;
         if last {
             self.storage.execute("DELETE FROM extensions WHERE id = ?1", params![id])?;
@@ -917,7 +969,7 @@ impl Model {
 
     /// Data stores of every profile that has this extension installed and enabled.
     pub fn extension_stores(&self, id: &str) -> anyhow::Result<Vec<String>> {
-        let mut stmt = self.storage.conn().prepare(
+        let mut stmt = self.storage.conn().prepare_cached(
             "SELECT p.data_store_id FROM profile_extensions l JOIN profiles p ON p.id = l.profile_id
              WHERE l.extension_id = ?1 AND l.enabled = 1",
         )?;
@@ -927,7 +979,7 @@ impl Model {
 
     /// Every extension installed in any profile: id, folder and source.
     pub fn installed_extensions(&self) -> anyhow::Result<Vec<(String, PathBuf, String)>> {
-        let mut stmt = self.storage.conn().prepare("SELECT id, path, source FROM extensions ORDER BY rowid")?;
+        let mut stmt = self.storage.conn().prepare_cached("SELECT id, path, source FROM extensions ORDER BY rowid")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, PathBuf::from(row.get::<_, String>(1)?), row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -1201,6 +1253,7 @@ impl Model {
                 self.active_session_id = session.id.clone();
             }
         }
+        self.ext_cache.clear();
         self.extensions = query_extensions(&self.storage, &self.active_profile_id)?;
         Ok(())
     }
@@ -1221,7 +1274,7 @@ fn read_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
 }
 
 fn query_extensions(storage: &Storage, profile_id: &str) -> anyhow::Result<Vec<ExtensionRecord>> {
-    let mut stmt = storage.conn().prepare(
+    let mut stmt = storage.conn().prepare_cached(
         "SELECT e.id, e.path, l.enabled, e.manifest_json, e.source, l.pinned
          FROM extensions e JOIN profile_extensions l ON l.extension_id = e.id AND l.profile_id = ?1
          ORDER BY e.rowid",
@@ -1242,7 +1295,7 @@ fn query_extensions(storage: &Storage, profile_id: &str) -> anyhow::Result<Vec<E
 }
 
 fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
-    let mut stmt = storage.conn().prepare(
+    let mut stmt = storage.conn().prepare_cached(
         "SELECT id, name, storage_path, data_store_id, created_at, icon, color FROM profiles ORDER BY position, created_at",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -1262,7 +1315,7 @@ fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
 fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
     let mut stmt = storage
         .conn()
-        .prepare("SELECT id, profile_id, name, active, free FROM sessions")?;
+        .prepare_cached("SELECT id, profile_id, name, active, free FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         Ok(Session {
             id: row.get(0)?,
@@ -1276,7 +1329,7 @@ fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
 }
 
 fn query_tabs(storage: &Storage) -> anyhow::Result<Vec<Tab>> {
-    let mut stmt = storage.conn().prepare(
+    let mut stmt = storage.conn().prepare_cached(
         "SELECT id, session_id, url, title, active, position, state, layout FROM tabs ORDER BY position",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -1512,9 +1565,9 @@ mod tests {
         let moved = model.create_tab("https://example.com/").unwrap();
         let space = model.create_empty_session().unwrap();
         assert_eq!(model.active_session_id, main);
-        model.move_tabs_to_session(&[moved.clone()], &space).unwrap();
+        model.move_tabs_to_session(std::slice::from_ref(&moved), &space).unwrap();
         model.set_active(&space).unwrap();
-        assert_eq!(model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(), [moved.clone()]);
+        assert_eq!(model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>(), std::slice::from_ref(&moved));
         // A tab opened while pinned stays in the pinned space even though reload runs.
         let second = model.create_tab("https://rust-lang.org/").unwrap();
         assert_eq!(model.active_session_id, space);
@@ -1527,13 +1580,77 @@ mod tests {
         let main = model.active_session_id.clone();
         let tab = model.create_tab("https://example.com/").unwrap();
         let hidden = model.create_empty_session().unwrap();
-        model.move_tabs_to_session(&[tab.clone()], &hidden).unwrap();
+        model.move_tabs_to_session(std::slice::from_ref(&tab), &hidden).unwrap();
         model.set_active(&hidden).unwrap();
-        model.move_tabs_to_session(&[tab.clone()], &main).unwrap();
+        model.move_tabs_to_session(std::slice::from_ref(&tab), &main).unwrap();
         model.set_active(&main).unwrap();
         model.delete_session(&hidden).unwrap();
         assert!(model.session_tabs().iter().any(|t| t.id == tab));
         assert!(!model.sessions.iter().any(|s| s.id == hidden));
         assert_eq!(model.active_session_id, main);
+    }
+
+    #[test]
+    fn profile_flips_reuse_extension_lists_and_keep_edits() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let personal = model.active_session_id.clone();
+        let personal_profile = model.active_profile_id.clone();
+        model.upsert_extension("ext", "Ext", Path::new("/tmp/ext"), "bundled").unwrap();
+        model.set_extension_enabled("ext", false).unwrap();
+        model.create_profile("Work").unwrap();
+        let work = model.active_session_id.clone();
+        assert!(model.extensions.is_empty());
+        // A detached window flips back and forth like this on every lock.
+        for _ in 0..2 {
+            model.set_active(&personal).unwrap();
+            assert_eq!(model.extensions.len(), 1);
+            assert!(!model.extensions[0].enabled);
+            assert_eq!(model.extensions.len(), query_extensions(&model.storage, &personal_profile).unwrap().len());
+            model.set_active(&work).unwrap();
+            assert!(model.extensions.is_empty());
+        }
+    }
+
+    #[test]
+    fn deleting_the_active_profile_loads_the_next_profiles_extensions() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.upsert_extension("ext", "Ext", Path::new("/tmp/ext"), "bundled").unwrap();
+        model.create_profile("Work").unwrap();
+        let work = model.active_profile_id.clone();
+        model.delete_profile(&work).unwrap();
+        assert_eq!(model.extensions.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["ext"]);
+    }
+
+    #[test]
+    fn history_search_sees_new_visits_despite_the_memo() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let tab = model.active_tab().unwrap().id.clone();
+        model.note_navigation(&tab, "https://example.com/a", "A").unwrap();
+        assert_eq!(model.search_history("example", 10).unwrap().len(), 1);
+        assert_eq!(model.suggest("example", 10).unwrap().len(), 1);
+        model.note_navigation(&tab, "https://example.com/b", "B").unwrap();
+        assert_eq!(model.search_history("example", 10).unwrap().len(), 2);
+        assert_eq!(model.suggest("example", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn old_history_is_pruned_on_open() {
+        let path = std::env::temp_dir().join(format!("nxbrowser-test-{}.sqlite", Uuid::new_v4()));
+        let model = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let old = now_secs() - (HISTORY_DAYS + 1) * 24 * 60 * 60;
+        for (url, at) in [("https://old.example/", old), ("https://new.example/", now_secs())] {
+            model
+                .storage
+                .execute(
+                    "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, '', ?3)",
+                    params![model.active_profile_id, url, at],
+                )
+                .unwrap();
+        }
+        drop(model);
+        let model = Model::open(Storage::open(&path).unwrap()).unwrap();
+        let urls = model.history().unwrap().into_iter().map(|entry| entry.url).collect::<Vec<_>>();
+        assert_eq!(urls, ["https://new.example/"]);
+        let _ = std::fs::remove_file(path);
     }
 }

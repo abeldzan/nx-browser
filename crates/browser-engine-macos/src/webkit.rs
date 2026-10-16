@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
@@ -276,8 +276,9 @@ define_class!(
                 .ivars()
                 .permissions
                 .lock()
-                .ok()
-                .and_then(|map| map.get(&key).cloned())
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned()
                 .unwrap_or_else(|| "deny".into());
             let _ = self.ivars().events.borrow().send(EngineEvent::Permission {
                 tab_id: self.ivars().tab_id.clone(),
@@ -663,11 +664,10 @@ impl MacEngine {
     }
 
     pub fn set_permissions(&mut self, entries: Vec<(String, String, String)>) {
-        if let Ok(mut map) = self.permissions.lock() {
-            map.clear();
-            for (origin, kind, decision) in entries {
-                map.insert(format!("{origin}\n{kind}"), decision);
-            }
+        let mut map = self.permissions.lock().unwrap_or_else(PoisonError::into_inner);
+        map.clear();
+        for (origin, kind, decision) in entries {
+            map.insert(format!("{origin}\n{kind}"), decision);
         }
     }
 
@@ -797,7 +797,7 @@ impl Drop for MacEngine {
             self.extensions.suspended(&id);
             self.drop_view(&id);
         }
-        if let Some(windows) = WINDOWS.lock().ok().as_mut().and_then(|windows| windows.as_mut()) {
+        if let Some(windows) = WINDOWS.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
             windows.remove(&self.window_no);
         }
     }
@@ -878,17 +878,16 @@ impl WebEngine for MacEngine {
         }
         observe(&view, &delegate);
         self.extensions.opened(tab_id, data_store_id, url, &view, mtm);
-        self.tabs.insert(tab_id.to_string(), LiveTab { view, delegate });
+        self.tabs.insert(tab_id.to_string(), LiveTab { view: view.clone(), delegate });
         self.cookie_used.insert(data_store_id.to_string());
         if self.cookie_restore.remove(data_store_id) {
             self.begin_cookie_restore(data_store_id, &store);
         }
-        let view = self.tabs.get(tab_id).unwrap().view.clone();
-        let held = self.held_loads.borrow_mut().get_mut(data_store_id).map(|loads| loads.push((view, url.to_string()))).is_some();
+        let held = self.held_loads.borrow_mut().get_mut(data_store_id).map(|loads| loads.push((view.clone(), url.to_string()))).is_some();
         if !held {
             self.navigate(tab_id, url)?;
         }
-        self.tabs.get(tab_id).unwrap().view.setHidden(true);
+        view.setHidden(true);
         Ok(())
     }
 
@@ -931,7 +930,6 @@ impl WebEngine for MacEngine {
         let Some(content) = self.content.clone() else {
             return;
         };
-        let live = self.tabs.get(tab_id).unwrap();
         let height = content.bounds().size.height;
         let frame = NSRect::new(
             NSPoint::new(bounds.x, height - bounds.y - bounds.height.max(1.0)),
@@ -1347,7 +1345,7 @@ struct WindowState {
 static WINDOWS: Mutex<Option<HashMap<isize, WindowState>>> = Mutex::new(None);
 
 fn with_window<T>(window_no: isize, f: impl FnOnce(&mut WindowState) -> T) -> Option<T> {
-    let mut windows = WINDOWS.lock().ok()?;
+    let mut windows = WINDOWS.lock().unwrap_or_else(PoisonError::into_inner);
     Some(f(windows.get_or_insert_with(HashMap::new).entry(window_no).or_default()))
 }
 

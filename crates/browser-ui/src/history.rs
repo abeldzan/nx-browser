@@ -217,73 +217,43 @@ fn day_label(visited: i64, now: i64) -> String {
     let Some(today) = local_tm(now) else {
         return dated(&when);
     };
-    if when.year == today.year && when.yday == today.yday {
+    if when.tm_year == today.tm_year && when.tm_yday == today.tm_yday {
         return "Today".into();
     }
-    let midnight = now - i64::from(today.hour) * 3600 - i64::from(today.min) * 60 - i64::from(today.sec);
+    let midnight = now - i64::from(today.tm_hour) * 3600 - i64::from(today.tm_min) * 60 - i64::from(today.tm_sec);
     if let Some(yesterday) = local_tm(midnight.saturating_sub(1)) {
-        if when.year == yesterday.year && when.yday == yesterday.yday {
+        if when.tm_year == yesterday.tm_year && when.tm_yday == yesterday.tm_yday {
             return "Yesterday".into();
         }
     }
     dated(&when)
 }
 
-fn dated(when: &LocalTime) -> String {
+fn dated(when: &libc::tm) -> String {
     const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let weekday = WEEKDAYS.get(when.wday as usize).copied().unwrap_or("Day");
-    let month = MONTHS.get(when.mon as usize).copied().unwrap_or("");
-    format!("{weekday}, {month} {}", when.mday)
+    let weekday = WEEKDAYS.get(when.tm_wday as usize).copied().unwrap_or("Day");
+    let month = MONTHS.get(when.tm_mon as usize).copied().unwrap_or("");
+    format!("{weekday}, {month} {}", when.tm_mday)
 }
 
 fn clock_label(visited: i64) -> String {
     let Some(when) = local_tm(visited) else {
         return String::new();
     };
-    let suffix = if when.hour >= 12 { "PM" } else { "AM" };
-    let hour = match when.hour % 12 {
+    let suffix = if when.tm_hour >= 12 { "PM" } else { "AM" };
+    let hour = match when.tm_hour % 12 {
         0 => 12,
         hour => hour,
     };
-    format!("{hour}:{:02} {suffix}", when.min)
+    format!("{hour}:{:02} {suffix}", when.tm_min)
 }
 
-#[repr(C)]
-struct LocalTime {
-    sec: i32,
-    min: i32,
-    hour: i32,
-    mday: i32,
-    mon: i32,
-    year: i32,
-    wday: i32,
-    yday: i32,
-    isdst: i32,
-    gmtoff: i64,
-    zone: *const i8,
-}
-
-fn local_tm(secs: i64) -> Option<LocalTime> {
-    let mut out = LocalTime {
-        sec: 0,
-        min: 0,
-        hour: 0,
-        mday: 0,
-        mon: 0,
-        year: 0,
-        wday: 0,
-        yday: 0,
-        isdst: 0,
-        gmtoff: 0,
-        zone: std::ptr::null(),
-    };
-    let ok = unsafe { localtime_r(&secs, &mut out) };
+fn local_tm(secs: i64) -> Option<libc::tm> {
+    // SAFETY: `tm` is plain C data (all-zero is valid) and both pointers outlive the call.
+    let mut out: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&secs, &mut out) };
     if ok.is_null() { None } else { Some(out) }
-}
-
-extern "C" {
-    fn localtime_r(timep: *const i64, result: *mut LocalTime) -> *mut LocalTime;
 }
 
 #[cfg(test)]
@@ -295,7 +265,7 @@ mod tests {
     fn labels_today_and_yesterday_in_local_time() {
         let now = now_secs();
         let today = local_tm(now).expect("local time");
-        let start = now - i64::from(today.hour) * 3600 - i64::from(today.min) * 60 - i64::from(today.sec);
+        let start = now - i64::from(today.tm_hour) * 3600 - i64::from(today.tm_min) * 60 - i64::from(today.tm_sec);
         assert_eq!(day_label(start + 60, now), "Today");
         assert_eq!(day_label(start - 60, now), "Yesterday");
         let older = day_label(start - 86_400 * 3, now);

@@ -117,8 +117,13 @@ impl BrowserWindow {
             return;
         };
         let typed = self.new_profile_input.read(cx).content().trim().to_string();
-        let count = self.model.lock().profiles.len().max(0) + 1;
-        let name = if typed.is_empty() { format!("Profile {count}") } else { typed };
+        let name = if typed.is_empty() {
+            // First free number, so a deleted "Profile 2" doesn't make the next one a duplicate.
+            let taken = self.model.lock().profiles.iter().map(|profile| profile.name.clone()).collect::<Vec<_>>();
+            (1..).map(|n| format!("Profile {n}")).find(|name| !taken.contains(name)).unwrap_or_default()
+        } else {
+            typed
+        };
         let id = self.with_model(|model| {
             let id = model.create_profile(&name).ok()?;
             let _ = model.set_profile_appearance(&id, &icon, &color);

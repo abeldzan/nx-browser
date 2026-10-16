@@ -343,7 +343,7 @@ fn decode(control: &Control, payload: &[u8]) -> Result<RgbaImage, &'static str> 
             if channels == 4 {
                 return RgbaImage::from_raw(w, h, data).ok_or("EINVAL:bad pixels");
             }
-            let rgba = data.chunks_exact(3).flat_map(|px| [px[0], px[1], px[2], 255]).collect();
+            let rgba = data.as_chunks::<3>().0.iter().flat_map(|px| [px[0], px[1], px[2], 255]).collect();
             RgbaImage::from_raw(w, h, rgba).ok_or("EINVAL:bad pixels")
         }
         _ => Err("EINVAL:unsupported format"),
