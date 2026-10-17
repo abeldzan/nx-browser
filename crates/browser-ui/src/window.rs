@@ -24,7 +24,7 @@ use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
 use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
-use gpuikit::elements::text_field::text_field;
+use gpuikit::elements::text_field::{text_field, Adornment};
 use gpuikit::icons::Icons;
 use tiling::{cell, move_border, neighbour, set_span, span, uncell, Side, Tile};
 use gpuikit::input::{bindings, InputState, InputStateEvent, SubmitOn};
@@ -122,6 +122,12 @@ pub struct BrowserWindow {
     /// A page was clicked while the address was being edited; end the edit on the next render.
     blur_address: bool,
     find_open: bool,
+    /// The tab the find bar belongs to; kept after close so the bar animates shut on that window.
+    find_tab: String,
+    /// Matches of the find query on the find tab; `None` until the page has counted them.
+    find_count: Option<usize>,
+    /// Which match is selected, from 1.
+    find_index: usize,
     focus_find: bool,
     /// Give keys to the active terminal on the next render.
     focus_terminal: bool,
@@ -322,11 +328,11 @@ impl BrowserWindow {
                 }
             }),
             cx.subscribe(&find_input, |this, input, event, cx| match event {
-                InputStateEvent::Submit => {
+                InputStateEvent::Submit => this.find_step(false, cx),
+                InputStateEvent::TextChanged => {
                     let query = input.read(cx).content().to_string();
-                    if let Some(id) = this.active_tab_id() {
-                        this.engine.find(&id, &query);
-                    }
+                    this.find_fresh(&query);
+                    cx.notify();
                 }
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
@@ -464,6 +470,9 @@ impl BrowserWindow {
             address_editing: false,
             blur_address: false,
             find_open: false,
+            find_tab: String::new(),
+            find_count: None,
+            find_index: 1,
             focus_find: false,
             focus_terminal: false,
             palette_open: false,
@@ -772,6 +781,11 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Alert { message } => self.status = message.into(),
+            EngineEvent::Eval { tab_id, token, value } if token == "find-count" => {
+                if tab_id == self.find_tab {
+                    self.find_count = value.parse().ok();
+                }
+            }
             EngineEvent::Eval { token, value, .. } if token == "favicon" => {
                 // shortcut: icons are cached per host forever; refetch on age if sites change icons.
                 if let Some((page, icon)) = value.split_once('\n') {
@@ -840,10 +854,7 @@ impl BrowserWindow {
             Shortcut::Reload => self.reload(),
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
-            Shortcut::Find => {
-                self.find_open = true;
-                self.focus_find = true;
-            }
+            Shortcut::Find => self.open_find(cx),
             Shortcut::Bookmark => self.bookmark(),
             Shortcut::Settings => self.toggle_settings(cx),
             Shortcut::ReopenTab => match self.with_model(|model| model.reopen_closed()) {
@@ -1803,6 +1814,55 @@ impl BrowserWindow {
                 }
             });
         self.term_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
+    }
+
+    /// Opens the find bar on the active window, unless it's a terminal, which has no page to search.
+    fn open_find(&mut self, cx: &mut Context<Self>) {
+        let active = self.model.lock().active_tab().filter(|tab| !is_terminal(&tab.url)).map(|tab| tab.id.clone());
+        if let Some(id) = active {
+            if self.find_tab != id {
+                self.close_find();
+                self.find_tab = id;
+                let query = self.find_input.read(cx).content().to_string();
+                self.find_fresh(&query);
+            }
+            self.find_open = true;
+            self.focus_find = true;
+        }
+    }
+
+    /// Closes the find bar and drops the match it left selected on the page.
+    fn close_find(&mut self) {
+        self.find_open = false;
+        self.engine.eval(&self.find_tab, "find-clear", "getSelection().removeAllRanges()");
+    }
+
+    /// Searches for `query` from the top of the page and recounts its matches.
+    fn find_fresh(&mut self, query: &str) {
+        // Drop the old match first, else the search goes on from after it.
+        self.engine.eval(&self.find_tab, "find-clear", "getSelection().removeAllRanges()");
+        self.find_count = None;
+        self.find_index = 1;
+        if !query.is_empty() {
+            self.engine.eval(&self.find_tab, "find-count", &find_count_js(query));
+            self.engine.find(&self.find_tab, query, false);
+        }
+    }
+
+    /// Moves to the next (or previous, `backwards`) match.
+    // shortcut: the index is counted here, so it drifts if the user selects text on the page; read WebKit's match index if that matters.
+    fn find_step(&mut self, backwards: bool, cx: &mut Context<Self>) {
+        if let Some(count) = self.find_count.filter(|&count| count > 0) {
+            self.find_index = if backwards { (self.find_index + count - 2) % count + 1 } else { self.find_index % count + 1 };
+        }
+        let query = self.find_input.read(cx).content().to_string();
+        self.engine.find(&self.find_tab, &query, backwards);
+        cx.notify();
+    }
+
+    /// The find bar is open on the active window.
+    fn find_here(&self) -> bool {
+        self.find_open && self.active_tab_id().is_some_and(|id| id == self.find_tab)
     }
 
     fn request_find_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2937,7 +2997,6 @@ impl BrowserWindow {
         let Some(stage) = self.stage_bounds else {
             return;
         };
-        let active = self.active_tab_id();
         let origin_x = f64::from(stage.origin.x);
         let origin_y = f64::from(stage.origin.y);
         let stage_w = f64::from(stage.size.width);
@@ -2975,7 +3034,7 @@ impl BrowserWindow {
                 self.engine.place_tab(&id, None);
                 continue;
             };
-            let find = if active.as_deref() == Some(id.as_str()) { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
+            let find = if self.find_tab == id { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
             let (scale, alpha) = self.window_motion(&id);
             let frame = scaled(frame, scale);
             if drawn.contains(&id) {
@@ -3286,7 +3345,7 @@ impl BrowserWindow {
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .when(!self.tab_window, |column| column.child(self.window_titlebar(tab, members, cx)))
-                .when(active && self.find.progress() > 0.0, |column| {
+                .when(self.find_tab == tab.id && self.find.progress() > 0.0, |column| {
                     column.child(div().h(px(FIND_H as f32 * self.find.progress())).flex_none().overflow_hidden().child(self.find_bar(cx)))
                 })
                 .child(match is_terminal(&tab.url) {
@@ -4120,9 +4179,12 @@ impl BrowserWindow {
                         )
                     })
                     .child(self.pinned_extensions(cx))
-                    .child(icon_button("find-toggle", Icons::magnifying_glass()).box_size(rems(1.375)).icon_size(rems(0.875)).selected(self.find_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.find_open = !this.find_open;
-                        this.focus_find = this.find_open;
+                    .child(icon_button("find-toggle", Icons::magnifying_glass()).box_size(rems(1.375)).icon_size(rems(0.875)).selected(self.find_here()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        if this.find_here() {
+                            this.close_find();
+                        } else {
+                            this.open_find(cx);
+                        }
                         cx.notify();
                     })))
                     .child(
@@ -4935,31 +4997,44 @@ impl BrowserWindow {
 
     fn find_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
+        let typed = !self.find_input.read(cx).content().is_empty();
+        let tally = match self.find_count {
+            Some(0) => "No matches".to_string(),
+            Some(count) => format!("{} of {count}", self.find_index.min(count)),
+            None => String::new(),
+        };
+        let found = self.find_count.is_some_and(|count| count > 0);
+        let step = |id: &'static str, icon: gpui::Svg, backwards: bool| {
+            icon_button(id, icon)
+                .box_size(rems(1.25))
+                .icon_size(rems(0.75))
+                .disabled(!found)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.find_step(backwards, cx)))
+        };
         h_stack()
+            .h(px(FIND_H as f32))
             .items_center()
-            .gap(px(6.))
+            .justify_end()
+            .gap(px(2.))
             .px(px(8.))
-            .py(px(6.))
             .bg(paint.surface)
             .border_b_1()
             .border_color(paint.border)
             .child(
-                div().flex_1().child(
+                div().w(px(260.)).child(
                     text_field(&self.find_input, cx)
                         .placeholder("Find in page")
-                        .full_width(true),
+                        .full_width(true)
+                        .when(typed, |field| field.suffix(Adornment::element(div().text_size(px(11.)).text_color(paint.muted).child(tally)))),
                 ),
             )
-            .child(action_button("find-next", "Next", Kind::Secondary, true, cx, |this, cx| {
-                let query = this.find_input.read(cx).content().to_string();
-                if let Some(id) = this.active_tab_id() {
-                    this.engine.find(&id, &query);
-                }
-            }))
-            .child(action_button("find-close", "Close", Kind::Secondary, true, cx, |this, cx| {
-                this.find_open = false;
+            .child(div().w(px(4.)))
+            .child(step("find-prev", Icons::chevron_up(), true))
+            .child(step("find-next", Icons::chevron_down(), false))
+            .child(icon_button("find-close", Icons::cross_2()).box_size(rems(1.25)).icon_size(rems(0.75)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.close_find();
                 cx.notify();
-            }))
+            })))
     }
 
     /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
@@ -5480,12 +5555,19 @@ fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
 const WINDOW_RADIUS: f64 = 10.0;
 /// Page URL and its icon URL, newline separated.
 const FAVICON_JS: &str = r#"(() => { const l = document.querySelector('link[rel~="icon" i], link[rel="apple-touch-icon"]'); return location.href + "\n" + (l ? l.href : location.origin + "/favicon.ico"); })()"#;
+
+/// Counts `query` in the page's visible text, ignoring case as WebKit's find does.
+// shortcut: innerText skips iframes and can disagree with WebKit on odd whitespace; count via WebKit's own matcher if that shows.
+fn find_count_js(query: &str) -> String {
+    let query = serde_json::to_string(&query.to_lowercase()).unwrap_or_default();
+    format!("(() => {{ const q = {query}, t = (document.body?.innerText ?? '').toLowerCase(); let n = 0; for (let i = t.indexOf(q); i !== -1; i = t.indexOf(q, i + q.length)) n++; return n; }})()")
+}
 const TITLE_H: f64 = 26.0;
 /// Window border beside and below the page; PAGE_RADIUS in the macOS engine is WINDOW_RADIUS minus this.
 const PAGE_INSET: f64 = 1.0;
 /// Must match PAGE_RADIUS in the macOS engine, which rounds the page's bottom corners.
 const PAGE_RADIUS: f64 = WINDOW_RADIUS - PAGE_INSET;
-const FIND_H: f64 = 36.0;
+const FIND_H: f64 = 32.0;
 
 /// Visible parts of each page, as disjoint rects: a page is hidden wherever a window in front of it sits.
 /// `stack` is back to front: (tab id, window shell, page rect). Pages never show outside `stage`.

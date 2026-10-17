@@ -1,0 +1,51 @@
+# Push a tag like v0.2.0 (matching Info.plist's CFBundleShortVersionString) to build, publish the DMG and bump the cask.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Xcode 26+ is needed for actool to compile the Icon Composer .icon.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Info.plist version
+        run: |
+          v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' crates/app/Info.plist)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != Info.plist version v$v"; exit 1; }
+
+      # GPUI compiles its shaders with `xcrun metal`, which Xcode 26 ships as a separate download.
+      - name: Install Metal toolchain
+        run: xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build NxBrowser.dmg
+        run: scripts/bundle-macos.sh
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" target/NxBrowser.dmg --title "$GITHUB_REF_NAME" --generate-notes
+
+      # TAP_DEPLOY_KEY: private half of a write deploy key on abeldzan/homebrew-tap.
+      - name: Bump Homebrew cask
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          sha=$(shasum -a 256 target/NxBrowser.dmg | cut -d' ' -f1)
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$RUNNER_TEMP/tap_key" && chmod 600 "$RUNNER_TEMP/tap_key"
+          # GitHub's published host key (gh api meta), so the push can't be redirected.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/tap_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          git clone git@github.com:abeldzan/homebrew-tap.git tap
+          sed -i '' -e "s/^  version \".*\"/  version \"${GITHUB_REF_NAME#v}\"/" -e "s/^  sha256 .*/  sha256 \"$sha\"/" tap/Casks/nxbrowser.rb
+          git -C tap -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -am "nxbrowser ${GITHUB_REF_NAME#v}"
+          git -C tap push

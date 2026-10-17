@@ -1224,7 +1224,7 @@ impl WebEngine for MacEngine {
         }
     }
 
-    fn find(&mut self, tab_id: &str, query: &str) {
+    fn find(&mut self, tab_id: &str, query: &str, backwards: bool) {
         let Some(mtm) = MainThreadMarker::new() else {
             return;
         };
@@ -1235,6 +1235,7 @@ impl WebEngine for MacEngine {
             return;
         }
         let config = unsafe { WKFindConfiguration::new(mtm) };
+        unsafe { config.setBackwards(backwards) };
         let block = RcBlock::new(|_result: std::ptr::NonNull<objc2_web_kit::WKFindResult>| {});
         unsafe {
             live.view.findString_withConfiguration_completionHandler(

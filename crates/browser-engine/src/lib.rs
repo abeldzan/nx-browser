@@ -271,7 +271,8 @@ pub trait WebEngine {
     fn forward(&mut self, tab_id: &str);
     fn reload(&mut self, tab_id: &str);
     fn hard_reload(&mut self, tab_id: &str);
-    fn find(&mut self, tab_id: &str, query: &str);
+    /// Selects the next match of `query` after the page selection (before it, `backwards`), wrapping around.
+    fn find(&mut self, tab_id: &str, query: &str, backwards: bool);
     fn eval(&mut self, tab_id: &str, token: &str, javascript: &str);
     fn focus_chrome(&mut self);
     fn remove_data_store(&mut self, data_store_id: &str);
