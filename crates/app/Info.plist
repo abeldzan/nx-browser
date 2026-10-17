@@ -12,6 +12,13 @@
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSCameraUsageDescription</key><string>Websites you allow can use your camera.</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>Web site URL</string>
+            <key>CFBundleURLSchemes</key><array><string>http</string><string>https</string></array>
+        </dict>
+    </array>
     <key>NSMicrophoneUsageDescription</key><string>Websites you allow can use your microphone.</string>
 </dict>
 </plist>

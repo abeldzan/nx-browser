@@ -94,6 +94,8 @@ pub struct BrowserWindow {
     /// The popover a press outside it just closed, and where; that press's click on its own button keeps it closed.
     popover_dismissed: Option<(Popover, gpui::Point<Pixels>)>,
     pub(crate) history_modal: bool,
+    /// Links from other apps waiting for the user to pick a profile.
+    pub(crate) pending_links: Vec<String>,
     pub(crate) history_query: Entity<InputState>,
     /// The bookmark editor: (bookmark id, pinned); no id adds a new pinned site.
     pub(crate) bookmark_edit: Option<(Option<String>, bool)>,
@@ -443,6 +445,7 @@ impl BrowserWindow {
             popover: None,
             popover_dismissed: None,
             history_modal: false,
+            pending_links: Vec::new(),
             history_query,
             bookmark_edit: None,
             bookmark_title,
@@ -2079,6 +2082,7 @@ impl Render for BrowserWindow {
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
+            .when(!self.pending_links.is_empty(), |root| root.child(self.link_profile_modal(cx)))
             .map(|root| match self.popover {
                 Some(Popover::Downloads) => root.child(self.downloads_popover(cx)),
                 Some(Popover::Extensions) => root.child(self.extensions_popover(cx)),
@@ -2923,7 +2927,7 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some();
+        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty();
         self.engine.set_modal(modal);
         let Some(stage) = self.stage_bounds else {
             return;
@@ -4445,6 +4449,39 @@ impl BrowserWindow {
         self.chrome.insert(new.clone(), chrome);
         self.focus_window(&new, cx);
         self.focus_address = url.is_none();
+    }
+
+    /// Links opened from other apps: ask which profile takes them, or use the active one.
+    pub(crate) fn open_external(&mut self, urls: Vec<String>, cx: &mut Context<Self>) {
+        let (ask, active) = {
+            let model = self.model.lock();
+            (model.settings.ask_link_profile && model.profiles.len() > 1, model.active_profile_id.clone())
+        };
+        if ask {
+            self.pending_links.extend(urls);
+            cx.notify();
+        } else {
+            self.open_links_in(&active, urls, cx);
+        }
+    }
+
+    /// Switches to `profile` and opens each link in a new tab, as Cmd+T would.
+    pub(crate) fn open_links_in(&mut self, profile: &str, urls: Vec<String>, cx: &mut Context<Self>) {
+        if self.model.lock().active_profile_id != profile {
+            self.with_model(|model| { let _ = model.switch_profile(profile); });
+            self.refresh_url(cx);
+        }
+        for url in urls {
+            match self.active_tab_id() {
+                Some(id) => self.new_tab_in(&id, Some(&url), cx),
+                None => {
+                    if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
+                        self.focus_window(&id, cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// The + button: a new tab in the window holding `id`, or a terminal with Shift held.

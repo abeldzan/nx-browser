@@ -21,6 +21,12 @@ pub fn normalize_url(input: &str, search_template: &str, https_only: bool) -> St
     if let Some(url) = expand_bang(trimmed) {
         return url;
     }
+    // Local dev hosts rarely have TLS, so open them over plain http like other browsers do.
+    let host = trimmed.split(['/', '?', '#']).next().unwrap_or("");
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    if !trimmed.contains(' ') && (name == "localhost" || name.parse::<std::net::Ipv4Addr>().is_ok()) {
+        return format!("http://{trimmed}");
+    }
     if trimmed.contains(' ') || !trimmed.contains('.') {
         return search_template.replace("%s", &percent_encode(trimmed));
     }
@@ -108,6 +114,10 @@ mod tests {
         assert_eq!(normalize_url("https://example.com/a", DDG, false), "https://example.com/a");
         assert_eq!(normalize_url("nxbrowser://home", DDG, false), "nxbrowser://home");
         assert!(normalize_url("rust browser", DDG, false).starts_with("https://duckduckgo.com/?q="));
+        assert_eq!(normalize_url("localhost:3000", DDG, false), "http://localhost:3000");
+        assert_eq!(normalize_url("localhost", DDG, false), "http://localhost");
+        assert_eq!(normalize_url("192.168.1.10:8080/a", DDG, false), "http://192.168.1.10:8080/a");
+        assert_eq!(normalize_url("example.com:8080", DDG, false), "https://example.com:8080");
     }
 
     #[test]

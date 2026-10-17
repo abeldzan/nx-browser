@@ -82,7 +82,7 @@ impl SettingsSection {
     fn keywords(self) -> &'static str {
         match self {
             Self::Profiles => "new profile icon color rename delete switch export import backup",
-            Self::General => "on startup restore session new tab page home focus windows hover click",
+            Self::General => "on startup restore session new tab page home focus windows hover click default browser links other apps profile",
             Self::Shortcuts => "keyboard keys reset",
             Self::Appearance => "theme dark light system page zoom accent color density compact reduce motion site zoom",
             Self::Search => "address bar google duckduckgo",
@@ -267,6 +267,53 @@ impl BrowserWindow {
             );
         self.modal_shell("delete-modal", card, |this, cx| {
             this.delete_prompt = None;
+            cx.notify();
+        }, cx)
+    }
+
+    /// Which profile links from other apps open in.
+    pub(crate) fn link_profile_modal(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let paint = paint(cx);
+        let (profiles, active) = {
+            let model = self.model.lock();
+            (model.profiles.clone(), model.active_profile_id.clone())
+        };
+        let heading = match self.pending_links.len() {
+            1 => "Open link in".to_string(),
+            n => format!("Open {n} links in"),
+        };
+        let mut list = v_stack().gap(px(2.));
+        for profile in profiles {
+            let id = profile.id.clone();
+            list = list.child(
+                h_stack()
+                    .id(SharedString::from(format!("link-profile-{id}")))
+                    .gap(px(10.))
+                    .items_center()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(7.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(paint.secondary))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let urls = std::mem::take(&mut this.pending_links);
+                        this.open_links_in(&id, urls, cx);
+                    }))
+                    .child(profile_badge(&profile, profile.id == active, 28., paint))
+                    .child(div().flex_1().child(profile.name.clone()))
+                    .when(profile.id == active, |row| row.child(div().text_color(paint.muted).child("Active"))),
+            );
+        }
+        let card = v_stack()
+            .w(px(380.))
+            .max_w_full()
+            .gap(px(10.))
+            .p(px(24.))
+            .child(title(heading))
+            .child(div().text_color(paint.muted).truncate().child(self.pending_links.first().cloned().unwrap_or_default()))
+            .child(list);
+        self.modal_shell("link-profile-modal", card, |this, cx| {
+            this.pending_links.clear();
             cx.notify();
         }, cx)
     }
@@ -506,6 +553,23 @@ impl BrowserWindow {
                     "Focus windows",
                     Some("Hover focuses the window under the pointer; click waits for a click."),
                     choice("window-focus", vec![("Click", false), ("Hover", true)], settings.focus_on_hover, |s, v| s.focus_on_hover = v, paint, cx),
+                    paint,
+                ))
+                .child(row(
+                    "Links from other apps",
+                    Some("Which profile a link clicked in another app opens in."),
+                    choice("link-profile", vec![("Ask each time", true), ("Active profile", false)], settings.ask_link_profile, |s, v| s.ask_link_profile = v, paint, cx),
+                    paint,
+                ))
+                .child(row(
+                    "Default browser",
+                    Some("Open web links from every app in NxBrowser. macOS asks you to confirm."),
+                    action_button("make-default", "Make default", Kind::Secondary, true, cx, |this, cx| {
+                        if let Err(error) = browser_engine_macos::make_default_browser() {
+                            this.settings_note = Some(error.to_string().into());
+                        }
+                        cx.notify();
+                    }),
                     paint,
                 )),
             SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, query, paint, cx)),

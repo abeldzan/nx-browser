@@ -63,6 +63,8 @@ pub struct Settings {
     pub offer_passwords: bool,
     /// Suggest saved passwords in sign-in forms.
     pub autofill_passwords: bool,
+    /// Links opened from other apps ask which profile to use; off, they open in the active profile.
+    pub ask_link_profile: bool,
 }
 
 impl Default for Settings {
@@ -101,6 +103,7 @@ impl Default for Settings {
             focus_on_hover: false,
             offer_passwords: true,
             autofill_passwords: true,
+            ask_link_profile: true,
         }
     }
 }
@@ -152,7 +155,7 @@ mod tests {
         assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
         assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));
-        assert!(parsed.shortcuts.is_empty() && !parsed.focus_on_hover);
+        assert!(parsed.shortcuts.is_empty() && !parsed.focus_on_hover && parsed.ask_link_profile);
         let round: Settings = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(round, parsed);
     }

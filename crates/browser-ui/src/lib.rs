@@ -14,15 +14,20 @@ mod window;
 use gpui::{
     App, AppContext, Application, Bounds, Pixels, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
+use futures::StreamExt;
 use std::sync::{Arc, Mutex};
 use window::BrowserWindow;
 
 pub fn run() {
     let self_test = std::env::args().any(|arg| arg == "--self-test");
     let started = std::time::Instant::now();
-    Application::with_platform(gpui_platform::current_platform(false))
-        .with_assets(Assets)
-        .run(move |cx: &mut App| {
+    let app = Application::with_platform(gpui_platform::current_platform(false)).with_assets(Assets);
+    // Links from other apps (NxBrowser as the system browser) arrive without an `App`; the main window takes them below.
+    let (link_tx, mut links) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    app.on_open_urls(move |urls| {
+        let _ = link_tx.unbounded_send(urls);
+    });
+    app.run(move |cx: &mut App| {
         gpuikit::init(cx);
         gpuikit::input::bind_input_keys(cx, None);
         let storage = browser_storage::Storage::open(&browser_core::app_support_dir().join("nxbrowser.sqlite"))
@@ -52,12 +57,31 @@ pub fn run() {
         std::thread::spawn(|| terminal::monospace_fonts().len());
         let model: SharedModel = Arc::new(Mutex::new(model));
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
-        open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, self_test, started, cx));
+        let shared = model.clone();
+        let mut main = open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, self_test, started, cx));
         cx.activate(true);
+        cx.spawn(async move |cx| {
+            while let Some(urls) = links.next().await {
+                cx.update(|cx| {
+                    let open = |view: &mut BrowserWindow, window: &mut gpui::Window, cx: &mut gpui::Context<BrowserWindow>| {
+                        view.open_external(urls.clone(), cx);
+                        window.activate_window();
+                    };
+                    // The main window was closed: links reopen it rather than vanish.
+                    if main.update(cx, open).is_err() {
+                        let model = shared.clone();
+                        main = open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, false, std::time::Instant::now(), cx));
+                        let _ = main.update(cx, open);
+                    }
+                    cx.activate(true);
+                });
+            }
+        })
+        .detach();
     });
 }
 
-pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: impl FnOnce(&mut gpui::Context<BrowserWindow>) -> BrowserWindow + 'static) {
+pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: impl FnOnce(&mut gpui::Context<BrowserWindow>) -> BrowserWindow + 'static) -> gpui::WindowHandle<BrowserWindow> {
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -73,7 +97,7 @@ pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: i
         },
         |_, cx| cx.new(build),
     )
-    .expect("open window");
+    .expect("open window")
 }
 
 /// gpuikit's assets plus the app's own icons (Radix has no puzzle piece or microphone).
