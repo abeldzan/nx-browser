@@ -1,6 +1,6 @@
 use crate::settings::measure_overlay;
 use crate::window::{paint, BrowserWindow};
-use gpui::{div, prelude::*, px, relative, ClickEvent, Context, SharedString};
+use gpui::{div, prelude::*, px, relative, ClickEvent, Context, MouseButton, MouseDownEvent, MouseMoveEvent, SharedString};
 use crate::history::{popover_header, text_action, INSET};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
@@ -45,6 +45,7 @@ impl BrowserWindow {
                 ("Interrupted".into(), None)
             };
             let path = entry.path.clone();
+            let drag = entry.path.clone();
             let reveal = entry.path.clone();
             let group = SharedString::from(format!("download-{}", entry.id));
             list = list.child(
@@ -63,6 +64,22 @@ impl BrowserWindow {
                         row.cursor_pointer()
                             .hover(|style| style.bg(paint.secondary))
                             .on_click(move |_: &ClickEvent, _, _| open_path(&path, false))
+                            // Dragging the row out drops the file on a page (or anywhere) as from Finder.
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, _| {
+                                this.download_drag = Some((drag.clone(), event.position));
+                            }))
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+                                let Some((_, start)) = &this.download_drag else {
+                                    return;
+                                };
+                                if event.pressed_button != Some(MouseButton::Left) {
+                                    this.download_drag = None;
+                                } else if (event.position.x - start.x).abs() + (event.position.y - start.y).abs() > px(4.) {
+                                    if let Some((path, _)) = this.download_drag.take() {
+                                        browser_engine_macos::drag_file(Path::new(&path));
+                                    }
+                                }
+                            }))
                     })
                     .child(Icons::file().flex_none().size(px(16.)).text_color(if failed { danger } else { paint.muted }))
                     .child(

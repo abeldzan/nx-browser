@@ -2,6 +2,7 @@ use crate::settings::row;
 use crate::ui::{action_button, Kind};
 use crate::window::{BrowserWindow, Paint};
 use browser_core::Settings;
+use browser_engine::WebEngine;
 use browser_engine::{Binding, Shortcut, SHORTCUTS};
 use gpui::{div, prelude::*, px, ClickEvent, Context, FontWeight, KeyDownEvent, Keystroke, SharedString};
 use gpuikit::elements::icon_button::icon_button;
@@ -48,6 +49,14 @@ pub(crate) fn hint(settings: &Settings, action: Shortcut) -> String {
     SHORTCUTS.iter().find(|binding| binding.action == action).map(|binding| label(keys(settings, binding))).unwrap_or_default()
 }
 
+/// Whether settings search `query` (already lowercased) names `binding` by its label, group or default keys.
+pub(crate) fn matches(binding: &Binding, query: &str) -> bool {
+    query.is_empty()
+        || binding.label.to_lowercase().contains(query)
+        || binding.group.to_lowercase().contains(query)
+        || label(binding.keys).to_lowercase().contains(query)
+}
+
 /// Stores `keys` for `binding`, dropping the override when it matches the default.
 fn set_keys(settings: &mut Settings, binding: &'static Binding, keys: String) {
     if keys == binding.keys {
@@ -58,28 +67,30 @@ fn set_keys(settings: &mut Settings, binding: &'static Binding, keys: String) {
 }
 
 impl BrowserWindow {
-    pub(crate) fn shortcuts_settings(&self, settings: &Settings, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    pub(crate) fn shortcuts_settings(&self, settings: &Settings, query: &str, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
         let mut page = v_stack()
             .w_full()
             .track_focus(&self.shortcut_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.record_key(event, cx)))
             .child(row(
                 "Change a shortcut",
-                Some("Click it, then press the new keys. Delete removes it; Escape cancels."),
+                Some("Click a shortcut, then press the new keys. Delete clears it; Esc or click again to cancel."),
                 action_button("shortcuts-reset", "Reset all", Kind::Secondary, !settings.shortcuts.is_empty(), cx, |this, cx| {
                     this.set_pref(cx, |s| s.shortcuts.clear());
                 }),
                 paint,
             ));
+        // The section can match by its own keywords; then list every binding rather than none.
+        let query = if SHORTCUTS.iter().any(|binding| matches(binding, query)) { query } else { "" };
         let mut group = "";
-        for binding in SHORTCUTS {
+        for binding in SHORTCUTS.iter().filter(|binding| matches(binding, query)) {
             if binding.group != group {
                 group = binding.group;
                 page = page.child(div().pt(px(18.)).pb(px(2.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(group));
             }
             let keys = keys(settings, binding);
             let recording = self.recording == Some(binding.id);
-            let shown = if recording { "Press keys…".to_string() } else if keys.is_empty() { "None".into() } else { label(keys) };
+            let shown = if recording { "Press keys… (Esc)".to_string() } else if keys.is_empty() { "None".into() } else { label(keys) };
             let pill = div()
                 .id(SharedString::from(format!("shortcut-{}", binding.id)))
                 .h(px(28.))
@@ -96,18 +107,32 @@ impl BrowserWindow {
                 .text_color(if keys.is_empty() && !recording { paint.muted } else { paint.fg })
                 .child(shown)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.recording = Some(binding.id);
                     this.settings_note = None;
-                    this.engine.set_shortcuts(Vec::new());
-                    window.focus(&this.shortcut_focus, cx);
+                    if this.recording == Some(binding.id) {
+                        this.end_recording();
+                    } else {
+                        this.recording = Some(binding.id);
+                        this.engine.set_shortcuts(Vec::new());
+                        // Take key focus from the page, or Escape never reaches the recorder.
+                        this.engine.focus_chrome();
+                        window.focus(&this.shortcut_focus, cx);
+                    }
                     cx.notify();
                 }));
+            let cancel = recording.then(|| {
+                icon_button(SharedString::from(format!("shortcut-cancel-{}", binding.id)), Icons::cross_2())
+                    .small()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.end_recording();
+                        cx.notify();
+                    }))
+            });
             let reset = settings.shortcuts.contains_key(binding.id).then(|| {
                 icon_button(SharedString::from(format!("shortcut-reset-{}", binding.id)), Icons::reset())
                     .small()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| { s.shortcuts.remove(binding.id); })))
             });
-            page = page.child(row(binding.label, None, h_stack().gap(px(6.)).items_center().children(reset).child(pill), paint));
+            page = page.child(row(binding.label, None, h_stack().gap(px(6.)).items_center().children(reset).children(cancel).child(pill), paint));
         }
         page
     }

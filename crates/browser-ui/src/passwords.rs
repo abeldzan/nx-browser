@@ -289,7 +289,9 @@ impl BrowserWindow {
 
     /// Settings → Passwords, below the two switches.
     pub(crate) fn passwords_settings(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
-        let logins = self.model.lock().logins(&self.manager_profile(), None).unwrap_or_default();
+        // Not inline: `manager_profile` locks the model too, and a second lock on this thread deadlocks.
+        let profile_id = self.manager_profile();
+        let logins = self.model.lock().logins(&profile_id, None).unwrap_or_default();
         let query = self.passwords.search.read(cx).content().trim().to_lowercase();
         let unlocked = self.passwords.unlocked();
         // Counted over this profile's logins: `health` may still hold another profile's results (ids never collide).

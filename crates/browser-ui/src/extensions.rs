@@ -129,7 +129,7 @@ impl BrowserWindow {
                                 cx.notify();
                             }))
                             .child(link("load-unpacked", "Load unpacked…", paint, cx, |this, cx| {
-                                this.load_unpacked();
+                                this.load_unpacked(cx);
                                 cx.notify();
                             }))
                             .child(div().flex_1())

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 pub struct Pty {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Input for the writer thread: a write blocks while the program isn't reading stdin, so never on the UI thread.
+    writer: std::sync::mpsc::Sender<Vec<u8>>,
     /// Taken on drop, to be killed and reaped off the UI thread.
     child: Option<Box<dyn Child + Send + Sync>>,
 }
@@ -36,7 +37,16 @@ pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Unb
     let child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
+    let mut pty_writer = pair.master.take_writer()?;
+    let (writer, input) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Ends when the `Pty` (and so the sender) drops, or the shell is gone.
+    std::thread::spawn(move || {
+        while let Ok(bytes) = input.recv() {
+            if pty_writer.write_all(&bytes).and_then(|()| pty_writer.flush()).is_err() {
+                break;
+            }
+        }
+    });
     let (tx, rx) = unbounded();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
@@ -52,8 +62,7 @@ pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Unb
 impl Pty {
     pub fn write(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            let _ = self.writer.write_all(bytes);
-            let _ = self.writer.flush();
+            let _ = self.writer.send(bytes.to_vec());
         }
     }
 

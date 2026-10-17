@@ -10,7 +10,7 @@ use browser_core::{
     Model, TabState,
 };
 use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
-use browser_engine_macos::{choose_folder_path, choose_open_path, choose_save_path, Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
+use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
 use gpui::{
     canvas, div, img, prelude::*, px, relative, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
@@ -80,6 +80,8 @@ pub struct BrowserWindow {
     pub(crate) name_input: Entity<InputState>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
+    /// Filters the settings nav and the shortcut list.
+    pub(crate) settings_query: Entity<InputState>,
     /// Confirmation shown in the settings footer after an action.
     pub(crate) settings_note: Option<SharedString>,
     pub(crate) settings_profile: Option<String>,
@@ -103,6 +105,8 @@ pub struct BrowserWindow {
     pub(crate) new_profile_input: Entity<InputState>,
     /// Live (received, total) bytes per download id, fed by the download threads.
     pub(crate) download_progress: HashMap<String, (u64, Option<u64>)>,
+    /// A finished download pressed in the downloads popover: (path, press position), until it moves far enough to drag.
+    pub(crate) download_drag: Option<(String, gpui::Point<Pixels>)>,
     /// Right-click menu on a rail profile: (profile id, index, click position).
     pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
     address_focused: bool,
@@ -290,6 +294,7 @@ impl BrowserWindow {
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let history_query = cx.new(InputState::new_singleline);
+        let settings_query = cx.new(InputState::new_singleline);
         let bookmark_title = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let bookmark_url = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let mut subscriptions = vec![
@@ -376,6 +381,11 @@ impl BrowserWindow {
                 InputStateEvent::TextChanged => cx.notify(),
                 _ => {}
             }),
+            cx.subscribe(&settings_query, |this, _, event, cx| match event {
+                InputStateEvent::Focus => this.engine.focus_chrome(),
+                InputStateEvent::TextChanged => cx.notify(),
+                _ => {}
+            }),
             cx.subscribe(&bookmark_title, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::Submit => this.save_bookmark_edit(cx),
@@ -388,7 +398,7 @@ impl BrowserWindow {
             }),
             cx.subscribe(&name_input, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => this.save_profile_name(cx),
+                InputStateEvent::Submit | InputStateEvent::Blur => this.save_profile_name(cx),
                 _ => {}
             }),
         ];
@@ -424,6 +434,7 @@ impl BrowserWindow {
             name_input,
             settings_open: false,
             settings_section: SettingsSection::Profiles,
+            settings_query,
             settings_note: None,
             settings_profile: None,
             delete_prompt: None,
@@ -440,6 +451,7 @@ impl BrowserWindow {
             new_profile: None,
             new_profile_input,
             download_progress: HashMap::new(),
+            download_drag: None,
             address_focused: false,
             focus_address: false,
             address_in_page: false,
@@ -717,7 +729,7 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Failed { message, .. } => self.status = message.into(),
-            EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename),
+            EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename, cx),
             EngineEvent::DownloadDone { download, bytes, error } => {
                 // Unknown ids are downloads cancelled before they were recorded.
                 if let Some((id, path)) = self.web_downloads.remove(&download) {
@@ -1068,15 +1080,22 @@ impl BrowserWindow {
         });
     }
 
-    pub(crate) fn load_unpacked(&mut self) {
-        let Some(path) = choose_folder_path() else {
-            return;
-        };
-        if !path.join("manifest.json").is_file() {
-            self.status = "That folder has no manifest.json".into();
-            return;
-        }
-        self.add_extension(&local_id(&path), &path, "unpacked");
+    pub(crate) fn load_unpacked(&mut self, cx: &mut Context<Self>) {
+        // gpui's sheet, not runModal: a modal loop inside a gpui handler lets its timers re-enter and abort.
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                if path.join("manifest.json").is_file() {
+                    this.add_extension(&local_id(&path), &path, "unpacked");
+                } else {
+                    this.status = "That folder has no manifest.json".into();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn remove_extension(&mut self, id: &str) {
@@ -1451,25 +1470,40 @@ impl BrowserWindow {
     }
 
     /// Picks the file for a download WebKit is holding, then lets it write there.
-    fn start_download(&mut self, download: u64, url: &str, filename: &str) {
+    fn start_download(&mut self, download: u64, url: &str, filename: &str, cx: &mut Context<Self>) {
         let (dir, ask) = {
             let settings = &self.model.lock().settings;
             (settings.download_dir.clone(), settings.ask_download_path)
         };
         let dir = if dir.is_empty() { downloads_dir() } else { std::path::PathBuf::from(dir) };
         let path = unique_path(&dir, filename);
-        let path = if ask {
-            let Some(path) = path.file_name().and_then(|name| choose_save_path(&name.to_string_lossy())) else {
-                self.engine.save_download(download, None);
-                return;
-            };
-            // The save panel already asked about replacing it; WebKit won't write over a file.
-            let _ = std::fs::remove_file(&path);
-            path
-        } else {
+        if !ask {
             let _ = std::fs::create_dir_all(&dir);
-            path
-        };
+            return self.begin_download(download, url, path);
+        }
+        // gpui's save sheet, not runModal: this runs from the tick, and a modal loop here lets gpui re-enter and abort.
+        let name = path.file_name().map(|name| name.to_string_lossy().into_owned());
+        let chosen = cx.prompt_for_new_path(&dir, name.as_deref());
+        let url = url.to_string();
+        cx.spawn(async move |this, cx| {
+            let path = chosen.await.ok().and_then(Result::ok).flatten();
+            let _ = this.update(cx, |this, cx| {
+                match path {
+                    Some(path) => {
+                        // The save sheet already asked about replacing it; WebKit won't write over a file.
+                        let _ = std::fs::remove_file(&path);
+                        this.begin_download(download, &url, path);
+                    }
+                    None => this.engine.save_download(download, None),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Lets WebKit write a held download to `path` and starts tracking it.
+    fn begin_download(&mut self, download: u64, url: &str, path: std::path::PathBuf) {
         let id = Uuid::new_v4().to_string();
         let shown = path.display().to_string();
         let _ = self.model.lock().add_download(&id, url, &shown);
@@ -1480,26 +1514,43 @@ impl BrowserWindow {
         self.popover = Some(Popover::Downloads);
     }
 
-    pub(crate) fn export_profile(&mut self) {
+    pub(crate) fn export_profile(&mut self, cx: &mut Context<Self>) {
         let bundle = self.model.lock().export_active();
         let Ok(bundle) = bundle else {
             self.status = "Export failed".into();
             return;
         };
-        let Some(path) = choose_save_path("profile.json") else {
-            return;
-        };
-        match std::fs::write(&path, serde_json::to_string_pretty(&bundle).unwrap_or_default()) {
-            Ok(()) => self.status = format!("Exported {}", path.display()).into(),
-            Err(error) => self.status = error.to_string().into(),
-        }
+        // gpui's sheets, not runModal: a modal loop inside a gpui handler lets its timers re-enter and abort.
+        let path = cx.prompt_for_new_path(&downloads_dir(), Some("profile.json"));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = path.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                match std::fs::write(&path, serde_json::to_string_pretty(&bundle).unwrap_or_default()) {
+                    Ok(()) => this.status = format!("Exported {}", path.display()).into(),
+                    Err(error) => this.status = error.to_string().into(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    pub(crate) fn import_profile(&mut self) {
-        let Some(path) = choose_open_path() else {
-            return;
-        };
-        let text = match std::fs::read_to_string(&path) {
+    pub(crate) fn import_profile(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.import_profile_from(&path);
+                this.refresh_url(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn import_profile_from(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
                 self.status = error.to_string().into();
@@ -5718,6 +5769,7 @@ pub(crate) struct WindowModel {
 impl WindowModel {
     /// The model pointed at this window's space for as long as the guard lives.
     pub(crate) fn lock(&self) -> Pinned<'_> {
+        debug_assert!(!MODEL_HELD.replace(true), "model locked twice on one thread (deadlock): drop the first guard before calling a helper that locks");
         let mut model = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         let back = self.detached.as_ref().filter(|id| **id != model.active_session_id).map(|id| {
             let back = model.active_session_id.clone();
@@ -5752,7 +5804,13 @@ impl Drop for Pinned<'_> {
         if let Some(back) = self.back.take() {
             let _ = self.model.set_active(&back);
         }
+        MODEL_HELD.set(false);
     }
+}
+
+thread_local! {
+    /// Whether this thread holds a `Pinned`: the mutex is not reentrant, so a second `lock` would hang the UI.
+    static MODEL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Drag payload for reordering profiles in the rail.
@@ -5841,6 +5899,26 @@ pub(crate) fn rail_mark(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window_model() -> WindowModel {
+        let model = Model::open(browser_storage::Storage::open_in_memory().unwrap()).unwrap();
+        WindowModel { shared: Arc::new(std::sync::Mutex::new(model)), detached: None }
+    }
+
+    #[test]
+    fn model_locks_again_once_the_guard_drops() {
+        let model = window_model();
+        drop(model.lock());
+        drop(model.lock());
+    }
+
+    #[test]
+    #[should_panic(expected = "locked twice")]
+    fn second_lock_on_one_thread_panics_instead_of_hanging() {
+        let model = window_model();
+        let _held = model.lock();
+        let _ = model.lock();
+    }
 
     #[test]
     fn dragged_tab_leaves_its_row_for_the_one_it_hovers() {

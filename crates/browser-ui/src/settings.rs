@@ -1,7 +1,6 @@
 use crate::window::{paint, profile_badge, BrowserWindow, Paint};
 use browser_core::{app_support_dir, Settings, SEARCH_ENGINES};
-use browser_engine::WebEngine;
-use browser_engine_macos::choose_folder_path;
+use browser_engine::{WebEngine, SHORTCUTS};
 use browser_engine::LogicalRect;
 use gpui::{FontWeight, anchored, canvas, deferred, div, prelude::*, px, ClickEvent, Context, KeyDownEvent, MouseButton, SharedString};
 use crate::ui::{action_button, Kind};
@@ -78,6 +77,33 @@ impl SettingsSection {
             Self::About => "About",
         }
     }
+
+    /// Row titles of the section, so search finds a setting by name.
+    fn keywords(self) -> &'static str {
+        match self {
+            Self::Profiles => "new profile icon color rename delete switch export import backup",
+            Self::General => "on startup restore session new tab page home focus windows hover click",
+            Self::Shortcuts => "keyboard keys reset",
+            Self::Appearance => "theme dark light system page zoom accent color density compact reduce motion site zoom",
+            Self::Search => "address bar google duckduckgo",
+            Self::Privacy => "save browsing history https ads trackers block pop-ups popups fraudulent warnings clear cookies site data permissions",
+            Self::Passwords => "offer save suggest autofill logins vault",
+            Self::Content => "javascript custom user agent",
+            Self::Downloads => "location folder ask where save file",
+            Self::Terminal => "font size line height cursor scrollback shell",
+            Self::Performance => "suspend background tabs maximum live tabs memory",
+            Self::Developer => "web inspector inspect element",
+            Self::About => "version engine webkit data folder",
+        }
+    }
+
+    /// Whether search `query` (already lowercased) should list this section.
+    fn matches(self, query: &str) -> bool {
+        query.is_empty()
+            || self.label().to_lowercase().contains(query)
+            || self.keywords().contains(query)
+            || (self == Self::Shortcuts && SHORTCUTS.iter().any(|binding| crate::shortcuts::matches(binding, query)))
+    }
 }
 
 type Apply<T> = fn(&mut Settings, T);
@@ -98,6 +124,7 @@ impl BrowserWindow {
             // Rebuilt on show, so it lists fonts installed since and selects the saved one.
             self.term_font_picker = None;
             self.term_shell_input.update(cx, |input, cx| input.set_content_silent(settings.terminal_shell, cx));
+            self.settings_query.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
             self.select_settings_profile(active, cx);
         }
         cx.notify();
@@ -368,16 +395,29 @@ impl BrowserWindow {
 
     pub(crate) fn settings_modal(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let paint = paint(cx);
-        let mut nav = v_stack().w(px(200.)).h_full().gap(px(2.)).p(px(10.)).bg(paint.surface).border_r_1().border_color(paint.border);
-        for section in SettingsSection::ALL {
-            let selected = self.settings_section == section;
+        let query = self.settings_query.read(cx).content().trim().to_lowercase();
+        let shown = SettingsSection::ALL.into_iter().filter(|section| section.matches(&query)).collect::<Vec<_>>();
+        let current = if shown.contains(&self.settings_section) { Some(self.settings_section) } else { shown.first().copied() };
+        let mut nav = v_stack()
+            .w(px(168.))
+            .h_full()
+            .gap(px(1.))
+            .p(px(8.))
+            .bg(paint.surface)
+            .border_r_1()
+            .border_color(paint.border)
+            .child(div().pb(px(6.)).child(text_field(&self.settings_query, cx).placeholder("Search").full_width(true)))
+            .when(shown.is_empty(), |nav| nav.child(div().px(px(10.)).py(px(6.)).text_size(px(13.)).text_color(paint.muted).child("No matches")));
+        for section in shown {
+            let selected = current == Some(section);
             nav = nav.child(
                 div()
                     .id(SharedString::from(format!("settings-nav-{}", section.label())))
-                    .h(px(34.))
-                    .px(px(12.))
+                    .h(px(28.))
+                    .px(px(10.))
                     .flex()
                     .items_center()
+                    .text_size(px(13.))
                     .rounded(px(6.))
                     .cursor_pointer()
                     .bg(if selected { paint.accent_bg } else { gpui::transparent_black() })
@@ -400,7 +440,7 @@ impl BrowserWindow {
                 h_stack()
                     .w_full()
                     .px(px(20.))
-                    .py(px(12.))
+                    .py(px(10.))
                     .justify_between()
                     .items_center()
                     .border_b_1()
@@ -415,7 +455,7 @@ impl BrowserWindow {
                         scroll_area("settings-content")
                             .vertical()
                             .full_height(true)
-                            .child(v_stack().w_full().px(px(28.)).py(px(24.)).child(self.settings_page(paint, cx))),
+                            .child(v_stack().w_full().px(px(28.)).py(px(24.)).children(current.map(|section| self.settings_page(section, &query, paint, cx)))),
                     ),
                 ),
             )
@@ -434,13 +474,13 @@ impl BrowserWindow {
         self.modal_shell("settings-backdrop", card, Self::toggle_settings, cx)
     }
 
-    fn settings_page(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_page(&self, section: SettingsSection, query: &str, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
         let settings = self.model.lock().settings.clone();
         let page = v_stack()
             .w_full()
             .gap(px(4.))
-            .child(div().pb(px(12.)).text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(self.settings_section.label()));
-        match self.settings_section {
+            .child(div().pb(px(8.)).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(section.label()));
+        match section {
             SettingsSection::Profiles => page.child(self.profiles_settings(paint, cx)),
             SettingsSection::General => page
                 .child(row(
@@ -468,7 +508,7 @@ impl BrowserWindow {
                     choice("window-focus", vec![("Click", false), ("Hover", true)], settings.focus_on_hover, |s, v| s.focus_on_hover = v, paint, cx),
                     paint,
                 )),
-            SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, paint, cx)),
+            SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, query, paint, cx)),
             SettingsSection::Appearance => page
                 .child(row(
                     "Theme",
@@ -613,10 +653,15 @@ impl BrowserWindow {
                 .child(row(
                     "Location",
                     Some(settings.download_dir.as_str()),
-                    action_button("download-dir", "Change…", Kind::Secondary, true, cx, |this, cx| {
-                        if let Some(path) = choose_folder_path() {
-                            this.set_pref(cx, |s| s.download_dir = path.display().to_string());
-                        }
+                    action_button("download-dir", "Change…", Kind::Secondary, true, cx, |_, cx| {
+                        // gpui's sheet, not runModal: a modal loop inside this click lets gpui's timers re-enter and abort.
+                        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
+                        cx.spawn(async move |this, cx| {
+                            let Ok(Ok(Some(paths))) = paths.await else { return };
+                            let Some(path) = paths.into_iter().next() else { return };
+                            let _ = this.update(cx, |this, cx| this.set_pref(cx, |s| s.download_dir = path.display().to_string()));
+                        })
+                        .detach();
                     }),
                     paint,
                 ))
@@ -736,11 +781,13 @@ impl BrowserWindow {
             let model = self.model.lock();
             (model.profiles.clone(), model.active_profile_id.clone())
         };
-        let editing = self.settings_profile.clone().unwrap_or_else(|| active.clone());
-        let mut list = v_stack().w_full().gap(px(4.));
+        let only_one = profiles.len() <= 1;
+        let mut list = v_stack().w_full().p(px(4.)).gap(px(2.)).rounded(px(10.)).border_1().border_color(paint.border);
         for profile in &profiles {
             let id = profile.id.clone();
-            let selected = profile.id == editing;
+            let is_active = profile.id == active;
+            let expanded = self.settings_profile.as_deref() == Some(profile.id.as_str());
+            let switch_id = profile.id.clone();
             list = list.child(
                 h_stack()
                     .id(SharedString::from(format!("settings-profile-{id}")))
@@ -751,94 +798,107 @@ impl BrowserWindow {
                     .rounded(px(8.))
                     .items_center()
                     .cursor_pointer()
-                    .bg(if selected { paint.secondary } else { gpui::transparent_black() })
+                    .bg(if expanded { paint.secondary } else { gpui::transparent_black() })
                     .hover(|style| style.bg(paint.secondary))
-                    .child(profile_badge(profile, profile.id == active, 28., paint))
+                    .child(profile_badge(profile, is_active, 28., paint))
                     .child(div().flex_1().child(profile.name.clone()))
-                    .when(profile.id == active, |row| row.child(div().text_size(px(11.)).text_color(paint.muted).child("Active")))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.select_settings_profile(id.clone(), cx);
-                        cx.notify();
-                    })),
-            );
-        }
-        let list = list.child(
-            h_stack()
-                .gap(px(8.))
-                .pt(px(4.))
-                .child(action_button("settings-new-profile", "New profile…", Kind::Secondary, true, cx, |this, cx| {
-                    this.open_new_profile(cx);
-                }))
-                .child(action_button("settings-export", "Export active", Kind::Secondary, true, cx, |this, cx| {
-                    this.export_profile();
-                    cx.notify();
-                }))
-                .child(action_button("settings-import", "Import…", Kind::Secondary, true, cx, |this, cx| {
-                    this.import_profile();
-                    this.refresh_url(cx);
-                    cx.notify();
-                })),
-        );
-        let Some(profile) = profiles.iter().find(|profile| profile.id == editing).cloned() else {
-            return list;
-        };
-        let (icons, colors) = appearance_pickers("edit", &profile.name, &profile.icon, &profile.color, |this, icon, color| {
-            if let Some(id) = this.settings_profile.clone() {
-                let _ = this.model.lock().set_profile_appearance(&id, &icon, &color);
-            }
-        }, paint, cx);
-        let is_active = profile.id == active;
-        let only_one = profiles.len() <= 1;
-        let switch_id = profile.id.clone();
-        let delete_id = profile.id.clone();
-        let editor = v_stack()
-            .w_full()
-            .gap(px(12.))
-            .p(px(14.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(paint.border)
-            .child(
-                h_stack()
-                    .gap(px(12.))
-                    .items_center()
-                    .child(profile_badge(&profile, is_active, 44., paint))
-                    .child(div().flex_1().child(text_field(&self.name_input, cx).placeholder("Profile name").full_width(true)))
-                    .child(action_button("settings-save-name", "Save name", Kind::Primary, true, cx, |this, cx| {
-                        this.save_profile_name(cx);
-                    })),
-            )
-            .child(heading("Icon", paint))
-            .child(icons)
-            .child(heading("Color", paint))
-            .child(colors)
-            .child(
-                h_stack()
-                    .gap(px(8.))
-                    .pt(px(4.))
-                    .when(!is_active, |row| {
-                        row.child(action_button("settings-switch-profile", "Switch to this profile", Kind::Secondary, true, cx, move |this, cx| {
+                    .child(if is_active {
+                        div().px(px(8.)).text_size(px(11.)).text_color(paint.muted).child("Active")
+                    } else {
+                        // Its own click must not also expand the row.
+                        div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
+                            action_button(SharedString::from(format!("settings-switch-{id}")), "Switch", Kind::Secondary, true, cx, move |this, cx| {
                                 this.with_model(|model| {
                                     let _ = model.switch_profile(&switch_id);
                                 });
                                 this.refresh_url(cx);
                                 cx.notify();
-                            },
-                        ))
+                            }),
+                        )
                     })
-                    .child(action_button("settings-delete-profile", "Delete profile…", Kind::Danger, !only_one, cx, move |this, cx| {
-                        this.delete_prompt = Some(delete_id.clone());
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if this.settings_profile.as_deref() == Some(id.as_str()) {
+                            this.settings_profile = None;
+                        } else {
+                            this.select_settings_profile(id.clone(), cx);
+                        }
                         cx.notify();
                     })),
             );
-        v_stack().w_full().gap(px(14.)).child(list).child(editor)
+            if !expanded {
+                continue;
+            }
+            let (icons, colors) = appearance_pickers("edit", &profile.name, &profile.icon, &profile.color, |this, icon, color| {
+                if let Some(id) = this.settings_profile.clone() {
+                    let _ = this.model.lock().set_profile_appearance(&id, &icon, &color);
+                }
+            }, paint, cx);
+            let delete_id = profile.id.clone();
+            list = list.child(
+                v_stack()
+                    .w_full()
+                    .gap(px(8.))
+                    .pl(px(46.))
+                    .pr(px(8.))
+                    .pt(px(6.))
+                    .pb(px(12.))
+                    .child(text_field(&self.name_input, cx).placeholder("Profile name").full_width(true))
+                    .child(heading("Icon", paint))
+                    .child(icons)
+                    .child(heading("Color", paint))
+                    .child(colors)
+                    .child(h_stack().pt(px(8.)).justify_end().child(action_button(
+                        "settings-delete-profile",
+                        "Delete profile…",
+                        Kind::Danger,
+                        !only_one,
+                        cx,
+                        move |this, cx| {
+                            this.delete_prompt = Some(delete_id.clone());
+                            cx.notify();
+                        },
+                    ))),
+            );
+        }
+        v_stack()
+            .w_full()
+            .gap(px(12.))
+            .child(
+                h_stack()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_size(px(12.)).text_color(paint.muted).child("Click a profile to edit it."))
+                    .child(action_button("settings-new-profile", "New profile…", Kind::Primary, true, cx, |this, cx| {
+                        this.open_new_profile(cx);
+                    })),
+            )
+            .child(list)
+            .child(row(
+                "Backup",
+                Some("Export the active profile, or import one from a file."),
+                h_stack()
+                    .gap(px(8.))
+                    .child(action_button("settings-export", "Export active", Kind::Secondary, true, cx, |this, cx| {
+                        this.export_profile(cx);
+                        cx.notify();
+                    }))
+                    .child(action_button("settings-import", "Import…", Kind::Secondary, true, cx, |this, cx| {
+                        this.import_profile(cx);
+                    })),
+                paint,
+            ))
     }
 
     pub(crate) fn save_profile_name(&mut self, cx: &mut Context<Self>) {
         let name = self.name_input.read(cx).content().trim().to_string();
         if let (false, Some(id)) = (name.is_empty(), self.settings_profile.clone()) {
-            let _ = self.model.lock().rename_profile(&id, &name);
-            self.settings_note = Some("Profile renamed".into());
+            let mut model = self.model.lock();
+            // Blur saves too, so leaving the field untouched must not rename or note anything.
+            if model.profiles.iter().any(|profile| profile.id == id && profile.name != name) {
+                let _ = model.rename_profile(&id, &name);
+                drop(model);
+                self.settings_note = Some("Profile renamed".into());
+            }
         }
         cx.notify();
     }
@@ -1099,5 +1159,19 @@ fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
         y: f64::from(bounds.origin.y),
         width: f64::from(bounds.size.width),
         height: f64::from(bounds.size.height),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_finds_sections_by_setting_and_shortcut() {
+        let hits = |query: &str| SettingsSection::ALL.into_iter().filter(|section| section.matches(query)).collect::<Vec<_>>();
+        assert_eq!(hits("https"), [SettingsSection::Privacy]);
+        assert!(hits("new tab").contains(&SettingsSection::Shortcuts));
+        assert_eq!(hits("").len(), SettingsSection::ALL.len());
+        assert!(hits("zzzz").is_empty());
     }
 }
