@@ -795,6 +795,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-local-authentication",
  "objc2-quartz-core 0.3.2",
+ "objc2-security",
  "objc2-web-kit",
  "security-framework",
  "uuid",

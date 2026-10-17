@@ -17,10 +17,11 @@ use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Se
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
+use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSURLResponse, NSHTTPURLResponse, NSProgress, NSUUID,
+    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
@@ -181,7 +182,14 @@ struct DelegateIvars {
     permissions: Arc<Mutex<HashMap<String, String>>>,
     https_only: Arc<AtomicBool>,
     extensions: TabNotifier,
+    /// The error page's "visit anyway" link: its one-time token, the URL it opens, and the host whose certificate
+    /// it accepts (none when it falls back to http). The token keeps other pages from following the link.
+    proceed: RefCell<Option<(String, Retained<NSURL>, Option<String>)>>,
 }
+
+/// Hosts whose untrusted certificate the user accepted this run, in any window; never saved, as in Safari.
+static TRUSTED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const PROCEED_SCHEME: &str = "nxbrowser-proceed:";
 
 define_class!(
     #[unsafe(super = NSObject)]
@@ -213,6 +221,15 @@ define_class!(
             let main_frame = navigation_action.targetFrame().is_some_and(|frame| frame.isMainFrame());
             let from_extension = web_view.URL().and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
             let target = navigation_action.request().URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url));
+            if let Some(token) = target.as_deref().and_then(|url| url.strip_prefix(PROCEED_SCHEME)) {
+                decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                let proceed = self.ivars().proceed.borrow_mut().take_if(|(expected, _, _)| expected == token);
+                if let Some((_, url, host)) = proceed {
+                    TRUSTED_HOSTS.lock().unwrap_or_else(PoisonError::into_inner).extend(host);
+                    web_view.loadRequest(&NSURLRequest::requestWithURL(&url));
+                }
+                return;
+            }
             // ⌥-click (WebKit's default would download the link) previews it instead, as Zen's Glance.
             let peek = navigation_action.navigationType() == WKNavigationType::LinkActivated
                 && navigation_action.modifierFlags().contains(NSEventModifierFlags::Option);
@@ -293,27 +310,85 @@ define_class!(
         #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
         unsafe fn webView_didFailProvisionalNavigation_withError(
             &self,
-            _web_view: &WKWebView,
+            web_view: &WKWebView,
             _navigation: Option<&WKNavigation>,
             error: &NSError,
         ) {
+            // Cancelled (a newer navigation took over) and frame-load-interrupted (became a download) aren't failures.
+            let (domain, code) = (ns_string(&error.domain()), error.code());
+            if (domain == "NSURLErrorDomain" && code == -999) || (domain == "WebKitErrorDomain" && code == 102) {
+                return;
+            }
+            let detail = ns_string(&error.localizedDescription());
+            let info = error.userInfo();
+            let url = info.objectForKey(ns_string!("NSErrorFailingURLKey")).and_then(|url| url.downcast::<NSURL>().ok());
             let _ = self.ivars().events.borrow().send(EngineEvent::Failed {
                 tab_id: self.ivars().tab_id.clone(),
-                message: ns_string(&error.localizedDescription()),
+                url: url.as_ref().and_then(|url| url.absoluteString()).map(|url| ns_string(&url)).unwrap_or_default(),
+                message: detail.clone(),
             });
+            let Some(url) = url else {
+                return;
+            };
+            // A certificate WebKit didn't trust comes with its trust, which can be accepted; a failed handshake
+            // (a site without working https) can only be opened over http instead. Neither helps a missing host or network.
+            let untrusted = info.objectForKey(ns_string!("NSURLErrorFailingURLPeerTrustErrorKey")).is_some();
+            let address = url.absoluteString().map(|url| ns_string(&url)).unwrap_or_default();
+            let proceed = match (untrusted, address.strip_prefix("https://")) {
+                (true, _) => Some(("Visit Website Anyway", url.clone(), url.host().map(|host| ns_string(&host)))),
+                (false, Some(rest)) if code != -1003 && code != -1009 => NSURL::URLWithString(&NSString::from_str(&format!("http://{rest}")))
+                    .map(|http| ("Open over HTTP (Not Secure)", http, None)),
+                _ => None,
+            };
+            let token = Uuid::new_v4().to_string();
+            *self.ivars().proceed.borrow_mut() = proceed.as_ref().map(|(_, open, host)| (token.clone(), open.clone(), host.clone()));
+            let title = match code {
+                _ if untrusted => "This Connection Is Not Private",
+                -1003 => "Can\u{2019}t Find the Server",
+                -1009 => "You\u{2019}re Not Connected to the Internet",
+                _ => "Can\u{2019}t Open This Page",
+            };
+            let link = proceed.map(|(label, _, _)| (label, format!("{PROCEED_SCHEME}{token}")));
+            let html = NSString::from_str(&error_page(title, &detail, link.as_ref().map(|(label, href)| (*label, href.as_str()))));
+            // Private WebKit API Safari uses: the failed URL stays in the address bar and Reload retries it.
+            let _: () = msg_send![web_view, _loadAlternateHTMLString: &*html, baseURL: &*url, forUnreachableURL: &*url];
         }
 
         #[unsafe(method(webView:didFailNavigation:withError:))]
         unsafe fn webView_didFailNavigation_withError(
             &self,
-            _web_view: &WKWebView,
+            web_view: &WKWebView,
             _navigation: Option<&WKNavigation>,
             error: &NSError,
         ) {
             let _ = self.ivars().events.borrow().send(EngineEvent::Failed {
                 tab_id: self.ivars().tab_id.clone(),
+                url: web_view.URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url)).unwrap_or_default(),
                 message: ns_string(&error.localizedDescription()),
             });
+        }
+
+        /// Accepts a server certificate only for hosts the user chose to visit anyway; everything else is WebKit's call.
+        #[unsafe(method(webView:didReceiveAuthenticationChallenge:completionHandler:))]
+        unsafe fn webView_didReceiveAuthenticationChallenge_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            challenge: &NSURLAuthenticationChallenge,
+            completion_handler: &block2::DynBlock<dyn Fn(NSURLSessionAuthChallengeDisposition, *mut NSURLCredential)>,
+        ) {
+            let space = challenge.protectionSpace();
+            let host = ns_string(&space.host());
+            let server_trust = ns_string(&space.authenticationMethod()) == "NSURLAuthenticationMethodServerTrust";
+            if server_trust && TRUSTED_HOSTS.lock().unwrap_or_else(PoisonError::into_inner).contains(&host) {
+                // objc2-foundation doesn't bind `serverTrust` / `credentialForTrust:`.
+                let trust: *mut SecTrust = msg_send![&*space, serverTrust];
+                if !trust.is_null() {
+                    let credential: Retained<NSURLCredential> = msg_send![NSURLCredential::class(), credentialForTrust: trust];
+                    completion_handler.call((NSURLSessionAuthChallengeDisposition::UseCredential, Retained::as_ptr(&credential).cast_mut()));
+                    return;
+                }
+            }
+            completion_handler.call((NSURLSessionAuthChallengeDisposition::PerformDefaultHandling, std::ptr::null_mut()));
         }
     }
 
@@ -536,6 +611,24 @@ impl NxWebDelegate {
         });
         self.ivars().extensions.changed(&self.ivars().tab_id);
     }
+}
+
+/// The in-page notice for a load that never reached the site, in the style of Safari's; `link` is a
+/// (label, href) button to go ahead anyway.
+fn error_page(title: &str, detail: &str, link: Option<(&str, &str)>) -> String {
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let (title, detail) = (escape(title), escape(detail));
+    let link = link.map_or(String::new(), |(label, href)| format!("<a href=\"{}\">{}</a>", escape(href), escape(label)));
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title><style>\
+         :root{{color-scheme:light dark}}\
+         body{{margin:0;height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;\
+         font:13px -apple-system,system-ui,sans-serif;color:#8e8e93;text-align:center;padding:0 24px;box-sizing:border-box}}\
+         h1{{font-size:24px;margin:0 0 10px}}p{{margin:0;max-width:440px;line-height:1.4}}\
+         a{{margin-top:20px;padding:6px 14px;border-radius:6px;background:rgba(128,128,128,.2);color:inherit;text-decoration:none}}\
+         a:hover{{background:rgba(128,128,128,.3)}}\
+         </style></head><body><h1>{title}</h1><p>{detail}</p>{link}</body></html>"
+    )
 }
 
 /// A page with its delegate, handed between window engines with `take_tab` / `adopt_tab`.
@@ -1221,6 +1314,12 @@ impl WebEngine for MacEngine {
         }
     }
 
+    fn stop(&mut self, tab_id: &str) {
+        if let Some(live) = self.tabs.get(tab_id) {
+            unsafe { live.view.stopLoading() };
+        }
+    }
+
     fn hard_reload(&mut self, tab_id: &str) {
         if let Some(live) = self.tabs.get(tab_id) {
             unsafe { live.view.reloadFromOrigin() };
@@ -1369,6 +1468,7 @@ impl MacEngine {
                 permissions: self.permissions.clone(),
                 https_only: self.https_only.clone(),
                 extensions: self.extensions.handle(),
+                proceed: RefCell::new(None),
             },
         )
     }
@@ -2184,8 +2284,17 @@ fn ns_string(value: &NSString) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{menu_keys, unify_data_root};
+    use super::{error_page, menu_keys, unify_data_root};
     use objc2_app_kit::NSEventModifierFlags as Flags;
+
+    #[test]
+    fn error_page_escapes_its_text() {
+        let page = error_page("Can't <Open>", "a & \"b\"", Some(("Go <on>", "x:\"y")));
+        assert!(page.contains("<h1>Can't &lt;Open&gt;</h1>"));
+        assert!(page.contains("<p>a &amp; &quot;b&quot;</p>"));
+        assert!(page.contains("<a href=\"x:&quot;y\">Go &lt;on&gt;</a>"));
+        assert!(!error_page("t", "d", None).contains("<a "));
+    }
 
     #[test]
     fn keystrokes_become_menu_key_equivalents() {

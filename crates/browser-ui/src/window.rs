@@ -201,6 +201,8 @@ pub struct BrowserWindow {
     load_done: Option<Instant>,
     /// The active tab's load progress at the last tick; a change repaints the bar.
     load_seen: Option<f64>,
+    /// Typed bare hosts open over https first; if that https URL fails, the tab retries the http one, as other browsers do.
+    http_fallback: HashMap<String, (String, String)>,
     /// Each tab's last finished URL: later reports of the same URL are title changes.
     finished_url: HashMap<String, String>,
     /// New windows growing in.
@@ -531,6 +533,7 @@ impl BrowserWindow {
             load_bar: 0.0,
             load_done: None,
             load_seen: None,
+            http_fallback: HashMap::new(),
             finished_url: HashMap::new(),
             opened: HashMap::new(),
             suggestions: Vec::new(),
@@ -745,7 +748,16 @@ impl BrowserWindow {
                     }
                 }
             }
-            EngineEvent::Failed { message, .. } => self.status = message.into(),
+            EngineEvent::Failed { tab_id, url, message } => {
+                // Matched by URL: WebKit reports the page it falls back to as finished before the failure arrives.
+                let retry = self.http_fallback.get(&tab_id).is_some_and(|(https, _)| https.trim_end_matches('/') == url.trim_end_matches('/'));
+                if let (true, Some((_, http))) = (retry, self.http_fallback.remove(&tab_id)) {
+                    let _ = self.engine.navigate(&tab_id, &http);
+                } else if self.active_tab_id().as_deref() == Some(tab_id.as_str()) {
+                    // Other tabs show their failure in the page; a toast over this one would point at the wrong page.
+                    self.status = message.into();
+                }
+            }
             EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename, cx),
             EngineEvent::DownloadDone { download, bytes, error } => {
                 // Unknown ids are downloads cancelled before they were recorded.
@@ -1407,10 +1419,18 @@ impl BrowserWindow {
     }
 
     fn commit_navigation(&mut self, raw: &str, cx: &mut Context<Self>) {
-        let url = {
+        let (url, tab_id) = {
             let model = self.model.lock();
-            normalize_url(raw, model.settings.search_template(), model.settings.https_only)
+            (normalize_url(raw, model.settings.search_template(), model.settings.https_only), model.active_tab().map(|tab| tab.id.clone()))
         };
+        if let Some(tab_id) = tab_id {
+            // Only a host we prefixed ourselves: a typed scheme, a search or a bang is meant as given.
+            if url == format!("https://{}", raw.trim()) && !self.model.lock().settings.https_only {
+                self.http_fallback.insert(tab_id, (url.clone(), format!("http://{}", raw.trim())));
+            } else {
+                self.http_fallback.remove(&tab_id);
+            }
+        }
         self.address_focused = false;
         self.address_editing = false;
         self.address_in_page = false;
@@ -2173,7 +2193,7 @@ impl BrowserWindow {
         let progress = self.active_tab_id().and_then(|id| self.engine.progress(&id));
         match progress {
             Some(target) => {
-                let target = (target as f32).max(0.08);
+                let target = (target as f32).max(0.15);
                 self.load_bar = if self.reduce_motion { target } else { self.load_bar + (target - self.load_bar) * 0.2 };
                 self.load_done = None;
             }
@@ -3590,6 +3610,10 @@ impl BrowserWindow {
                             ),
                     )
                     .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url)))
+                    // Plain http: an open padlock, as Safari's "Not Secure".
+                    .when(tab.url.starts_with("http://"), |pill| {
+                        pill.child(Icons::lock_open_1().flex_none().size(px(12.)).text_color(cx.theme().danger()))
+                    })
                     .children(self.audio_button(tab, cx)),
             );
         }
@@ -3909,6 +3933,7 @@ impl BrowserWindow {
 
     fn window_tools(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
         let reload_id = tab_id.to_string();
+        let loading = self.engine.progress(tab_id).is_some();
         let bookmark_id = tab_id.to_string();
         let min_id = tab_id.to_string();
         let zoom_id = tab_id.to_string();
@@ -3932,9 +3957,13 @@ impl BrowserWindow {
                 }
                 this.focus_window(&keep_id, cx);
             })))
-            .child(self.tool_button(format!("reload-{reload_id}"), Icons::reload(), false, cx, move |this, _, cx| {
+            // While the page loads, Reload becomes Stop, as in Safari.
+            .child(self.tool_button(format!("reload-{reload_id}"), if loading { Icons::cross_2() } else { Icons::reload() }, false, cx, move |this, _, cx| {
                 this.focus_window(&reload_id, cx);
-                this.reload();
+                match this.engine.progress(&reload_id) {
+                    Some(_) => this.engine.stop(&reload_id),
+                    None => this.reload(),
+                }
             }))
             .child(self.tool_button(format!("bookmark-{bookmark_id}"), if bookmarked { Icons::star_filled() } else { Icons::star() }, false, cx, move |this, _, cx| {
                 this.focus_window(&bookmark_id, cx);
