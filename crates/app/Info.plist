@@ -19,6 +19,15 @@
             <key>CFBundleURLSchemes</key><array><string>http</string><string>https</string></array>
         </dict>
     </array>
+    <!-- macOS lists an app under "Default web browser" only if it opens HTML files as well as http/https links. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>HTML document</string>
+            <key>CFBundleTypeRole</key><string>Viewer</string>
+            <key>LSItemContentTypes</key><array><string>public.html</string><string>public.xhtml</string></array>
+        </dict>
+    </array>
     <key>NSMicrophoneUsageDescription</key><string>Websites you allow can use your microphone.</string>
 </dict>
 </plist>
