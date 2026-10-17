@@ -1,6 +1,7 @@
 use crate::window::{paint, profile_badge, BrowserWindow, Paint};
-use browser_core::{app_support_dir, Settings, SEARCH_ENGINES};
-use browser_engine::{WebEngine, SHORTCUTS};
+use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
+use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
+use crate::terminal::is_terminal;
 use browser_engine::LogicalRect;
 use gpui::{FontWeight, anchored, canvas, deferred, div, prelude::*, px, ClickEvent, Context, KeyDownEvent, MouseButton, SharedString};
 use crate::ui::{action_button, Kind};
@@ -93,7 +94,7 @@ impl SettingsSection {
             Self::Terminal => "font size line height cursor scrollback shell",
             Self::Performance => "suspend background tabs maximum live tabs memory",
             Self::Developer => "web inspector inspect element",
-            Self::About => "version engine webkit data folder",
+            Self::About => "version update check restart engine webkit data folder",
         }
     }
 
@@ -388,17 +389,48 @@ impl BrowserWindow {
         let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
         let at = row.iter().position(|other| *other == id).unwrap_or(0);
         let (others, right) = (row.iter().filter(|other| **other != id).cloned().collect::<Vec<_>>(), row[(at + 1).min(row.len())..].to_vec());
-        let url = self.model.lock().session_tabs().iter().find(|tab| tab.id == id).map(|tab| tab.url.clone()).unwrap_or_default();
+        let (url, title, suspended, bookmark, reopenable) = {
+            let model = self.model.lock();
+            let tab = model.session_tabs().into_iter().find(|tab| tab.id == id).cloned();
+            let (url, title) = tab.as_ref().map(|tab| (tab.url.clone(), tab.title.clone())).unwrap_or_default();
+            let bookmark = model.bookmarks().unwrap_or_default().into_iter().find(|bookmark| bookmark.url == url);
+            (url, title, tab.is_some_and(|tab| tab.state == TabState::Suspended), bookmark, !model.closed_urls().is_empty())
+        };
+        let web = !url.is_empty() && !is_terminal(&url);
+        let pinned = bookmark.as_ref().is_some_and(|bookmark| bookmark.pinned);
         let muted = self.engine.is_muted(&id);
         let rows = vec![
             menu_item("New Tab", true, false, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, None, cx) }, cx),
-            menu_item("Duplicate Tab", true, false, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }, cx),
+            menu_item("Duplicate Tab", true, false, { let (id, url) = (id.clone(), url.clone()); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }, cx),
             menu_item("Reload Tab", true, false, { let id = id.clone(); move |this, _| this.engine.reload(&id) }, cx),
             menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, false, { let id = id.clone(); move |this, _| this.engine.set_muted(&id, !muted) }, cx),
+            menu_divider(cx),
+            menu_item("Copy Link", web, false, { let url = url.clone(); move |this, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                this.status = "Copied page address".into();
+            } }, cx),
+            menu_item(if bookmark.is_some() { "Remove Bookmark" } else { "Add Bookmark" }, web, false, {
+                let (url, title, bookmark) = (url.clone(), title.clone(), bookmark.as_ref().map(|bookmark| bookmark.id.clone()));
+                move |this, _| this.with_model(|model| {
+                    let _ = match &bookmark {
+                        Some(id) => model.delete_bookmark(id),
+                        None => model.save_bookmark(None, &url, &title, false),
+                    };
+                })
+            }, cx),
+            menu_item(if pinned { "Unpin from Start Page" } else { "Pin to Start Page" }, web, false, {
+                let bookmark = bookmark.as_ref().map(|bookmark| bookmark.id.clone());
+                move |this, _| this.with_model(|model| { let _ = model.save_bookmark(bookmark.as_deref(), &url, &title, !pinned); })
+            }, cx),
+            menu_divider(cx),
+            menu_item("Move to New Window", self.group_len(&id) > 1, false, { let id = id.clone(); move |this, cx| this.detach_tab(&id, position, cx) }, cx),
+            // A tab its window shows would go blank; only ones hidden behind another tab can sleep.
+            menu_item("Suspend Tab", web && !suspended && !self.is_front(&id), false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.mark_suspended(&id); }) }, cx),
             menu_divider(cx),
             menu_item("Close Tab", true, false, move |this, cx| this.close_tabs(vec![id.clone()], cx), cx),
             menu_item("Close Other Tabs", !others.is_empty(), false, move |this, cx| this.close_tabs(others.clone(), cx), cx),
             menu_item("Close Tabs to the Right", !right.is_empty(), false, move |this, cx| this.close_tabs(right.clone(), cx), cx),
+            menu_item("Reopen Closed Tab", reopenable, false, |this, cx| this.on_shortcut(Shortcut::ReopenTab, cx), cx),
         ];
         menu_card("tab-menu", position, rows, cx)
     }
@@ -817,9 +849,40 @@ impl BrowserWindow {
             )),
             SettingsSection::About => page
                 .child(row("Version", None, div().child(env!("CARGO_PKG_VERSION")), paint))
+                .child(self.update_row(paint, cx))
+                .child(row(
+                    "Check for updates automatically",
+                    Some("New versions download in the background and install when you restart."),
+                    switch("auto-update", settings.auto_update, |s, v| s.auto_update = v, paint, cx),
+                    paint,
+                ))
                 .child(row("Engine", None, div().child("WebKit (WKWebView)"), paint))
                 .child(row("Data folder", Some(app_support_dir().display().to_string().as_str()), div(), paint)),
         }
+    }
+
+    fn update_row(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::update::Status;
+        let status = crate::update::status(cx).clone();
+        let detail = match &status {
+            Status::Unavailable => "This build doesn't update itself.".to_string(),
+            Status::Idle => "Updates come from GitHub releases.".to_string(),
+            Status::Checking => "Checking…".to_string(),
+            Status::Downloading(version) => format!("Downloading NxBrowser {version}…"),
+            Status::Ready { version, .. } => format!("NxBrowser {version} is ready to install."),
+            Status::Failed(message) => message.clone(),
+        };
+        let ready = matches!(status, Status::Ready { .. });
+        let enabled = matches!(status, Status::Idle | Status::Failed(_) | Status::Ready { .. });
+        let (label, kind) = if ready { ("Restart to Update", Kind::Primary) } else { ("Check for Updates", Kind::Secondary) };
+        let button = action_button("check-updates", label, kind, enabled, cx, move |_, cx| {
+            if ready {
+                crate::update::restart(cx);
+            } else {
+                crate::update::check(true, cx);
+            }
+        });
+        row("Updates", Some(&detail), button, paint)
     }
 
     fn profiles_settings(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {

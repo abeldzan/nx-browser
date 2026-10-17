@@ -44,6 +44,8 @@ pub(crate) enum Run {
     Copy(String),
     /// Replaces the typed text, e.g. `!yt ` or `@tabs `.
     Fill(String),
+    CheckUpdates,
+    RestartToUpdate,
 }
 
 #[derive(Clone)]
@@ -209,8 +211,12 @@ impl BrowserWindow {
                 ("New private profile", Run::NewPrivate),
                 (if model.active_tab().is_some_and(|tab| self.engine.is_muted(&tab.id)) { "Unmute tab" } else { "Mute tab" }, Run::ToggleMute),
                 ("Manage extensions", Run::Extensions),
+                ("Check for updates", Run::CheckUpdates),
             ] {
                 add(label, item("Actions", label, "", run));
+            }
+            if let crate::update::Status::Ready { version, .. } = crate::update::status(cx) {
+                add("Restart to update", item("Actions", "Restart to update", format!("NxBrowser {version}"), Run::RestartToUpdate));
             }
             // Zen-style toggles; the label says what picking it will do.
             let on_off = |on: bool| if on { "Turn off" } else { "Turn on" };
@@ -328,6 +334,8 @@ impl BrowserWindow {
                 }
             }
             Run::NewPrivate => self.with_model(|model| { let _ = model.create_private_profile(); }),
+            Run::CheckUpdates => crate::update::check(true, cx),
+            Run::RestartToUpdate => crate::update::restart(cx),
             Run::Pref(change) => self.set_pref(cx, change),
             Run::Tab(id) => self.focus_window(&id, cx),
             Run::Closed(url) => match self.with_model(|model| model.reopen_closed_url(Some(&url))) {

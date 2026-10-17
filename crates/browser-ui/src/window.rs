@@ -414,6 +414,8 @@ impl BrowserWindow {
         ];
         let (passwords, password_subscriptions) = PasswordState::new(cx);
         subscriptions.extend(password_subscriptions);
+        // The update status lives app-wide; every window's title bar shows "Restart to Update".
+        subscriptions.push(cx.observe_global::<crate::update::Updates>(|_, cx| cx.notify()));
         let (detached, tab_window, extensions, pages, chrome) = match handoff {
             Some(handoff) => (Some(handoff.session), handoff.tab_window, Some(handoff.extensions), handoff.pages, handoff.chrome),
             None => (None, false, None, Vec::new(), HashMap::new()),
@@ -4178,6 +4180,7 @@ impl BrowserWindow {
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.merge_into_main(window, cx))),
                         )
                     })
+                    .when_some(self.restart_to_update(cx), |row, button| row.child(button))
                     .child(self.pinned_extensions(cx))
                     .child(icon_button("find-toggle", Icons::magnifying_glass()).box_size(rems(1.375)).icon_size(rems(0.875)).selected(self.find_here()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         if this.find_here() {
@@ -4209,6 +4212,35 @@ impl BrowserWindow {
                             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::Extensions, event, cx))),
                     ),
             )
+    }
+
+    /// Accent pill shown once an update is downloaded and staged.
+    fn restart_to_update(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        if !matches!(crate::update::status(cx), crate::update::Status::Ready { .. }) {
+            return None;
+        }
+        let paint = paint(cx);
+        Some(
+            h_stack()
+                .id("restart-to-update")
+                .flex_none()
+                .h(px(22.))
+                .px(px(9.))
+                .mr(px(4.))
+                .gap(px(5.))
+                .items_center()
+                .rounded(px(6.))
+                .bg(paint.accent)
+                .text_color(paint.bg)
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.88))
+                .active(|style| style.opacity(0.75))
+                .child(Icons::reload().size(px(12.)).text_color(paint.bg))
+                .child("Restart to Update")
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| crate::update::restart(cx))),
+        )
     }
 
     /// Blob hanging from the title bar; hovering grows it into a shelf of this space's windows.
@@ -4582,7 +4614,7 @@ impl BrowserWindow {
     }
 
     /// Pulls a tab out of its window into one of its own, under the pointer.
-    fn detach_tab(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn detach_tab(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         if self.group_len(id) < 2 {
             return;
         }
@@ -4924,13 +4956,13 @@ impl BrowserWindow {
         self.chrome.get(id).and_then(|chrome| chrome.window.clone()).unwrap_or_else(|| id.to_string())
     }
 
-    fn group_len(&self, id: &str) -> usize {
+    pub(crate) fn group_len(&self, id: &str) -> usize {
         let group = self.group_id(id);
         self.chrome.keys().filter(|other| self.group_id(other) == group).count()
     }
 
     /// Whether this tab is the one its window shows: the group member raised most recently.
-    fn is_front(&self, id: &str) -> bool {
+    pub(crate) fn is_front(&self, id: &str) -> bool {
         let group = self.group_id(id);
         raised_last(&self.order, id, |other| self.group_id(other) == group)
     }

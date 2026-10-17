@@ -65,6 +65,8 @@ pub struct Settings {
     pub autofill_passwords: bool,
     /// Links opened from other apps ask which profile to use; off, they open in the active profile.
     pub ask_link_profile: bool,
+    /// Check GitHub for new releases and download them in the background; they install on restart.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -104,6 +106,7 @@ impl Default for Settings {
             offer_passwords: true,
             autofill_passwords: true,
             ask_link_profile: true,
+            auto_update: true,
         }
     }
 }

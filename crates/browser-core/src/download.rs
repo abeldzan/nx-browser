@@ -65,7 +65,7 @@ fn parse_opensearch(body: &str) -> Vec<String> {
     list.iter().filter_map(|item| item.as_str().map(String::from)).collect()
 }
 
-fn runtime() ->&'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         // Only spawn_blocking is used; one async worker is enough.

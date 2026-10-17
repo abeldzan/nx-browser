@@ -6,6 +6,17 @@ NxBrowser draws its interface with [GPUI](https://www.gpui.rs) (the GPU UI frame
 
 > **Status:** early and moving fast. Expect rough edges. macOS only for now.
 
+## Install
+
+```bash
+brew install --cask abeldzan/tap/nxbrowser
+brew trust --cask abeldzan/tap/nxbrowser   # lets Homebrew load the cask by its short name
+```
+
+NxBrowser updates itself. It checks GitHub releases in the background, downloads new versions, and shows **Restart to Update** in the title bar when one is ready. You can also choose NxBrowser ▸ Check for Updates…, or turn automatic checks off in Settings ▸ About.
+
+Apple Silicon, macOS 14 or newer. The app is ad-hoc signed, not notarized, so the cask clears the download quarantine flag for you. Because of that, macOS may ask again for Keychain and camera/microphone access after an update.
+
 ## Features
 
 ### Profiles and privacy
@@ -90,15 +101,6 @@ These are the defaults. All of them can be changed in Settings.
 | ⌘Y / ⌥⌘L / ⌥⌘B | History / downloads / bookmarks |
 | ⌘, | Settings |
 | ⌥-click a link | Peek |
-
-## Install
-
-```bash
-brew install --cask abeldzan/tap/nxbrowser
-brew trust --cask abeldzan/tap/nxbrowser   # lets `brew upgrade` update it
-```
-
-Apple Silicon, macOS 14 or newer. The app is ad-hoc signed, not notarized, so the cask clears the download quarantine flag for you. Because of that, macOS may ask again for Keychain and camera/microphone access after an update.
 
 ## Building from source
 

@@ -9,6 +9,7 @@ mod shortcuts;
 mod tabs;
 mod terminal;
 mod ui;
+mod update;
 mod window;
 
 use gpui::{
@@ -56,6 +57,7 @@ pub fn run() {
         // Listing fonts takes over a second; done now, the settings font list opens instantly.
         std::thread::spawn(|| terminal::monospace_fonts().len());
         let model: SharedModel = Arc::new(Mutex::new(model));
+        update::init(model.clone(), !self_test, cx);
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         let shared = model.clone();
         let mut main = open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, self_test, started, cx));

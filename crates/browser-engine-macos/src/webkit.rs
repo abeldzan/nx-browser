@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
+use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine, SHORTCUTS};
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
@@ -802,6 +802,9 @@ impl MacEngine {
     /// Replaces the app shortcuts in every window; empty pauses them (while one is being recorded).
     pub fn set_shortcuts(&mut self, keys: Vec<(String, Shortcut)>) {
         KEYMAP.with_borrow_mut(|map| *map = keys.into_iter().collect());
+        if let Some(mtm) = MainThreadMarker::new() {
+            refresh_menu_keys(mtm);
+        }
     }
 
     /// Zoom, user agent and inspector apply to open tabs; the rest to tabs created afterwards.
@@ -1061,7 +1064,7 @@ impl WebEngine for MacEngine {
             .ok_or_else(|| anyhow::anyhow!("window has no content view"))?;
         install_hit_proxy(&chrome);
         if let Some(mtm) = MainThreadMarker::new() {
-            install_edit_menu(mtm);
+            install_menu_bar(mtm);
             track_mouse_moves(&chrome, mtm);
         }
         self.chrome = Some(chrome);
@@ -1965,15 +1968,83 @@ fn reply_json(reply: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>, j
     reply.call((Retained::as_ptr(&value).cast::<AnyObject>().cast_mut(), std::ptr::null_mut()));
 }
 
+/// The menu bar's shortcut menus, as `SHORTCUTS` ids; "-" is a separator.
+const MENUS: &[(&str, &[&str])] = &[
+    ("File", &["new_tab", "new_terminal", "new_space", "-", "close_tab", "close_window", "reopen_tab", "-", "print"]),
+    ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "command_palette", "-", "inspect"]),
+    ("History", &["back", "forward", "-", "history", "downloads"]),
+    ("Bookmarks", &["bookmark", "bookmarks"]),
+    ("Window", &[
+        "next_tab", "prev_tab", "-", "focus_left", "focus_right", "focus_up", "focus_down", "move_left", "move_right", "-",
+        "maximize_window", "minimize_window", "tile_windows", "-", "next_space", "prev_space",
+    ]),
+];
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NxShortcutMenuTarget"]
+    struct NxShortcutMenuTarget;
+
+    unsafe impl NSObjectProtocol for NxShortcutMenuTarget {}
+
+    impl NxShortcutMenuTarget {
+        /// A menu-bar item, whose tag is its index in `SHORTCUTS`, sends that shortcut to the key window.
+        #[unsafe(method(runShortcut:))]
+        fn run_shortcut(&self, item: &NSMenuItem) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            // Keys already went to the key monitor (or the page first); the menu only shows them.
+            if app.currentEvent().is_some_and(|event| event.r#type() == NSEventType::KeyDown) {
+                return;
+            }
+            let Some(binding) = usize::try_from(item.tag()).ok().and_then(|tag| SHORTCUTS.get(tag)) else {
+                return;
+            };
+            let events = [app.keyWindow(), app.mainWindow()]
+                .into_iter()
+                .flatten()
+                .find_map(|window| with_window(window.windowNumber(), |state| state.events.clone()).flatten());
+            if let Some(events) = events {
+                let _ = events.send(EngineEvent::Shortcut(binding.action));
+            }
+        }
+    }
+);
+
+thread_local! {
+    /// Menu items hold their target weakly.
+    static MENU_TARGET: Retained<NxShortcutMenuTarget> = {
+        let this = NxShortcutMenuTarget::alloc(MainThreadMarker::new().expect("menus are built on the main thread")).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    };
+}
+
 /// GPUI sets no menu bar, and WebKit's copy/paste/undo/select-all only run as Edit menu actions,
-/// so pages never got them. Items have no target: they go to whatever has focus.
-fn install_edit_menu(mtm: MainThreadMarker) {
+/// so pages never got them. Edit items have no target: they go to whatever has focus.
+fn install_menu_bar(mtm: MainThreadMarker) {
     defuse_gpui_menu_handlers();
     let app = NSApplication::sharedApplication(mtm);
     let main = app.mainMenu().unwrap_or_else(|| {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
         let app_item = NSMenuItem::new(mtm);
         let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("NxBrowser"));
+        if let Some(updates) = crate::updates::menu_item(mtm) {
+            app_menu.addItem(&updates);
+            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        app_menu.insertItem_atIndex(&menu_item(mtm, "About NxBrowser", sel!(orderFrontStandardAboutPanel:), "", false), 0);
+        app_menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), 1);
+        if let Some(settings) = shortcut_item(mtm, "settings") {
+            settings.setTitle(ns_string!("Settings…"));
+            app_menu.addItem(&settings);
+            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        app_menu.addItem(&menu_item(mtm, "Hide NxBrowser", sel!(hide:), "h", false));
+        let others = menu_item(mtm, "Hide Others", sel!(hideOtherApplications:), "h", false);
+        others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+        app_menu.addItem(&others);
+        app_menu.addItem(&menu_item(mtm, "Show All", sel!(unhideAllApplications:), "", false));
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
         app_menu.addItem(&menu_item(mtm, "Quit NxBrowser", sel!(terminate:), "q", false));
         app_item.setSubmenu(Some(&app_menu));
         menu.addItem(&app_item);
@@ -1991,10 +2062,82 @@ fn install_edit_menu(mtm: MainThreadMarker) {
     edit.addItem(&menu_item(mtm, "Copy", sel!(copy:), "c", false));
     edit.addItem(&menu_item(mtm, "Paste", sel!(paste:), "v", false));
     edit.addItem(&menu_item(mtm, "Select All", sel!(selectAll:), "a", false));
+    if let Some(copy_url) = shortcut_item(mtm, "copy_url") {
+        edit.addItem(&NSMenuItem::separatorItem(mtm));
+        edit.addItem(&copy_url);
+    }
     let item = NSMenuItem::new(mtm);
     item.setTitle(ns_string!("Edit"));
     item.setSubmenu(Some(&edit));
     main.addItem(&item);
+    for (title, ids) in MENUS {
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
+        for id in *ids {
+            if let Some(item) = if *id == "-" { Some(NSMenuItem::separatorItem(mtm)) } else { shortcut_item(mtm, id) } {
+                menu.addItem(&item);
+            }
+        }
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str(title));
+        item.setSubmenu(Some(&menu));
+        main.addItem(&item);
+    }
+    refresh_menu_keys(mtm);
+}
+
+/// A menu-bar item running the `SHORTCUTS` entry `id`; its keys are filled in by `refresh_menu_keys`.
+fn shortcut_item(mtm: MainThreadMarker, id: &str) -> Option<Retained<NSMenuItem>> {
+    let index = SHORTCUTS.iter().position(|binding| binding.id == id)?;
+    let item = menu_item(mtm, SHORTCUTS[index].label, sel!(runShortcut:), "", false);
+    item.setTag(index as isize);
+    MENU_TARGET.with(|target| unsafe { item.setTarget(Some(target)) });
+    Some(item)
+}
+
+/// Shows each menu-bar shortcut's current keys, so rebinding one in Settings shows up there too.
+fn refresh_menu_keys(mtm: MainThreadMarker) {
+    let Some(main) = NSApplication::sharedApplication(mtm).mainMenu() else {
+        return;
+    };
+    for menu in main.itemArray().iter().filter_map(|item| item.submenu()) {
+        for item in menu.itemArray().iter().filter(|item| item.action() == Some(sel!(runShortcut:))) {
+            let Some(binding) = SHORTCUTS.get(item.tag() as usize) else {
+                continue;
+            };
+            let keys = KEYMAP.with_borrow(|map| map.iter().find(|(_, action)| **action == binding.action).map(|(keys, _)| keys.clone()));
+            let (key, mask) = menu_keys(keys.as_deref().unwrap_or(""));
+            item.setKeyEquivalent(&NSString::from_str(&key));
+            item.setKeyEquivalentModifierMask(mask);
+        }
+    }
+}
+
+/// A gpui keystroke (`ctrl-cmd-shift-left`) as an AppKit key equivalent; empty for keys a menu can't show.
+fn menu_keys(keys: &str) -> (String, NSEventModifierFlags) {
+    let (mut rest, mut mask) = (keys, NSEventModifierFlags::empty());
+    let prefixes = [
+        ("ctrl-", NSEventModifierFlags::Control),
+        ("alt-", NSEventModifierFlags::Option),
+        ("cmd-", NSEventModifierFlags::Command),
+        ("shift-", NSEventModifierFlags::Shift),
+    ];
+    while let Some((tail, flag)) = prefixes.iter().find_map(|(prefix, flag)| Some((rest.strip_prefix(prefix)?, *flag))) {
+        rest = tail;
+        mask |= flag;
+    }
+    let key = match rest {
+        "left" => "\u{F702}",
+        "right" => "\u{F703}",
+        "up" => "\u{F700}",
+        "down" => "\u{F701}",
+        "tab" => "\t",
+        "enter" => "\r",
+        "space" => " ",
+        "backspace" => "\u{8}",
+        key if key.chars().count() == 1 => key,
+        _ => return (String::new(), NSEventModifierFlags::empty()),
+    };
+    (key.to_string(), mask)
 }
 
 /// GPUI's app delegate answers `validateMenuItem:` and the edit actions by looking the item's tag up in
@@ -2037,7 +2180,17 @@ fn ns_string(value: &NSString) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unify_data_root;
+    use super::{menu_keys, unify_data_root};
+    use objc2_app_kit::NSEventModifierFlags as Flags;
+
+    #[test]
+    fn keystrokes_become_menu_key_equivalents() {
+        assert_eq!(menu_keys("cmd--"), ("-".to_string(), Flags::Command));
+        assert_eq!(menu_keys("ctrl-cmd-shift-left"), ("\u{F702}".to_string(), Flags::Control | Flags::Command | Flags::Shift));
+        assert_eq!(menu_keys("alt-cmd-t"), ("t".to_string(), Flags::Option | Flags::Command));
+        assert_eq!(menu_keys("f5"), (String::new(), Flags::empty()));
+        assert_eq!(menu_keys(""), (String::new(), Flags::empty()));
+    }
     use std::fs;
 
     #[test]

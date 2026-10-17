@@ -5,6 +5,7 @@ mod metrics;
 mod model;
 pub mod passwords;
 mod settings;
+pub mod update;
 mod url;
 
 pub use download::{fetch_suggestions, spawn_favicon, unique_path};

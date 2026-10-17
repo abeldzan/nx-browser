@@ -15,10 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check tag matches Info.plist version
+      # The app compares releases against its Cargo version, and the updater checks the bundle's: both must match the tag.
+      - name: Check tag matches Info.plist and Cargo.toml versions
         run: |
           v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' crates/app/Info.plist)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != Info.plist version v$v"; exit 1; }
+          c=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$c" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != Cargo.toml version v$c"; exit 1; }
 
       # GPUI compiles its shaders with `xcrun metal`, which Xcode 26 ships as a separate download.
       - name: Install Metal toolchain
