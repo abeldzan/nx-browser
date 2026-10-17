@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NxBrowser — a keyboard-first browser for macOS</title>
+<meta name="description" content="A fast, keyboard-first web browser for macOS, written in Rust. Tiling windows, spaces, isolated profiles, Chrome extensions and a built-in terminal.">
+<meta property="og:title" content="NxBrowser">
+<meta property="og:description" content="A fast, keyboard-first web browser for macOS, written in Rust.">
+<meta property="og:image" content="img/hero.webp">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --paper: #121418;
+  --paper-2: #1d2027;
+  --ink: #f4f1e7;
+  --muted: #a3a097;
+  --night: #0a0b0d;
+  --rule: #353943;
+  --blue: #0088ff;
+  --blue-ink: #0062c4;
+  --red: #ff503e; --yellow: #ffdc38; --green: #39e88e;
+  --pixel: "Space Mono", ui-monospace, monospace;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --shadow: 5px 5px 0 var(--ink);
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.65 var(--mono); -webkit-font-smoothing: antialiased; }
+a { color: inherit; }
+img { max-width: 100%; height: auto; display: block; }
+.wrap { width: min(1180px, 100% - 32px); margin-inline: auto; }
+h1, h2, h3 { font-family: var(--pixel); font-weight: 700; letter-spacing: -0.02em; }
+
+/* retro bits */
+.dots { display: inline-flex; gap: 6px; flex: none; }
+.dots i { width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--ink); background: var(--red); }
+.dots i:nth-child(2) { background: var(--yellow); }
+.dots i:nth-child(3) { background: var(--green); }
+.win { background: var(--paper); border: 2px solid var(--ink); border-radius: 10px; box-shadow: var(--shadow); overflow: hidden; }
+.bar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 2px solid var(--ink); background: var(--paper-2); font-size: 13px; }
+.bar > span:last-child { text-align: center; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 9px 18px; border: 2px solid var(--ink); border-radius: 8px; background: var(--paper); box-shadow: 3px 3px 0 var(--ink); font: 600 15px var(--mono); text-decoration: none; color: var(--ink); cursor: pointer; transition: transform .08s, box-shadow .08s; }
+.btn:hover { transform: translate(-1px, -1px); box-shadow: 4px 4px 0 var(--ink); }
+.btn:active { transform: translate(3px, 3px); box-shadow: 0 0 0 var(--ink); }
+.btn.primary { background: var(--blue); color: #fff; }
+:root { color-scheme: dark; }
+kbd { font: 600 .82em var(--mono); padding: 1px 7px; border: 2px solid var(--ink); border-bottom-width: 4px; border-radius: 6px; background: var(--paper-2); white-space: nowrap; }
+code { font-family: var(--mono); background: var(--paper-2); padding: 1px 5px; border-radius: 4px; }
+
+/* nav */
+nav { position: sticky; top: 0; z-index: 10; background: var(--paper); border-bottom: 2px solid var(--rule); }
+nav .wrap { display: flex; align-items: center; gap: 28px; height: 64px; }
+.brand { display: flex; align-items: center; gap: 10px; font: 700 20px var(--pixel); text-decoration: none; }
+.brand img { width: 32px; height: 32px; }
+nav .links { display: flex; align-items: center; gap: 26px; margin-left: auto; font-size: 15px; font-weight: 500; }
+nav .links a:not(.btn) { text-decoration: none; padding: 4px 0; border-bottom: 2px solid transparent; }
+nav .links a:not(.btn):hover { border-color: var(--ink); }
+
+/* hero */
+.hero { padding: 80px 0 24px; text-align: center; }
+.hero .icon { width: 120px; height: 120px; margin: 0 auto 36px; filter: drop-shadow(6px 6px 0 var(--blue)); }
+h1 { font-size: clamp(36px, 5.6vw, 70px); line-height: 1.28; margin: 0 auto 22px; max-width: 17ch; }
+h1 em { font-style: normal; background: var(--blue); color: #fff; padding: 0 .18em; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.lede { font-size: clamp(16px, 1.8vw, 18px); color: var(--muted); max-width: 68ch; text-wrap: balance; margin: 0 auto 40px; }
+.cta-row { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-top: 22px; }
+.meta { margin-top: 20px; font-size: 13px; color: var(--muted); }
+
+/* terminal install box */
+.term { max-width: 600px; margin: 0 auto; text-align: left; }
+.term .body { display: flex; align-items: center; gap: 12px; background: var(--night); color: var(--ink); padding: 14px 14px 14px 18px; }
+.term code { flex: 1; min-width: 0; background: none; padding: 0; overflow-x: auto; white-space: nowrap; scrollbar-width: none; font-size: 15px; }
+.term code::-webkit-scrollbar { display: none; }
+.term .prompt { color: var(--green); user-select: none; margin-right: 10px; }
+.copy { flex: none; border: 2px solid var(--ink); border-radius: 6px; background: transparent; color: var(--ink); padding: 4px 12px; font: 600 13px var(--mono); cursor: pointer; }
+.copy:hover { background: var(--ink); color: var(--night); }
+
+/* screenshots: hard shadow that follows the window's rounded corners */
+.shot { margin-top: 64px; }
+.shot img, .feature img { filter: drop-shadow(8px 8px 0 var(--blue)); }
+
+/* sections */
+section { padding: 104px 0; }
+section + section { border-top: 2px solid var(--rule); }
+.tag { display: inline-block; font: 700 13px var(--pixel); text-transform: uppercase; letter-spacing: .04em; background: var(--ink); color: var(--paper); padding: 3px 10px; border-radius: 4px; margin-bottom: 18px; }
+h2 { font-size: clamp(28px, 3.6vw, 42px); line-height: 1.15; margin: 0 0 18px; }
+.section-head { max-width: 700px; margin-bottom: 52px; }
+.section-head p { color: var(--muted); margin: 0; font-size: 17px; }
+.feature { display: grid; grid-template-columns: 5fr 7fr; gap: 64px; align-items: center; }
+.feature + .feature { margin-top: 128px; }
+.feature.flip { grid-template-columns: 7fr 5fr; }
+.feature.flip .copy-col { order: 2; }
+.feature p { color: var(--muted); margin: 0 0 20px; }
+.feature ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.feature li { padding-left: 24px; position: relative; font-size: 15px; }
+.feature li::before { content: "▸"; position: absolute; left: 2px; color: var(--blue); }
+
+/* palette */
+.palette .body { padding: 8px; font-size: 15px; }
+.palette .q { padding: 12px 12px 14px; border-bottom: 2px dashed var(--ink); margin-bottom: 8px; color: var(--muted); }
+.palette .row { display: flex; justify-content: space-between; gap: 16px; padding: 9px 12px; border-radius: 6px; }
+.palette .row b { font-weight: 600; }
+.palette .row span { color: var(--muted); text-align: right; font-size: 14px; }
+.palette .row.on { background: var(--blue); color: #fff; }
+.palette .row.on span { color: #fff; }
+
+/* cards */
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; }
+.card .body { padding: 22px 24px 26px; }
+.card h3 { margin: 0 0 8px; font-size: 19px; line-height: 1.3; }
+.card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+/* shortcuts */
+.keys { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 40px; }
+.keys div { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 14px 0; border-bottom: 2px dashed var(--rule); font-size: 15px; }
+
+/* install band */
+.final { background: var(--blue); color: #fff; text-align: center; }
+.final h2 { font-size: clamp(32px, 4.6vw, 52px); margin-bottom: 10px; }
+.final p { margin: 0 0 36px; }
+.final .term { box-shadow: 6px 6px 0 var(--night); }
+.final .btn { box-shadow: 3px 3px 0 var(--night); border-color: var(--night); }
+.final .btn.primary { background: var(--yellow); color: var(--night); }
+.final .note { font-size: 13px; margin: 24px auto 0; max-width: 60ch; opacity: .9; }
+footer { background: var(--night); color: var(--ink); border-top: 2px solid var(--rule); padding: 28px 0; font-size: 14px; }
+footer .wrap { display: flex; gap: 20px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+footer .brand { font-size: 17px; }
+footer .brand img { width: 24px; height: 24px; }
+
+@media (max-width: 900px) {
+  nav .links a:not(.btn) { display: none; }
+  .feature, .feature.flip { grid-template-columns: 1fr; gap: 36px; }
+  .feature.flip .copy-col { order: 0; }
+  .grid { grid-template-columns: 1fr 1fr; }
+  .keys { grid-template-columns: 1fr 1fr; }
+  section { padding: 76px 0; }
+}
+@media (max-width: 600px) {
+  .grid, .keys { grid-template-columns: 1fr; }
+  .hero { padding-top: 52px; }
+  .term code { font-size: 13px; }
+  .shot img, .feature img { filter: drop-shadow(4px 4px 0 var(--blue)); }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .btn { transition: none; } }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="icon.svg" alt="">NxBrowser</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#shortcuts">Shortcuts</a>
+      <a href="https://github.com/abeldzan/nx-browser">GitHub</a>
+      <a class="btn primary" href="#install">Install</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <img class="icon" src="icon.svg" alt="NxBrowser icon">
+    <h1>The browser that tiles like your <em>window manager</em></h1>
+    <p class="lede">NxBrowser is a fast, keyboard-first web browser for macOS, written in Rust. GPU-drawn interface, Safari's WebKit engine, Chrome extensions, isolated profiles and a real terminal built in.</p>
+    <div class="win term">
+      <div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>zsh</span></div>
+      <div class="body"><code><span class="prompt">$</span>brew install --cask abeldzan/tap/nxbrowser</code><button class="copy" data-copy="brew install --cask abeldzan/tap/nxbrowser">Copy</button></div>
+    </div>
+    <div class="cta-row">
+      <a class="btn" href="https://github.com/abeldzan/nx-browser/releases/latest/download/NxBrowser.dmg">Download .dmg</a>
+      <a class="btn" href="https://github.com/abeldzan/nx-browser">View source</a>
+    </div>
+    <p class="meta">Free and open source (MIT) · Apple Silicon · macOS 14 or newer</p>
+    <div class="shot"><img src="img/hero.webp" width="2400" height="1500" alt="NxBrowser with three tiled windows: the GPUI website with three tabs, Hacker News, and a terminal"></div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="feature">
+      <div class="copy-col">
+        <div class="tag">Spaces &amp; windows</div>
+        <h2>Pages are windows. Arrange them however you think.</h2>
+        <p>Every space is a stage. Windows tile automatically as a split tree, or float freely and snap to halves and quarters. Each window can hold its own tabs.</p>
+        <ul>
+          <li>Focus with <kbd>⌃⌘</kbd> + arrows, move with <kbd>⌃⇧⌘</kbd> + arrows</li>
+          <li>Switch spaces with <kbd>⌥⌘←</kbd> <kbd>⌥⌘→</kbd>, or drag one into its own OS window</li>
+          <li>Tear a window off, and drag it back to merge</li>
+          <li><kbd>⌥</kbd>-click a link to peek at it in a floating window</li>
+        </ul>
+      </div>
+      <img src="img/free.webp" width="2400" height="1500" loading="lazy" alt="A floating space with the Rust website, Lobsters and a terminal overlapping">
+    </div>
+
+    <div class="feature flip">
+      <div class="copy-col">
+        <div class="tag">Built-in terminal</div>
+        <h2>Your shell, right next to the docs.</h2>
+        <p>Terminal tabs (<kbd>⌥⌘T</kbd>) run your login shell, tile with your pages and come back in the same folder after a restart.</p>
+        <ul>
+          <li>Built on <code>alacritty_terminal</code></li>
+          <li>Mouse reporting, bracketed paste, kitty graphics images</li>
+          <li>Your choice of font, size, line height, cursor, shell and scrollback</li>
+        </ul>
+      </div>
+      <img src="img/terminal.webp" width="2400" height="1500" loading="lazy" alt="A terminal tab tiled beside the alacritty GitHub repository">
+    </div>
+
+    <div class="feature">
+      <div class="copy-col">
+        <div class="tag">Command palette</div>
+        <h2>One shortcut for everything: <kbd>⌘K</kbd></h2>
+        <p>Search tabs, bookmarks, history, spaces, profiles, extensions and every action. Change settings in place, do quick sums, and search other sites with bangs.</p>
+        <ul>
+          <li>Scopes: <code>@tabs</code> <code>@bookmarks</code> <code>@history</code> <code>@actions</code> <code>@spaces</code></li>
+          <li>Bangs: <code>!yt</code> <code>!gh</code> <code>!w</code> <code>!mdn</code> <code>!crates</code> <code>!claude</code> and 20 more</li>
+          <li>Type <code>12*(3+4)</code> and the answer is copied</li>
+        </ul>
+      </div>
+      <div class="win palette" aria-label="Examples of what you can type in the command palette">
+        <div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>⌘K</span></div>
+        <div class="body">
+          <div class="q">search tabs, bookmarks, actions…<span class="cursor">▌</span></div>
+          <div class="row on"><b>!gh gpui</b><span>Search GitHub</span></div>
+          <div class="row"><b>@tabs hacker</b><span>Jump to an open tab</span></div>
+          <div class="row"><b>&gt; dark</b><span>Switch theme</span></div>
+          <div class="row"><b>12*(3+4)</b><span>= 84, copied</span></div>
+          <div class="row"><b>!crates serde</b><span>Search crates.io</span></div>
+          <div class="row"><b>@spaces build</b><span>Switch space</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="feature flip">
+      <div class="copy-col">
+        <div class="tag">Start page</div>
+        <h2>Open a tab, land where you meant to go.</h2>
+        <p>The new-tab page shows your pinned sites, recent visits and bookmarks. Address bar suggestions come from history, bookmarks and your search engine.</p>
+        <ul>
+          <li>DuckDuckGo, Google, Bing, Brave, Startpage or Ecosia</li>
+          <li>History, bookmark and download panels</li>
+          <li>Drag finished downloads straight into a page or Finder</li>
+        </ul>
+      </div>
+      <img src="img/home.webp" width="2400" height="1500" loading="lazy" alt="The new-tab page with pinned and recent sites">
+    </div>
+
+    <div class="feature">
+      <div class="copy-col">
+        <div class="tag">Make it yours</div>
+        <h2>Light, dark, any accent.</h2>
+        <p>Pick a theme and accent color, comfortable or compact density, and reduced motion. Every shortcut can be rebound in Settings.</p>
+        <ul>
+          <li>Compact, Safari-style title bar: navigation, tabs and tools in one row</li>
+          <li>Profiles get their own name, icon and color on the profile rail</li>
+        </ul>
+      </div>
+      <img src="img/light.webp" width="2400" height="1500" loading="lazy" alt="Light theme with WebKit.org and MDN tiled side by side">
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="section-head">
+      <div class="tag">Everything else</div>
+      <h2>Private, quick, and complete.</h2>
+      <p>The things you expect from a daily browser, built in instead of bolted on.</p>
+    </div>
+    <div class="grid">
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>profiles</span></div><div class="body"><h3>Isolated profiles</h3><p>Each profile has its own WebKit data store: cookies, logins, storage and extension data never cross over. Private profiles are wiped at launch.</p></div></div>
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>extensions</span></div><div class="body"><h3>Chrome extensions</h3><p>Chrome Web Store extensions, MV2 and MV3, run unmodified on WebKit's native extension runtime. Enabled per profile.</p></div></div>
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>passwords</span></div><div class="body"><h3>Password manager</h3><p>AES-256-GCM, key in the Keychain, Touch ID to reveal. Generator, health checks and CSV import/export.</p></div></div>
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>blocking</span></div><div class="body"><h3>Ads and trackers blocked</h3><p>Built-in content rules, pop-up blocking, HTTPS-only mode and fraud warnings. Per-site camera and mic permissions.</p></div></div>
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>performance</span></div><div class="body"><h3>GPU-rendered</h3><p>Built on GPUI and Metal. Web views are created lazily, and background tabs are suspended so they use no memory.</p></div></div>
+      <div class="win card"><div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>sessions</span></div><div class="body"><h3>Never lose a tab</h3><p>Sessions are saved continuously. A crash or restart brings every window, tab and terminal back. Updates install themselves.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="shortcuts">
+  <div class="wrap">
+    <div class="section-head">
+      <div class="tag">Keyboard first</div>
+      <h2>Your hands stay on the keys.</h2>
+      <p>These are the defaults. Every one of them can be changed.</p>
+    </div>
+    <div class="keys">
+      <div><span>Command palette</span><kbd>⌘K</kbd></div>
+      <div><span>Address bar</span><kbd>⌘L</kbd></div>
+      <div><span>New tab</span><kbd>⌘T</kbd></div>
+      <div><span>New terminal</span><kbd>⌥⌘T</kbd></div>
+      <div><span>Reopen closed tab</span><kbd>⇧⌘T</kbd></div>
+      <div><span>Switch tabs</span><kbd>⌘1…9</kbd></div>
+      <div><span>Focus window</span><kbd>⌃⌘ arrows</kbd></div>
+      <div><span>Move window</span><kbd>⌃⇧⌘ ←→</kbd></div>
+      <div><span>Next / previous space</span><kbd>⌥⌘ ←→</kbd></div>
+      <div><span>New space</span><kbd>⌃⌘N</kbd></div>
+      <div><span>Find in page</span><kbd>⌘F</kbd></div>
+      <div><span>Inspect page</span><kbd>⌥⌘I</kbd></div>
+    </div>
+  </div>
+</section>
+
+<section class="final" id="install">
+  <div class="wrap">
+    <h2>Install NxBrowser</h2>
+    <p>One line with Homebrew. It keeps itself up to date after that.</p>
+    <div class="win term">
+      <div class="bar"><span class="dots"><i></i><i></i><i></i></span><span>zsh</span></div>
+      <div class="body"><code><span class="prompt">$</span>brew install --cask abeldzan/tap/nxbrowser</code><button class="copy" data-copy="brew install --cask abeldzan/tap/nxbrowser">Copy</button></div>
+    </div>
+    <div class="cta-row">
+      <a class="btn primary" href="https://github.com/abeldzan/nx-browser/releases/latest/download/NxBrowser.dmg">Download .dmg</a>
+      <a class="btn" href="https://github.com/abeldzan/nx-browser#building-from-source">Build from source</a>
+    </div>
+    <p class="note">Apple Silicon, macOS 14 or newer. The app is ad-hoc signed, not notarized; the cask clears the quarantine flag for you.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span class="brand"><img src="icon.svg" alt="">NxBrowser</span>
+    <span>MIT license · <a href="https://github.com/abeldzan/nx-browser">github.com/abeldzan/nx-browser</a></span>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll(".copy").forEach(button => button.addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(button.dataset.copy); button.textContent = "Copied"; }
+  catch { button.textContent = "Select & copy"; }
+  setTimeout(() => button.textContent = "Copy", 1600);
+}));
+</script>
+</body>
+</html>
