@@ -1,9 +1,7 @@
 mod tiling;
 
 use crate::passwords::PasswordState;
-use crate::profiles::profile_label;
 use crate::settings::SettingsSection;
-use crate::sidebar::SidebarPage;
 use crate::tabs::tab_label;
 use crate::terminal::{self, is_terminal, TERMINAL_URL};
 use crate::SharedModel;
@@ -74,7 +72,6 @@ pub struct BrowserWindow {
     ext_active: Option<String>,
     address: Entity<InputState>,
     find_input: Entity<InputState>,
-    rename_input: Entity<InputState>,
     pub(crate) home_input: Entity<InputState>,
     pub(crate) ua_input: Entity<InputState>,
     /// Searchable font list in the Terminal settings; built on first show since it needs a `Window`.
@@ -126,7 +123,6 @@ pub struct BrowserWindow {
     /// The bang shown as a pill in the palette; the input then holds only the query.
     pub(crate) palette_bang: Option<&'static (&'static str, &'static str, &'static str)>,
     pub(crate) focus_palette: bool,
-    panel: Option<SidebarPage>,
     chrome: HashMap<String, TabChrome>,
     gesture: Option<Gesture>,
     suppress_window_drag: bool,
@@ -137,11 +133,9 @@ pub struct BrowserWindow {
     order: Vec<String>,
     subscriptions: Vec<Subscription>,
     pub(crate) status: SharedString,
-    renaming: bool,
     /// Space whose chip is showing the rename field.
     space_rename: Option<String>,
     space_input: Entity<InputState>,
-    confirm_delete: bool,
     /// Camera/microphone request the page is waiting on: (request, origin, kind).
     permission: Option<(u64, String, String)>,
     pub(crate) passwords: PasswordState,
@@ -186,9 +180,6 @@ pub struct BrowserWindow {
     /// A tab or profile being dragged, and the row it would drop into.
     reorder: Option<Reorder>,
     find: Tween,
-    panel_tween: Tween,
-    /// Sidebar page still drawn while its panel slides shut.
-    shown_panel: Option<SidebarPage>,
     /// Status message shown as a toast, and when it changed.
     toast: (SharedString, Instant),
     /// Load bar width for the active tab, and when its load finished (the bar then fades).
@@ -292,7 +283,6 @@ impl BrowserWindow {
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let rename_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -331,17 +321,6 @@ impl BrowserWindow {
                 }
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
-            }),
-            cx.subscribe(&rename_input, |this, input, event, cx| {
-                if matches!(event, InputStateEvent::Focus) {
-                    this.engine.focus_chrome();
-                }
-                if matches!(event, InputStateEvent::Submit) {
-                    let name = input.read(cx).content().to_string();
-                    let id = this.model.lock().active_profile_id.clone();
-                    let _ = this.model.lock().rename_profile(&id, &name);
-                    this.renaming = false;
-                }
             }),
             cx.subscribe(&space_input, |this, input, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
@@ -438,7 +417,6 @@ impl BrowserWindow {
             ext_active: None,
             address,
             find_input,
-            rename_input,
             home_input,
             ua_input,
             term_font_picker: None,
@@ -475,7 +453,6 @@ impl BrowserWindow {
             palette_index: 0,
             palette_bang: None,
             focus_palette: false,
-            panel: None,
             chrome,
             gesture: None,
             suppress_window_drag: false,
@@ -486,10 +463,8 @@ impl BrowserWindow {
             subscriptions,
             passwords,
             status: "Ready".into(),
-            renaming: false,
             space_rename: None,
             space_input,
-            confirm_delete: false,
             permission: None,
             web_downloads: HashMap::new(),
             attached: false,
@@ -523,8 +498,6 @@ impl BrowserWindow {
             tab_grab: Rc::default(),
             reorder: None,
             find: Tween::new(false),
-            panel_tween: Tween::new(false),
-            shown_panel: None,
             toast: ("Ready".into(), Instant::now() - TOAST_LIFE),
             load_bar: 0.0,
             load_done: None,
@@ -2028,16 +2001,7 @@ impl Render for BrowserWindow {
                     .flex_1()
                     .h_full()
                     .overflow_hidden()
-                    .child(self.stage(&tabs, entity, cx))
-                    .when_some(self.shown_panel, |column, page| {
-                        column.child(self.panel_view(
-                            page,
-                            &profiles,
-                            &active_profile,
-                            &sessions,
-                            cx,
-                        ))
-                    }),
+                    .child(self.stage(&tabs, entity, cx)),
             ),
             )
             .when(!self.tab_window, |root| root.child(self.dock(&tabs, cx)))
@@ -2081,15 +2045,7 @@ impl Render for BrowserWindow {
 impl BrowserWindow {
     /// Moves every animation one frame along: tweens follow their targets, finished closes run.
     fn step_motion(&mut self) {
-        let (find, panel) = (self.anim(PANEL_ANIM), self.anim(PANEL_ANIM));
-        self.find.set(self.find_open, find);
-        if self.panel.is_some() {
-            self.shown_panel = self.panel;
-        }
-        self.panel_tween.set(self.panel.is_some(), panel);
-        if self.panel.is_none() && self.panel_tween.progress() <= 0.0 {
-            self.shown_panel = None;
-        }
+        self.find.set(self.find_open, self.anim(PANEL_ANIM));
         if self.status != self.toast.0 {
             self.toast = (self.status.clone(), Instant::now());
         }
@@ -2198,11 +2154,6 @@ impl BrowserWindow {
         div().absolute().top_0().left_0().child(list)
     }
 
-    fn toggle_panel(&mut self, page: SidebarPage, cx: &mut Context<Self>) {
-        self.panel = if self.panel == Some(page) { None } else { Some(page) };
-        cx.notify();
-    }
-
     /// What each profile's pages are doing across this window's tabs, for the rail.
     fn profile_activity(&self) -> HashMap<String, Activity> {
         let model = self.model.lock();
@@ -2271,7 +2222,6 @@ impl BrowserWindow {
                     move |this, _: &ClickEvent, _, cx| {
                         this.with_model(|model| { let _ = model.switch_profile(&id); });
                         this.refresh_url(cx);
-                        this.confirm_delete = false;
                     }
                 }))
                 .on_drag(dragged, move |drag, at, _, cx| {
@@ -2316,9 +2266,6 @@ impl BrowserWindow {
                     })))
                     .child(rail_button("open-settings", Icons::gear()).selected(self.settings_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_settings(cx);
-                    })))
-                    .child(rail_button("more-actions", Icons::dots_vertical()).selected(self.panel == Some(SidebarPage::Profiles)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.toggle_panel(SidebarPage::Profiles, cx);
                     }))),
             )
     }
@@ -4105,7 +4052,11 @@ impl BrowserWindow {
                         )
                     })
                     .child(self.pinned_extensions(cx))
-                    .child(self.panel_icon("find-toggle", Icons::magnifying_glass(), None, cx))
+                    .child(icon_button("find-toggle", Icons::magnifying_glass()).box_size(rems(1.375)).icon_size(rems(0.875)).selected(self.find_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.find_open = !this.find_open;
+                        this.focus_find = this.find_open;
+                        cx.notify();
+                    })))
                     .child(
                         icon_button("history-toggle", Icons::file_text())
                             .box_size(rems(1.375))
@@ -4859,7 +4810,6 @@ impl BrowserWindow {
     fn animating(&self) -> bool {
         self.dock.running()
             || self.find.running()
-            || self.panel_tween.running()
             || self.toast.1.elapsed() < TOAST_IN
             || self.toast_fading()
             || self.load_moving()
@@ -4881,56 +4831,6 @@ impl BrowserWindow {
         self.load_bar > 0.0 && (self.load_done.is_some() || (target - self.load_bar).abs() > 0.002)
     }
 
-    fn panel_icon(
-        &self,
-        id: &'static str,
-        icon: gpui::Svg,
-        page: Option<SidebarPage>,
-        cx: &mut Context<Self>,
-    ) -> gpuikit::elements::icon_button::IconButton {
-        let selected = match page {
-            Some(page) => self.panel == Some(page),
-            None => self.find_open,
-        };
-        icon_button(id, icon).box_size(rems(1.375)).icon_size(rems(0.875)).selected(selected).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            if page.is_none() {
-                this.find_open = !this.find_open;
-                this.focus_find = this.find_open;
-                cx.notify();
-            } else if let Some(page) = page {
-                this.toggle_panel(page, cx);
-            }
-        }))
-    }
-
-    fn panel_view(
-        &self,
-        page: SidebarPage,
-        profiles: &[browser_core::Profile],
-        active_profile: &str,
-        sessions: &[browser_core::Session],
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let paint = paint(cx);
-        let p = self.panel_tween.progress();
-        div()
-            .h(px(260. * p))
-            .flex_none()
-            .opacity(p)
-            .w_full()
-            .overflow_hidden()
-            .px(px(12.))
-            .py(px(8.))
-            .bg(paint.surface)
-            .border_t_1()
-            .border_color(paint.border)
-            .child(
-                scroll_area("library-panel")
-                    .vertical()
-                    .full_height(true)
-                    .child(self.library_page(page, profiles, active_profile, sessions, cx)),
-            )
-    }
 
     fn find_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
@@ -4958,101 +4858,6 @@ impl BrowserWindow {
             .child(action_button("find-close", "Close", Kind::Secondary, true, cx, |this, cx| {
                 this.find_open = false;
                 cx.notify();
-            }))
-    }
-
-    fn library_page(
-        &self,
-        page: SidebarPage,
-        profiles: &[browser_core::Profile],
-        active_profile: &str,
-        sessions: &[browser_core::Session],
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        match page {
-            SidebarPage::Profiles => self.profile_page(profiles, active_profile, sessions, cx),
-        }
-    }
-
-    fn profile_page(
-        &self,
-        profiles: &[browser_core::Profile],
-        active_profile: &str,
-        sessions: &[browser_core::Session],
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let paint = paint(cx);
-        let mut column = v_stack().gap(px(6.)).w_full();
-        column = column.child(self.section_label("Profiles", paint));
-        for profile in profiles {
-            let id = profile.id.clone();
-            let active = profile.id == active_profile;
-            column = column.child(
-                div()
-                    .id(SharedString::from(format!("profile-{id}")))
-                    .w_full()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .bg(if active { paint.accent_bg } else { paint.secondary })
-                    .text_color(if active { paint.accent } else { paint.fg })
-                    .child(profile_label(&profile.name, active))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.with_model(|model| { let _ = model.switch_profile(&id); });
-                        this.refresh_url(cx);
-                        this.confirm_delete = false;
-                    })),
-            );
-        }
-        column = column
-            .child(action_button("new-profile", "New profile…", Kind::Secondary, true, cx, |this, cx| {
-                this.open_new_profile(cx);
-            }))
-            .child(action_button("rename-profile", if self.renaming { "Save name" } else { "Rename" }, Kind::Secondary, true, cx, |this, cx| {
-                if this.renaming {
-                    let name = this.rename_input.read(cx).content().to_string();
-                    let id = this.model.lock().active_profile_id.clone();
-                    let _ = this.model.lock().rename_profile(&id, &name);
-                    this.renaming = false;
-                } else {
-                    let name = Some(this.model.lock()).and_then(|model| model.active_profile().map(|profile| profile.name.clone())).unwrap_or_default();
-                    this.rename_input.update(cx, |input, cx| input.set_content_silent(name, cx));
-                    this.renaming = true;
-                }
-                cx.notify();
-            }));
-        if self.renaming {
-            column = column.child(
-                text_field(&self.rename_input, cx)
-                    .placeholder("Profile name")
-                    .full_width(true),
-            );
-        }
-        let only_one = profiles.len() <= 1;
-        column = column.child(action_button("delete-profile", "Delete profile…", Kind::Danger, !only_one, cx, |this, cx| {
-            this.delete_prompt = Some(this.model.lock()).map(|model| model.active_profile_id.clone());
-            cx.notify();
-        }));
-        column = column.child(self.section_label("Sessions", paint));
-        for session in sessions {
-            let id = session.id.clone();
-            column = column.child(
-                action_button(SharedString::from(format!("session-{id}")), session.name.clone(), Kind::Secondary, true, cx, move |this, cx| {
-                    this.with_model(|model| { let _ = model.switch_session(&id); });
-                    this.refresh_url(cx);
-                }),
-            );
-        }
-        column
-            .child(action_button("new-session", "New session", Kind::Secondary, true, cx, |this, cx| {
-                this.with_model(|model| { let _ = model.create_session(); });
-                this.refresh_url(cx);
-            }))
-            .child(action_button("export-profile", "Export profile", Kind::Secondary, true, cx, |this, _| this.export_profile()))
-            .child(action_button("import-profile", "Import profile", Kind::Secondary, true, cx, |this, cx| {
-                this.import_profile();
-                this.refresh_url(cx);
             }))
     }
 
