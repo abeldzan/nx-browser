@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "browser-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "browser-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -783,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "browser-engine-macos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "browser-extensions"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "browser-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "browser-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "nxbrowser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "browser-ui",
 ]
