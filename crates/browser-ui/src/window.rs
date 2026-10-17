@@ -111,6 +111,8 @@ pub struct BrowserWindow {
     pub(crate) download_drag: Option<(String, gpui::Point<Pixels>)>,
     /// Right-click menu on a rail profile: (profile id, index, click position).
     pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
+    /// Right-click menu on a tab pill: (tab id, click position).
+    pub(crate) tab_menu: Option<(String, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
@@ -442,6 +444,7 @@ impl BrowserWindow {
             delete_prompt: None,
             overlay_rects: Vec::new(),
             rail_menu: None,
+            tab_menu: None,
             popover: None,
             popover_dismissed: None,
             history_modal: false,
@@ -2094,6 +2097,7 @@ impl Render for BrowserWindow {
             .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
             .when(self.passwords.edit.is_some(), |root| root.child(self.login_editor(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
+            .when_some(self.tab_menu.clone(), |root, menu| root.child(self.tab_menu_view(menu, cx)))
     }
 }
 
@@ -2287,6 +2291,7 @@ impl BrowserWindow {
             let badge = badge.on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.close_menus();
                     this.rail_menu = Some((id.clone(), index, event.position));
                     cx.notify();
                 }),
@@ -3474,6 +3479,14 @@ impl BrowserWindow {
                         this.suppress_window_drag = true;
                         this.tab_press = Some(event.position);
                     }))
+                    .on_mouse_down(MouseButton::Right, cx.listener({
+                        let id = id.clone();
+                        move |this, event: &MouseDownEvent, _, cx| {
+                            this.close_menus();
+                            this.tab_menu = Some((id.clone(), event.position));
+                            cx.notify();
+                        }
+                    }))
                     .on_drag(TabDrag((*tab).clone()), {
                         let grab = self.tab_grab.clone();
                         move |_, at, _, cx| {
@@ -4649,7 +4662,7 @@ impl BrowserWindow {
     }
 
     /// Tab rows of the windows on show, back to front, each in its tab order.
-    fn tab_rows(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) fn tab_rows(&self) -> Vec<(String, Vec<String>)> {
         let tabs = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut groups = Vec::<String>::new();
         for id in tabs.iter().chain(&self.order) {

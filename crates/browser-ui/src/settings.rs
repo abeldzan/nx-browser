@@ -372,58 +372,40 @@ impl BrowserWindow {
     }
 
     pub(crate) fn rail_menu_view(&self, (id, index, position): (String, usize, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
-        let danger = cx.theme().danger();
         let count = self.model.lock().profiles.len().max(1);
-        let watch = cx.entity();
-        let item = |label: &'static str, enabled: bool, destructive: bool, run: fn(&mut Self, &str, usize, &mut Context<Self>), cx: &mut Context<Self>| {
-            let id = id.clone();
-            div()
-                .id(label)
-                .px(px(10.))
-                .py(px(5.))
-                .rounded(px(5.))
-                .text_color(if !enabled { paint.muted } else if destructive { danger } else { paint.fg })
-                .when(enabled, |row| {
-                    row.cursor_pointer().hover(|style| style.bg(paint.secondary)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.rail_menu = None;
-                        run(this, &id, index, cx);
-                        cx.notify();
-                    }))
-                })
-                .child(label)
-        };
-        let menu = v_stack()
-            .id("rail-menu")
-            .relative()
-            .min_w(px(170.))
-            .p(px(4.))
-            .rounded(px(8.))
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.rail_menu = None;
-                cx.notify();
-            }))
-            .child(
-                canvas(
-                    move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), 8.))),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            )
-            .child(item("Move up", index > 0, false, |this, id, index, _| this.with_model(|model| { let _ = model.move_profile(id, index - 1); }), cx))
-            .child(item("Move down", index + 1 < count, false, |this, id, index, _| this.with_model(|model| { let _ = model.move_profile(id, index + 1); }), cx))
-            .child(div().my(px(4.)).h(px(1.)).bg(paint.border))
-            .child(item("Edit profile…", true, false, |this, id, _, cx| this.open_profile_settings(id.to_string(), cx), cx))
-            .child(item("Delete profile…", count > 1, true, |this, id, _, _| this.delete_prompt = Some(id.to_string()), cx));
-        deferred(anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(1)
+        let rows = vec![
+            menu_item("Move up", index > 0, false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index - 1); }) }, cx),
+            menu_item("Move down", index + 1 < count, false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index + 1); }) }, cx),
+            menu_divider(cx),
+            menu_item("Edit profile…", true, false, { let id = id.clone(); move |this, cx| this.open_profile_settings(id.clone(), cx) }, cx),
+            menu_item("Delete profile…", count > 1, true, move |this, _| this.delete_prompt = Some(id.clone()), cx),
+        ];
+        menu_card("rail-menu", position, rows, cx)
+    }
+
+    /// Right-click menu on a tab pill; "other" and "to the right" stay within the tab's window.
+    pub(crate) fn tab_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+        let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
+        let at = row.iter().position(|other| *other == id).unwrap_or(0);
+        let (others, right) = (row.iter().filter(|other| **other != id).cloned().collect::<Vec<_>>(), row[(at + 1).min(row.len())..].to_vec());
+        let url = self.model.lock().session_tabs().iter().find(|tab| tab.id == id).map(|tab| tab.url.clone()).unwrap_or_default();
+        let muted = self.engine.is_muted(&id);
+        let rows = vec![
+            menu_item("New Tab", true, false, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, None, cx) }, cx),
+            menu_item("Duplicate Tab", true, false, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }, cx),
+            menu_item("Reload Tab", true, false, { let id = id.clone(); move |this, _| this.engine.reload(&id) }, cx),
+            menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, false, { let id = id.clone(); move |this, _| this.engine.set_muted(&id, !muted) }, cx),
+            menu_divider(cx),
+            menu_item("Close Tab", true, false, move |this, cx| this.close_tabs(vec![id.clone()], cx), cx),
+            menu_item("Close Other Tabs", !others.is_empty(), false, move |this, cx| this.close_tabs(others.clone(), cx), cx),
+            menu_item("Close Tabs to the Right", !right.is_empty(), false, move |this, cx| this.close_tabs(right.clone(), cx), cx),
+        ];
+        menu_card("tab-menu", position, rows, cx)
+    }
+
+    pub(crate) fn close_menus(&mut self) {
+        self.rail_menu = None;
+        self.tab_menu = None;
     }
 
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
@@ -1224,6 +1206,70 @@ fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
         width: f64::from(bounds.size.width),
         height: f64::from(bounds.size.height),
     }
+}
+
+/// A right-click menu row; clicking it closes the menu, then runs `run`.
+fn menu_item(
+    label: &'static str,
+    enabled: bool,
+    destructive: bool,
+    run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static,
+    cx: &mut Context<BrowserWindow>,
+) -> gpui::AnyElement {
+    let paint = paint(cx);
+    let danger = cx.theme().danger();
+    div()
+        .id(label)
+        .px(px(10.))
+        .py(px(5.))
+        .rounded(px(5.))
+        .text_color(if !enabled { paint.muted } else if destructive { danger } else { paint.fg })
+        .when(enabled, |row| {
+            row.cursor_pointer().hover(|style| style.bg(paint.secondary)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.close_menus();
+                run(this, cx);
+                cx.notify();
+            }))
+        })
+        .child(label)
+        .into_any_element()
+}
+
+fn menu_divider(cx: &mut Context<BrowserWindow>) -> gpui::AnyElement {
+    div().my(px(4.)).h(px(1.)).bg(paint(cx).border).into_any_element()
+}
+
+/// The floating card a right-click menu sits in, cut out of the page beneath and closed by clicking elsewhere.
+fn menu_card(id: &'static str, position: gpui::Point<gpui::Pixels>, rows: Vec<gpui::AnyElement>, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
+    let paint = paint(cx);
+    let watch = cx.entity();
+    let menu = v_stack()
+        .id(id)
+        .relative()
+        .min_w(px(170.))
+        .p(px(4.))
+        .rounded(px(8.))
+        .bg(paint.surface)
+        .border_1()
+        .border_color(paint.border)
+        .shadow_lg()
+        .occlude()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.close_menus();
+            cx.notify();
+        }))
+        .child(
+            canvas(
+                move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), 8.))),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+        .children(rows);
+    deferred(anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(1)
 }
 
 #[cfg(test)]

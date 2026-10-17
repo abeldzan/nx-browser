@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds target/NxBrowser.app, ad-hoc signed, so macOS gives it a bundle ID (needed for system AutoFill).
+# Builds target/NxBrowser.app, ad-hoc signed, so macOS gives it a bundle ID (needed for system AutoFill),
+# and target/NxBrowser.dmg holding it beside an Applications link for drag-to-install.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -21,3 +22,13 @@ rm "$app/icon.plist"
 
 codesign --force --sign - "$app"
 echo "Built $app"
+
+dmg=target/NxBrowser.dmg
+stage=target/dmg
+rm -rf "$stage"
+mkdir -p "$stage"
+cp -R "$app" "$stage/"
+ln -s /Applications "$stage/Applications"
+hdiutil create -volname NxBrowser -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+rm -rf "$stage"
+echo "Built $dmg"
