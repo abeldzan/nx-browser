@@ -21,8 +21,10 @@ pub enum EngineEvent {
         title: String,
         loading: bool,
     },
+    /// A page load failed; `url` is the one that failed, empty when WebKit doesn't say.
     Failed {
         tab_id: String,
+        url: String,
         message: String,
     },
     /// WebKit is holding a download until `save_download(download, path)` says where to write it.
@@ -270,6 +272,7 @@ pub trait WebEngine {
     fn back(&mut self, tab_id: &str);
     fn forward(&mut self, tab_id: &str);
     fn reload(&mut self, tab_id: &str);
+    fn stop(&mut self, tab_id: &str);
     fn hard_reload(&mut self, tab_id: &str);
     /// Selects the next match of `query` after the page selection (before it, `backwards`), wrapping around.
     fn find(&mut self, tab_id: &str, query: &str, backwards: bool);

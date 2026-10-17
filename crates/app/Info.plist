@@ -28,6 +28,8 @@
             <key>LSItemContentTypes</key><array><string>public.html</string><string>public.xhtml</string></array>
         </dict>
     </array>
+    <!-- Plain-http sites: WKWebView loads are held to App Transport Security unless web content is exempted. -->
+    <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoadsInWebContent</key><true/></dict>
     <key>NSMicrophoneUsageDescription</key><string>Websites you allow can use your microphone.</string>
 </dict>
 </plist>
