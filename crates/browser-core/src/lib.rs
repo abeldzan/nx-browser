@@ -3,6 +3,7 @@ mod download;
 mod lifecycle;
 mod metrics;
 mod model;
+pub mod passwords;
 mod settings;
 mod url;
 

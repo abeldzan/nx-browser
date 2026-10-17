@@ -3,6 +3,7 @@ mod downloads;
 mod extensions;
 mod history;
 mod palette;
+mod passwords;
 mod profiles;
 mod settings;
 mod shortcuts;

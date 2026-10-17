@@ -57,6 +57,12 @@ pub struct Settings {
     pub terminal_scrollback: usize,
     /// Shortcuts rebound away from their defaults, by binding id; an empty value unbinds it.
     pub shortcuts: BTreeMap<String, String>,
+    /// Pointing at a window focuses it; off, a click does.
+    pub focus_on_hover: bool,
+    /// Offer to save or update a password when a sign-in form is submitted.
+    pub offer_passwords: bool,
+    /// Suggest saved passwords in sign-in forms.
+    pub autofill_passwords: bool,
 }
 
 impl Default for Settings {
@@ -92,6 +98,9 @@ impl Default for Settings {
             terminal_shell: String::new(),
             terminal_scrollback: 10_000,
             shortcuts: BTreeMap::new(),
+            focus_on_hover: false,
+            offer_passwords: true,
+            autofill_passwords: true,
         }
     }
 }
@@ -143,7 +152,7 @@ mod tests {
         assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
         assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));
-        assert!(parsed.shortcuts.is_empty());
+        assert!(parsed.shortcuts.is_empty() && !parsed.focus_on_hover);
         let round: Settings = serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(round, parsed);
     }

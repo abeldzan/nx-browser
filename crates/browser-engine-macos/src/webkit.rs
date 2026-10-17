@@ -25,7 +25,7 @@ use objc2_foundation::{
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
     WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy,
-    WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKSecurityOrigin, WKUIDelegate,
+    WKPermissionDecision, WKScriptMessage, WKScriptMessageHandler, WKScriptMessageHandlerWithReply, WKSecurityOrigin, WKUIDelegate,
     WKUserContentController, WKUserScript, WKUserScriptInjectionTime, WKWebView, WKWebViewConfiguration,
     WKAudiovisualMediaTypes, WKDownload, WKDownloadDelegate, WKFullscreenState, WKNavigationType, WKContentRuleList, WKContentRuleListStore, WKWebsiteDataStore, WKWindowFeatures,
 };
@@ -49,6 +49,9 @@ thread_local! {
     static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
     /// Camera/microphone requests waiting for the user, by `EngineEvent::Permission::request`.
     static ASKS: RefCell<HashMap<u64, PermissionReply>> = RefCell::new(HashMap::new());
+    /// Password-script messages waiting for the UI, by `EngineEvent::Passwords::request`.
+    /// shortcut: a tab closed before the UI answers leaves its entry here; evict on close if that ever matters.
+    static PASSWORD_ASKS: RefCell<HashMap<u64, ScriptReply>> = RefCell::new(HashMap::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
     /// Downloads WebKit is running, by `EngineEvent::Download::download`.
     static DOWNLOADS: RefCell<HashMap<u64, Download>> = RefCell::new(HashMap::new());
@@ -447,6 +450,37 @@ define_class!(
                     let _ = self.ivars().events.borrow().send(EngineEvent::Shortcut(shortcut));
                 }
             }
+        }
+    }
+
+    unsafe impl WKScriptMessageHandlerWithReply for NxWebDelegate {
+        #[unsafe(method(userContentController:didReceiveScriptMessage:replyHandler:))]
+        unsafe fn userContentController_didReceiveScriptMessage_replyHandler(
+            &self,
+            _controller: &WKUserContentController,
+            message: &WKScriptMessage,
+            reply_handler: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>,
+        ) {
+            // The frame's real origin, from WebKit: the page script could claim any.
+            let origin = message.frameInfo().securityOrigin();
+            let (protocol, host, port) = (ns_string(&origin.protocol()), ns_string(&origin.host()), origin.port());
+            let body = message.body();
+            let body = body.downcast_ref::<NSString>().map(ns_string);
+            let web = protocol == "https" || protocol == "http";
+            let (Some(body), true, false) = (body, web, host.is_empty()) else {
+                return reply_json(reply_handler, "null");
+            };
+            let default_port = port == 0 || (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
+            let origin = if default_port { format!("{protocol}://{host}") } else { format!("{protocol}://{host}:{port}") };
+            // WebKit wants each reply handler called exactly once, so it waits here until the UI answers.
+            let request = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+            PASSWORD_ASKS.with_borrow_mut(|asks| asks.insert(request, reply_handler.copy()));
+            let _ = self.ivars().events.borrow().send(EngineEvent::Passwords {
+                tab_id: self.ivars().tab_id.clone(),
+                origin,
+                request,
+                message: body,
+            });
         }
     }
 );
@@ -866,6 +900,13 @@ impl MacEngine {
         }
     }
 
+    /// Answers a password-script message with JSON (`null` when there is nothing to say).
+    pub fn answer_passwords(&mut self, request: u64, json: &str) {
+        if let Some(reply) = PASSWORD_ASKS.with_borrow_mut(|asks| asks.remove(&request)) {
+            reply_json(&reply, json);
+        }
+    }
+
     pub fn set_permissions(&mut self, entries: Vec<(String, String, String)>) {
         let mut map = self.permissions.lock().unwrap_or_else(PoisonError::into_inner);
         map.clear();
@@ -1061,6 +1102,11 @@ impl WebEngine for MacEngine {
                     ProtocolObject::from_ref(&*delegate),
                     &key_world(mtm),
                     ns_string!("nxShortcut"),
+                );
+                view.configuration().userContentController().addScriptMessageHandlerWithReply_contentWorld_name(
+                    ProtocolObject::from_ref(&*delegate),
+                    &key_world(mtm),
+                    ns_string!("nxPasswords"),
                 );
                 add_key_script(&view.configuration().userContentController(), mtm);
             }
@@ -1641,6 +1687,7 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
 }
 
 type PermissionReply = RcBlock<dyn Fn(WKPermissionDecision)>;
+type ScriptReply = RcBlock<dyn Fn(*mut AnyObject, *mut NSString)>;
 /// Pages and the URL each will load, per data store.
 type HeldLoads = Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>;
 
@@ -1896,7 +1943,25 @@ fn add_key_script(controller: &WKUserContentController, mtm: MainThreadMarker) {
             &key_world(mtm),
         )
     };
-    unsafe { controller.addUserScript(&script) };
+    // Every frame: sign-in forms often live in iframes. Fills stay per frame, as replies go back to the asker.
+    let passwords = unsafe {
+        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+            WKUserScript::alloc(mtm),
+            &NSString::from_str(include_str!("passwords.js")),
+            WKUserScriptInjectionTime::AtDocumentStart,
+            false,
+            &key_world(mtm),
+        )
+    };
+    unsafe {
+        controller.addUserScript(&script);
+        controller.addUserScript(&passwords);
+    }
+}
+
+fn reply_json(reply: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>, json: &str) {
+    let value = NSString::from_str(json);
+    reply.call((Retained::as_ptr(&value).cast::<AnyObject>().cast_mut(), std::ptr::null_mut()));
 }
 
 /// GPUI sets no menu bar, and WebKit's copy/paste/undo/select-all only run as Edit menu actions,

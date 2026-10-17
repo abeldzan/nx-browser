@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = { workspace = true }
 browser-storage = { path = "../browser-storage" }
 rusqlite = "0.32"

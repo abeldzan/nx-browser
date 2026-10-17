@@ -113,6 +113,23 @@ impl Storage {
                 profile_id TEXT NOT NULL,
                 session_id TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS passwords (
+                id TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                username TEXT NOT NULL,
+                secret BLOB NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS password_never (
+                profile_id TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                PRIMARY KEY (profile_id, origin)
+            );
+            CREATE INDEX IF NOT EXISTS passwords_profile_origin ON passwords (profile_id, origin);
             CREATE INDEX IF NOT EXISTS history_profile_url ON history (profile_id, url);
             CREATE INDEX IF NOT EXISTS history_profile_visited ON history (profile_id, visited_at);
             CREATE INDEX IF NOT EXISTS tabs_session ON tabs (session_id);

@@ -1,8 +1,9 @@
 use crate::lifecycle::{suspend_candidates, LiveTab, TabState};
+use crate::passwords::{self, CsvLogin, Login, VaultKey};
 use crate::{now_secs, Settings};
 use anyhow::Context;
 use browser_storage::Storage;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -186,6 +187,9 @@ pub struct Model {
     history_memo: Memo<Vec<HistoryEntry>>,
     suggest_memo: Memo<Vec<(String, String)>>,
     bookmarks_memo: Memo<Vec<Bookmark>>,
+    logins_memo: Memo<Vec<Login>>,
+    /// Decrypts the `passwords` table; loaded from the platform keychain on first use.
+    vault_key: Option<VaultKey>,
 }
 
 /// (storage generation, profile, query, limit): any write or a different question misses.
@@ -224,6 +228,8 @@ impl Model {
             history_memo: RefCell::new(None),
             suggest_memo: RefCell::new(None),
             bookmarks_memo: RefCell::new(None),
+            logins_memo: RefCell::new(None),
+            vault_key: None,
         };
         model.reload()?;
         // A private profile left by the last run (quit or crash) has nothing worth keeping.
@@ -490,6 +496,8 @@ impl Model {
         self.storage.execute("DELETE FROM bookmarks WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM history WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM permissions WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM passwords WHERE profile_id = ?1", params![id])?;
+        self.storage.execute("DELETE FROM password_never WHERE profile_id = ?1", params![id])?;
         self.storage.execute("DELETE FROM profile_extensions WHERE profile_id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
@@ -903,6 +911,151 @@ impl Model {
         Ok(())
     }
 
+    pub fn set_vault_key(&mut self, key: VaultKey) {
+        self.vault_key = Some(key);
+    }
+
+    pub fn has_vault_key(&self) -> bool {
+        self.vault_key.is_some()
+    }
+
+    fn vault_key(&self) -> anyhow::Result<&VaultKey> {
+        self.vault_key.as_ref().context("password key not loaded")
+    }
+
+    /// Saved sign-ins of `profile_id`, all or only those for `origin`. Memoized: the manager asks every frame.
+    pub fn logins(&self, profile_id: &str, origin: Option<&str>) -> anyhow::Result<Vec<Login>> {
+        let origin = origin.unwrap_or("");
+        let key = (self.storage.generation(), profile_id.to_string(), origin.to_string(), 0);
+        memo(&self.logins_memo, key, || {
+            let mut stmt = self.storage.conn().prepare_cached(
+                "SELECT id, origin, username, note, created_at, updated_at, last_used_at FROM passwords
+                 WHERE profile_id = ?1 AND (?2 = '' OR origin = ?2) ORDER BY origin, username",
+            )?;
+            let rows = stmt.query_map(params![profile_id, origin], |row| {
+                Ok(Login {
+                    id: row.get(0)?,
+                    origin: row.get(1)?,
+                    username: row.get(2)?,
+                    note: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    last_used_at: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// The password of login `id`, only when it belongs to `profile_id` and (when given) was saved for `origin`,
+    /// so a page never gets another profile's or another site's.
+    pub fn login_password(&self, profile_id: &str, id: &str, origin: Option<&str>) -> anyhow::Result<Option<String>> {
+        let secret: Option<Vec<u8>> = self
+            .storage
+            .conn()
+            .query_row(
+                "SELECT secret FROM passwords WHERE id = ?1 AND profile_id = ?2 AND (?3 IS NULL OR origin = ?3)",
+                params![id, profile_id, origin],
+                |row| row.get(0),
+            )
+            .optional()?;
+        secret.map(|secret| passwords::decrypt(self.vault_key()?, &secret)).transpose()
+    }
+
+    pub fn note_login_used(&self, profile_id: &str, id: &str) -> anyhow::Result<()> {
+        self.storage.execute(
+            "UPDATE passwords SET last_used_at = ?3 WHERE id = ?1 AND profile_id = ?2",
+            params![id, profile_id, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Every login of `profile_id` with its password, for export and health checks.
+    pub fn logins_with_passwords(&self, profile_id: &str) -> anyhow::Result<Vec<(Login, String)>> {
+        self.logins(profile_id, None)?
+            .into_iter()
+            .map(|login| {
+                let password = self.login_password(profile_id, &login.id, None)?.unwrap_or_default();
+                Ok((login, password))
+            })
+            .collect()
+    }
+
+    /// Edits login `id`, or the one already saved for (`origin`, `username`), or adds a new one, all within `profile_id`.
+    pub fn save_login(&self, profile_id: &str, id: Option<&str>, origin: &str, username: &str, password: &str, note: &str) -> anyhow::Result<()> {
+        let secret = passwords::encrypt(self.vault_key()?, password)?;
+        let existing = match id {
+            Some(id) => Some(id.to_string()),
+            None => self
+                .storage
+                .conn()
+                .query_row(
+                    "SELECT id FROM passwords WHERE profile_id = ?1 AND origin = ?2 AND username = ?3",
+                    params![profile_id, origin, username],
+                    |row| row.get(0),
+                )
+                .optional()?,
+        };
+        match existing {
+            Some(id) => {
+                let changed = self.storage.execute(
+                    "UPDATE passwords SET origin = ?3, username = ?4, secret = ?5, note = ?6, updated_at = ?7
+                     WHERE id = ?1 AND profile_id = ?2",
+                    params![id, profile_id, origin, username, secret, note, now_secs()],
+                )?;
+                anyhow::ensure!(changed == 1, "no such login in this profile");
+            }
+            None => {
+                self.storage.execute(
+                    "INSERT INTO passwords (id, profile_id, origin, username, secret, note, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                    params![Uuid::new_v4().to_string(), profile_id, origin, username, secret, note, now_secs()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_login(&mut self, profile_id: &str, id: &str) -> anyhow::Result<()> {
+        self.storage.execute("DELETE FROM passwords WHERE id = ?1 AND profile_id = ?2", params![id, profile_id])?;
+        Ok(())
+    }
+
+    /// Stops the save prompt for `origin` in `profile_id`.
+    pub fn never_save(&mut self, profile_id: &str, origin: &str) -> anyhow::Result<()> {
+        self.storage.execute(
+            "INSERT OR IGNORE INTO password_never (profile_id, origin) VALUES (?1, ?2)",
+            params![profile_id, origin],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_never_save(&self, profile_id: &str, origin: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .storage
+            .conn()
+            .prepare_cached("SELECT 1 FROM password_never WHERE profile_id = ?1 AND origin = ?2")?
+            .exists(params![profile_id, origin])?)
+    }
+
+    /// Adds or updates (by origin and username) every importable row in `profile_id`; returns how many were taken.
+    pub fn import_logins(&mut self, profile_id: &str, rows: Vec<CsvLogin>) -> anyhow::Result<usize> {
+        let tx = self.storage.conn().unchecked_transaction()?;
+        let mut taken = 0;
+        for row in rows {
+            let Some(origin) = passwords::origin_of(&row.url) else {
+                continue;
+            };
+            if row.password.is_empty() {
+                continue;
+            }
+            self.save_login(profile_id, None, &origin, &row.username, &row.password, &row.note)?;
+            taken += 1;
+        }
+        tx.commit()?;
+        Ok(taken)
+    }
+
     pub fn history(&self) -> anyhow::Result<Vec<HistoryEntry>> {
         self.search_history("", 40)
     }
@@ -1111,6 +1264,7 @@ impl Model {
         Ok(())
     }
 
+    /// Leaves out saved passwords on purpose: the bundle is plain JSON. They leave only through the CSV export.
     pub fn export_active(&self) -> anyhow::Result<ProfileBundle> {
         let profile = self.active_profile().context("no profile")?;
         let tabs = self
@@ -1641,6 +1795,51 @@ mod tests {
         assert_eq!(model.bookmarks().unwrap()[0].url, "https://b.com/");
         model.delete_bookmark(&saved[0].id).unwrap();
         assert!(model.bookmarks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn logins_save_update_scope_and_import() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let a = model.active_profile_id.clone();
+        assert!(model.save_login(&a, None, "https://a.com", "ann", "pw", "").is_err(), "no key, no write");
+        model.set_vault_key([3u8; 32]);
+        model.save_login(&a, None, "https://a.com", "ann", "pw1", "").unwrap();
+        model.save_login(&a, None, "https://a.com", "ann", "pw2", "").unwrap();
+        let logins = model.logins(&a, Some("https://a.com")).unwrap();
+        assert_eq!(logins.len(), 1, "same origin and username updates");
+        let id = logins[0].id.clone();
+        assert_eq!(model.login_password(&a, &id, Some("https://a.com")).unwrap().as_deref(), Some("pw2"));
+        assert_eq!(model.login_password(&a, &id, Some("https://evil.com")).unwrap(), None);
+        let csv = "name,url,username,password,note\na,https://a.com/login,ann,pw3,\nb,https://b.com,bob,pw4,n\nx,android://x,c,pw,\n";
+        assert_eq!(model.import_logins(&a, passwords::from_csv(csv).unwrap()).unwrap(), 2);
+        assert_eq!(model.logins(&a, None).unwrap().len(), 2);
+        assert_eq!(model.login_password(&a, &id, None).unwrap().as_deref(), Some("pw3"));
+        model.never_save(&a, "https://c.com").unwrap();
+        assert!(model.is_never_save(&a, "https://c.com").unwrap() && !model.is_never_save(&a, "https://a.com").unwrap());
+        model.delete_login(&a, &id).unwrap();
+        assert_eq!(model.logins_with_passwords(&a).unwrap()[0].1, "pw4");
+    }
+
+    #[test]
+    fn logins_stay_in_their_profile() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.set_vault_key([3u8; 32]);
+        let a = model.active_profile_id.clone();
+        model.create_profile("Work").unwrap();
+        let b = model.profiles.iter().find(|p| p.id != a).unwrap().id.clone();
+        model.save_login(&a, None, "https://a.com", "ann", "pw-a", "").unwrap();
+        model.never_save(&a, "https://n.com").unwrap();
+        let id = model.logins(&a, None).unwrap()[0].id.clone();
+        assert!(model.logins(&b, None).unwrap().is_empty());
+        assert!(model.logins(&b, Some("https://a.com")).unwrap().is_empty());
+        assert_eq!(model.login_password(&b, &id, None).unwrap(), None);
+        assert!(!model.is_never_save(&b, "https://n.com").unwrap());
+        assert!(model.save_login(&b, Some(&id), "https://a.com", "ann", "stolen", "").is_err());
+        model.delete_login(&b, &id).unwrap();
+        model.save_login(&b, None, "https://a.com", "ann", "pw-b", "").unwrap();
+        assert_eq!(model.login_password(&a, &id, None).unwrap().as_deref(), Some("pw-a"), "b's writes leave a's login alone");
+        assert_eq!(model.logins(&a, None).unwrap().len(), 1);
+        assert_eq!(model.logins_with_passwords(&b).unwrap()[0].1, "pw-b");
     }
 
     #[test]

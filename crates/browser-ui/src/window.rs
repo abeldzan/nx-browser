@@ -1,5 +1,6 @@
 mod tiling;
 
+use crate::passwords::PasswordState;
 use crate::profiles::profile_label;
 use crate::settings::SettingsSection;
 use crate::sidebar::SidebarPage;
@@ -143,6 +144,7 @@ pub struct BrowserWindow {
     confirm_delete: bool,
     /// Camera/microphone request the page is waiting on: (request, origin, kind).
     permission: Option<(u64, String, String)>,
+    pub(crate) passwords: PasswordState,
     /// Downloads WebKit is writing, by engine id: (download id in the model, file path).
     web_downloads: HashMap<u64, (String, String)>,
     attached: bool,
@@ -300,7 +302,7 @@ impl BrowserWindow {
         let history_query = cx.new(InputState::new_singleline);
         let bookmark_title = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let bookmark_url = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
                     let raw = input.read(cx).content().to_string();
@@ -411,6 +413,8 @@ impl BrowserWindow {
                 _ => {}
             }),
         ];
+        let (passwords, password_subscriptions) = PasswordState::new(cx);
+        subscriptions.extend(password_subscriptions);
         let (detached, tab_window, extensions, pages, chrome) = match handoff {
             Some(handoff) => (Some(handoff.session), handoff.tab_window, Some(handoff.extensions), handoff.pages, handoff.chrome),
             None => (None, false, None, Vec::new(), HashMap::new()),
@@ -480,6 +484,7 @@ impl BrowserWindow {
             layout_stage: None,
             order: Vec::new(),
             subscriptions,
+            passwords,
             status: "Ready".into(),
             renaming: false,
             space_rename: None,
@@ -756,6 +761,7 @@ impl BrowserWindow {
                 }
                 cx.notify();
             }
+            EngineEvent::Passwords { tab_id, origin, request, message } => self.on_password_message(&tab_id, &origin, request, &message, cx),
             EngineEvent::OpenInNewTab { url, from } => {
                 // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
                 let panel = self.ext_meta.keys().find(|id| self.panel_url(id).as_deref() == Some(url.as_str())).cloned();
@@ -2053,6 +2059,7 @@ impl Render for BrowserWindow {
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
             .child(self.permission_prompt(cx))
+            .child(self.save_password_prompt(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
@@ -2066,6 +2073,7 @@ impl Render for BrowserWindow {
             })
             .when(self.history_modal, |root| root.child(self.history_modal(cx)))
             .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
+            .when(self.passwords.edit.is_some(), |root| root.child(self.login_editor(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
     }
 }
@@ -2917,7 +2925,7 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some();
+        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some();
         self.engine.set_modal(modal);
         let Some(stage) = self.stage_bounds else {
             return;
@@ -3249,10 +3257,20 @@ impl BrowserWindow {
             shell.left(px(GRIP_OUT)).top(px(GRIP_OUT)).right(px(GRIP_OUT)).bottom(px(GRIP_OUT))
         };
         let target = tab.id.clone();
+        let hover_id = tab.id.clone();
+        let hover_focus = !active && self.model.lock().settings.focus_on_hover;
         let body = div().relative().size_full().child(
             v_stack()
                 .id(SharedString::from(format!("window-{}", tab.id)))
                 .size_full()
+                .when(hover_focus, |column| {
+                    column.on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        // Not mid-drag, nor while typing an address, which passing over another window would cut off.
+                        if event.pressed_button.is_none() && this.gesture.is_none() && !cx.has_active_drag() && !this.palette_open && !this.address_editing {
+                            this.focus_window(&hover_id, cx);
+                        }
+                    }))
+                })
                 .when(!self.tab_window, |column| {
                     column.rounded(px(WINDOW_RADIUS as f32)).border_1().border_color(if active { accent } else { paint.border })
                 })

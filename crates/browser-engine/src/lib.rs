@@ -46,6 +46,14 @@ pub enum EngineEvent {
         kind: String,
         request: u64,
     },
+    /// A message from the password script in a page frame (JSON with a `kind`); the page waits for
+    /// `answer_passwords(request, ..)`. `origin` comes from WebKit, not the page.
+    Passwords {
+        tab_id: String,
+        origin: String,
+        request: u64,
+        message: String,
+    },
     OpenInNewTab {
         url: String,
         /// The tab whose page asked for it; the new tab joins that tab's window.

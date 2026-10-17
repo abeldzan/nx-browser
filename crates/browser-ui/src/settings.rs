@@ -35,6 +35,7 @@ pub enum SettingsSection {
     Appearance,
     Search,
     Privacy,
+    Passwords,
     Content,
     Downloads,
     Terminal,
@@ -44,13 +45,14 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Profiles,
         Self::General,
         Self::Shortcuts,
         Self::Appearance,
         Self::Search,
         Self::Privacy,
+        Self::Passwords,
         Self::Content,
         Self::Downloads,
         Self::Terminal,
@@ -67,6 +69,7 @@ impl SettingsSection {
             Self::Appearance => "Appearance",
             Self::Search => "Search engine",
             Self::Privacy => "Privacy & security",
+            Self::Passwords => "Passwords",
             Self::Content => "Site content",
             Self::Downloads => "Downloads",
             Self::Terminal => "Terminal",
@@ -84,6 +87,7 @@ impl BrowserWindow {
         self.end_recording();
         self.settings_open = !self.settings_open;
         self.settings_note = None;
+        self.passwords.lock_view();
         if self.settings_open {
             let (settings, active) = {
                 let model = self.model.lock();
@@ -457,6 +461,12 @@ impl BrowserWindow {
                     Some("Address opened for new tabs. Press Return to save."),
                     div().w(px(260.)).child(text_field(&self.home_input, cx).placeholder("nxbrowser://home").full_width(true)),
                     paint,
+                ))
+                .child(row(
+                    "Focus windows",
+                    Some("Hover focuses the window under the pointer; click waits for a click."),
+                    choice("window-focus", vec![("Click", false), ("Hover", true)], settings.focus_on_hover, |s, v| s.focus_on_hover = v, paint, cx),
+                    paint,
                 )),
             SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, paint, cx)),
             SettingsSection::Appearance => page
@@ -572,6 +582,20 @@ impl BrowserWindow {
                 )
                 .child(heading("Site permissions (current profile)", paint))
                 .child(self.permission_list(paint, cx)),
+            SettingsSection::Passwords => page
+                .child(row(
+                    "Offer to save passwords",
+                    Some("Asks after you sign in. Passwords stay on this Mac."),
+                    switch("offer-passwords", settings.offer_passwords, |s, v| s.offer_passwords = v, paint, cx),
+                    paint,
+                ))
+                .child(row(
+                    "Suggest saved passwords",
+                    Some("Lists saved logins when you click a sign-in field."),
+                    switch("autofill-passwords", settings.autofill_passwords, |s, v| s.autofill_passwords = v, paint, cx),
+                    paint,
+                ))
+                .child(self.passwords_settings(paint, cx)),
             SettingsSection::Content => page
                 .child(row(
                     "JavaScript",
@@ -901,7 +925,7 @@ impl BrowserWindow {
     }
 }
 
-fn heading(label: &'static str, paint: Paint) -> gpui::Div {
+pub(crate) fn heading(label: &'static str, paint: Paint) -> gpui::Div {
     div().pt(px(14.)).pb(px(4.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(label)
 }
 
