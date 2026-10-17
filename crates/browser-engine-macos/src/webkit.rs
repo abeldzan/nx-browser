@@ -2026,34 +2026,38 @@ fn install_menu_bar(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
     let main = app.mainMenu().unwrap_or_else(|| {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
-        let app_item = NSMenuItem::new(mtm);
-        let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("NxBrowser"));
-        if let Some(updates) = crate::updates::menu_item(mtm) {
-            app_menu.addItem(&updates);
-            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        }
-        app_menu.insertItem_atIndex(&menu_item(mtm, "About NxBrowser", sel!(orderFrontStandardAboutPanel:), "", false), 0);
-        app_menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), 1);
-        if let Some(settings) = shortcut_item(mtm, "settings") {
-            settings.setTitle(ns_string!("Settings…"));
-            app_menu.addItem(&settings);
-            app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        }
-        app_menu.addItem(&menu_item(mtm, "Hide NxBrowser", sel!(hide:), "h", false));
-        let others = menu_item(mtm, "Hide Others", sel!(hideOtherApplications:), "h", false);
-        others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
-        app_menu.addItem(&others);
-        app_menu.addItem(&menu_item(mtm, "Show All", sel!(unhideAllApplications:), "", false));
-        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        app_menu.addItem(&menu_item(mtm, "Quit NxBrowser", sel!(terminate:), "q", false));
-        app_item.setSubmenu(Some(&app_menu));
-        menu.addItem(&app_item);
         app.setMainMenu(Some(&menu));
         menu
     });
     if main.itemWithTitle(ns_string!("Edit")).is_some() {
         return;
     }
+    let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("NxBrowser"));
+    if let Some(updates) = crate::updates::menu_item(mtm) {
+        app_menu.addItem(&updates);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    }
+    app_menu.insertItem_atIndex(&menu_item(mtm, "About NxBrowser", sel!(orderFrontStandardAboutPanel:), "", false), 0);
+    app_menu.insertItem_atIndex(&NSMenuItem::separatorItem(mtm), 1);
+    if let Some(settings) = shortcut_item(mtm, "settings") {
+        settings.setTitle(ns_string!("Settings…"));
+        app_menu.addItem(&settings);
+        app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    }
+    app_menu.addItem(&menu_item(mtm, "Hide NxBrowser", sel!(hide:), "h", false));
+    let others = menu_item(mtm, "Hide Others", sel!(hideOtherApplications:), "h", false);
+    others.setKeyEquivalentModifierMask(NSEventModifierFlags::Command | NSEventModifierFlags::Option);
+    app_menu.addItem(&others);
+    app_menu.addItem(&menu_item(mtm, "Show All", sel!(unhideAllApplications:), "", false));
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    app_menu.addItem(&menu_item(mtm, "Quit NxBrowser", sel!(terminate:), "q", false));
+    // AppKit may already have a main menu whose app item has an empty submenu; fill that item instead of skipping it.
+    let app_item = if main.numberOfItems() > 0 { main.itemAtIndex(0) } else { None }.unwrap_or_else(|| {
+        let item = NSMenuItem::new(mtm);
+        main.insertItem_atIndex(&item, 0);
+        item
+    });
+    app_item.setSubmenu(Some(&app_menu));
     let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
     edit.addItem(&menu_item(mtm, "Undo", sel!(undo:), "z", false));
     edit.addItem(&menu_item(mtm, "Redo", sel!(redo:), "z", true));
