@@ -238,6 +238,31 @@
     });
   }
 
+  // WebKit has `setAccessLevel` on the session area only; Chrome has it on every area, and Kluff's background
+  // calls it on `local` at startup, so its absence stops the background. WebKit can't restrict the other areas
+  // to trusted contexts, so there it does nothing. `patch_pages` points the extension's storage calls here.
+  const storage = chrome["storage"];
+  if (storage) {
+    const bound = (target, key) => {
+      const value = target[key];
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+    const areas = new WeakMap();
+    const area = (target) => {
+      if (!areas.has(target)) {
+        const setAccessLevel = method(() => undefined);
+        areas.set(target, new Proxy(target, { get: (t, key) => (key === "setAccessLevel" && typeof t[key] !== "function" ? setAccessLevel : bound(t, key)) }));
+      }
+      return areas.get(target);
+    };
+    g.nxStorage = new Proxy(storage, {
+      get: (target, key) => {
+        const value = target[key];
+        return value && typeof value === "object" && typeof value.get === "function" && typeof value.set === "function" ? area(value) : bound(target, key);
+      },
+    });
+  }
+
   // Registered content scripts, as Chrome runs them. WebKit gets two things wrong:
   // - it records a script's ID only once it has saved it, so overlapping `registerContentScripts`
   //   calls both pass its duplicate check; calls here run one at a time instead.
@@ -245,6 +270,8 @@
   //   load. Extensions re-register on every start (Phantom: unregister all, register again), so open
   //   pages got a second copy ("Attempting to change value of a readonly property"). An unregister
   //   is held back briefly here, and re-registering the same script in that time keeps the old one.
+  // Registering a script identical to one already registered keeps it too, where Chrome throws "Duplicate
+  // ID": Bitwarden re-registers its passkey scripts on every start without awaiting, so that only ever logs.
   // `patch_pages` points the extension's calls here.
   const scripting = chrome["scripting"];
   if (scripting) {
@@ -288,7 +315,7 @@
         for (const script of scripts) {
           const held = later.has(script.id);
           const existing = current.find((registered) => registered.id === script.id);
-          if (held && existing && same(existing, script)) {
+          if (existing && same(existing, script)) {
             clearTimeout(later.get(script.id));
             later.delete(script.id);
             continue;

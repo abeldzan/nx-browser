@@ -39,6 +39,28 @@ pub fn patch_missing_apis(dir: &Path) -> anyhow::Result<()> {
     patch_pages(dir)
 }
 
+/// Copies a folder the user picked into `dest` and patches the copy, so unpacked extensions get the
+/// polyfill too without their files being rewritten. Replaces what was there, so a rebuild shows up on reload.
+pub fn patch_unpacked_copy(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let _ = std::fs::remove_dir_all(dest);
+    copy_dir(src, dest)?;
+    patch_missing_apis(dest)
+}
+
+/// Symlinked folders are skipped (one pointing up would recurse forever); symlinked files are copied.
+fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)?.flatten() {
+        let (from, to) = (entry.path(), dest.join(entry.file_name()));
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else if from.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Chrome enum constants WebKit lacks, as the values Chrome gives them. They can't be polyfilled:
 /// WebKit's API objects take no new properties, and swapping the `chrome` global breaks popups.
 /// Also Chrome's extension URL scheme: code that trusts `sender.url` only when it starts with
@@ -50,11 +72,13 @@ const CONSTANTS: [(&str, &str); 3] = [
 ];
 
 /// APIs WebKit gets wrong whose objects can't be patched, with the polyfill global that wraps each.
-const GUARDED: [(&str, &str); 4] = [
+const GUARDED: [(&str, &str); 6] = [
     ("chrome.permissions.", "nxPermissions"),
     ("browser.permissions.", "nxPermissions"),
     ("chrome.scripting.", "nxScripting"),
     ("browser.scripting.", "nxScripting"),
+    ("chrome.storage.", "nxStorage"),
+    ("browser.storage.", "nxStorage"),
 ];
 
 /// Points calls on the `GUARDED` APIs at the polyfill's wrappers, falling back to the real object where
@@ -131,7 +155,7 @@ mod tests {
         std::fs::write(dir.join("src/panel.html"), "<html><head><title>x</title></head></html>").unwrap();
         std::fs::write(dir.join("src/inject.js"), "run({world:chrome.scripting.ExecutionWorld.MAIN})").unwrap();
         std::fs::write(dir.join("src/senders.js"), "u.startsWith(`chrome-extension://${id}/`)").unwrap();
-        std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p);chrome.scripting.registerContentScripts(s)").unwrap();
+        std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p);chrome.scripting.registerContentScripts(s);chrome.storage.local.setAccessLevel(a)").unwrap();
         patch_missing_apis(&dir).unwrap();
         patch_missing_apis(&dir).unwrap();
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -143,10 +167,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("src/senders.js")).unwrap(), "u.startsWith(`webkit-extension://${id}/`)");
         assert_eq!(
             std::fs::read_to_string(dir.join("src/perms.js")).unwrap(),
-            "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p);(globalThis.nxScripting||chrome.scripting).registerContentScripts(s)"
+            "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p);(globalThis.nxScripting||chrome.scripting).registerContentScripts(s);(globalThis.nxStorage||chrome.storage).local.setAccessLevel(a)"
         );
-        assert!(!std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap().contains("nxPermissions||"), "the polyfill itself is left alone");
+        let polyfill = std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap();
+        assert!(!polyfill.contains("nxPermissions||") && !polyfill.contains("nxStorage||"), "the polyfill itself is left alone");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unpacked_folders_run_from_a_patched_copy() {
+        let root = std::env::temp_dir().join(format!("nx-polyfill-copy-{}", std::process::id()));
+        let (src, dest) = (root.join("src"), root.join("copy"));
+        std::fs::create_dir_all(src.join("assets")).unwrap();
+        let manifest = r#"{"background":{"service_worker":"sw.js","type":"module"}}"#;
+        std::fs::write(src.join("manifest.json"), manifest).unwrap();
+        std::fs::write(src.join("assets/sw.js"), "chrome.storage.local.get(k)").unwrap();
+        std::os::unix::fs::symlink(&root, src.join("up")).unwrap();
+        std::fs::create_dir_all(dest.join("stale")).unwrap();
+        patch_unpacked_copy(&src, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(src.join("manifest.json")).unwrap(), manifest, "the picked folder is untouched");
+        assert_eq!(std::fs::read_to_string(src.join("assets/sw.js")).unwrap(), "chrome.storage.local.get(k)");
+        assert_eq!(std::fs::read_to_string(dest.join("assets/sw.js")).unwrap(), "(globalThis.nxStorage||chrome.storage).local.get(k)");
+        assert!(dest.join(WORKER_FILE).is_file() && dest.join(POLYFILL_FILE).is_file());
+        assert!(!dest.join("stale").exists() && !dest.join("up").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

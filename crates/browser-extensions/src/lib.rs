@@ -4,7 +4,7 @@ mod polyfill;
 
 pub use install::{crx_zip, install_from_store, local_id, store_id, unpack_crx};
 pub use manifest::{read_manifest, Manifest};
-pub use polyfill::patch_missing_apis;
+pub use polyfill::{patch_missing_apis, patch_unpacked_copy};
 
 /// Folders directly under `dirs` (or `dirs` themselves) that hold a `manifest.json`.
 pub fn discover(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {

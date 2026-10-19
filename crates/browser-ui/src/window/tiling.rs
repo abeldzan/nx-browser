@@ -57,20 +57,37 @@ impl Side {
     }
 }
 
-/// The window nearest `from` in direction `dir`: its centre must lie that way, and a big sideways
-/// offset costs twice the distance travelled, so the one straight across wins over a closer diagonal.
+/// The window that way from `from`. `others` runs least to most recently focused: of the windows sharing
+/// `from`'s border that way, the latest wins, so stepping back returns to where you came from. With none,
+/// the nearest whose centre lies past `from`'s edge; a big sideways offset costs twice the distance travelled.
 pub(super) fn neighbour(from: Frame, others: &[(String, Frame)], dir: Dir) -> Option<String> {
+    let across = matches!(dir, Dir::Left | Dir::Right);
+    let (lo, hi) = span(from, !across);
+    let gap = |f: Frame| match dir {
+        Dir::Left => from.x - (f.x + f.w),
+        Dir::Right => f.x - (from.x + from.w),
+        Dir::Up => from.y - (f.y + f.h),
+        Dir::Down => f.y - (from.y + from.h),
+    };
+    let beside = others.iter().filter(|(_, f)| {
+        let (a, b) = span(*f, !across);
+        a < hi && b > lo && gap(*f) > -1.0
+    });
+    if let Some(nearest) = beside.clone().map(|(_, f)| gap(*f)).min_by(f32::total_cmp) {
+        return beside.filter(|(_, f)| gap(*f) <= nearest + SNAP_INSET).last().map(|(id, _)| id.clone());
+    }
     let centre = |f: Frame| (f.x + f.w / 2.0, f.y + f.h / 2.0);
     let (fx, fy) = centre(from);
     others
         .iter()
         .filter_map(|(id, frame)| {
             let (x, y) = centre(*frame);
+            // Measured from the edge, not the centre: a window below that merely reaches left of our centre isn't "left".
             let (ahead, aside) = match dir {
-                Dir::Left => (fx - x, y - fy),
-                Dir::Right => (x - fx, y - fy),
-                Dir::Up => (fy - y, x - fx),
-                Dir::Down => (y - fy, x - fx),
+                Dir::Left => (from.x - x, y - fy),
+                Dir::Right => (x - (from.x + from.w), y - fy),
+                Dir::Up => (from.y - y, x - fx),
+                Dir::Down => (y - (from.y + from.h), x - fx),
             };
             (ahead > 1.0).then(|| (ahead + aside.abs() * 2.0, id))
         })
@@ -362,6 +379,17 @@ mod tests {
         assert_eq!(neighbour(d, &others("d"), Dir::Left).as_deref(), Some("c"));
         assert_eq!(neighbour(a, &others("a"), Dir::Left), None);
         assert_eq!(neighbour(a, &others("a"), Dir::Up), None);
+
+        // 1 | 2      left of 2 is 1, not 3 below it.
+        //   | 3 4
+        let (one, two, three, four) = (f(0., 0., 500., 600.), f(500., 0., 500., 300.), f(500., 300., 250., 300.), f(750., 300., 250., 300.));
+        let all = [("1".to_string(), one), ("3".into(), three), ("4".into(), four)];
+        assert_eq!(neighbour(two, &all, Dir::Left).as_deref(), Some("1"));
+        assert_eq!(neighbour(four, &[("1".to_string(), one), ("2".into(), two), ("3".into(), three)], Dir::Left).as_deref(), Some("3"));
+        assert_eq!(neighbour(three, &[("1".to_string(), one), ("2".into(), two), ("4".into(), four)], Dir::Up).as_deref(), Some("2"));
+        // Right of 1 is whichever of 2 and 3 was focused last.
+        assert_eq!(neighbour(one, &[("3".to_string(), three), ("2".into(), two), ("4".into(), four)], Dir::Right).as_deref(), Some("2"));
+        assert_eq!(neighbour(one, &[("2".to_string(), two), ("4".into(), four), ("3".into(), three)], Dir::Right).as_deref(), Some("3"));
     }
 
     #[test]
