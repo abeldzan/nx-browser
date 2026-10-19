@@ -38,6 +38,10 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// "comfortable" or "compact".
     pub density: String,
+    /// Font family for the browser's own UI; empty means the system font.
+    pub ui_font: String,
+    /// Pages that set no font of their own use `ui_font`.
+    pub ui_font_pages: bool,
     /// Page zoom per host, for hosts zoomed away from `page_zoom`.
     pub site_zoom: BTreeMap<String, f64>,
     /// Spaces open in their own window, reopened at launch.
@@ -92,6 +96,8 @@ impl Default for Settings {
             accent: String::new(),
             reduce_motion: false,
             density: "comfortable".into(),
+            ui_font: String::new(),
+            ui_font_pages: false,
             site_zoom: BTreeMap::new(),
             detached_spaces: Vec::new(),
             detached_windows: Vec::new(),
@@ -156,6 +162,7 @@ mod tests {
         assert_eq!(parsed.max_live_tabs, Settings::default().max_live_tabs);
         assert!(parsed.search_template().starts_with("https://www.google.com/"));
         assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
+        assert!(parsed.ui_font.is_empty() && !parsed.ui_font_pages);
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
         assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));
         assert!(parsed.shortcuts.is_empty() && !parsed.focus_on_hover && parsed.ask_link_profile);

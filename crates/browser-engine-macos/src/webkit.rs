@@ -982,6 +982,17 @@ impl MacEngine {
         }
     }
 
+    /// Stops a running download; it ends as `DownloadDone` with "Cancelled".
+    pub fn cancel_download(&mut self, download: u64) {
+        // Removed first so WebKit's own failure callback finds nothing and isn't reported twice.
+        let Some(entry) = DOWNLOADS.with_borrow_mut(|downloads| downloads.remove(&download)) else {
+            return;
+        };
+        let bytes = download_progress(&entry.download).completedUnitCount().max(0) as u64;
+        unsafe { entry.download.cancel(None) };
+        let _ = entry.events.send(EngineEvent::DownloadDone { download, bytes, error: Some("Cancelled".into()) });
+    }
+
     /// Bytes written so far and the expected total, while WebKit runs the download.
     pub fn download_bytes(&self, download: u64) -> Option<(u64, Option<u64>)> {
         let progress = DOWNLOADS.with_borrow(|downloads| downloads.get(&download).map(|entry| download_progress(&entry.download)))?;
@@ -1423,6 +1434,10 @@ impl MacEngine {
             live.view.removeFromSuperview();
             self.stacked.clear();
         }
+        // A view rebuilt under the same id needs a fresh dimmer; a stale entry would leave it undimmed.
+        if let Some(dimmer) = self.dimmers.remove(tab_id) {
+            dimmer.removeFromSuperview();
+        }
         if self.visible.as_deref() == Some(tab_id) {
             self.visible = None;
         }
@@ -1531,6 +1546,12 @@ fn apply_view_settings(view: &WKWebView, settings: &EngineSettings) {
         let _: () = msg_send![&*view.configuration().preferences(), setValue: &*NSNumber::new_bool(settings.inspectable), forKey: ns_string!("developerExtrasEnabled")];
         view.setCustomUserAgent(agent.as_deref());
         view.setPageZoom(settings.page_zoom);
+        // Private setter: the font for page text that sets none. "Times" is WebKit's own default on macOS.
+        let preferences = view.configuration().preferences();
+        if preferences.respondsToSelector(sel!(_setStandardFontFamily:)) {
+            let font = NSString::from_str(if settings.page_font.trim().is_empty() { "Times" } else { settings.page_font.trim() });
+            let _: () = msg_send![&*preferences, _setStandardFontFamily: &*font];
+        }
     }
 }
 

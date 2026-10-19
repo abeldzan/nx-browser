@@ -113,6 +113,8 @@ pub struct EngineSettings {
     pub inspectable: bool,
     pub user_agent: String,
     pub page_zoom: f64,
+    /// Font for page text that sets none; empty means WebKit's default.
+    pub page_font: String,
 }
 
 impl Default for EngineSettings {
@@ -126,6 +128,7 @@ impl Default for EngineSettings {
             inspectable: true,
             user_agent: String::new(),
             page_zoom: 1.0,
+            page_font: String::new(),
         }
     }
 }

@@ -76,6 +76,7 @@ pub struct BrowserWindow {
     pub(crate) ua_input: Entity<InputState>,
     /// Searchable font list in the Terminal settings; built on first show since it needs a `Window`.
     pub(crate) term_font_picker: Option<Entity<ComboboxState<String>>>,
+    pub(crate) ui_font_picker: Option<Entity<ComboboxState<String>>>,
     pub(crate) term_shell_input: Entity<InputState>,
     pub(crate) name_input: Entity<InputState>,
     pub(crate) settings_open: bool,
@@ -444,6 +445,7 @@ impl BrowserWindow {
             home_input,
             ua_input,
             term_font_picker: None,
+            ui_font_picker: None,
             term_shell_input,
             name_input,
             settings_open: false,
@@ -642,10 +644,14 @@ impl BrowserWindow {
         let tabs = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).cloned().collect::<Vec<_>>();
         let mut changed = false;
         let mut exited = Vec::new();
+        let mut links = Vec::new();
         for tab in tabs {
             let Some(view) = terminal::get(&tab.id, cx) else {
                 continue;
             };
+            if let Some(url) = view.update(cx, |view, _| view.open_url.take()) {
+                links.push((tab.id.clone(), url));
+            }
             let view = view.read(cx);
             if view.exited {
                 exited.push(tab.id.clone());
@@ -661,6 +667,10 @@ impl BrowserWindow {
             if let Some(url) = url.filter(|url| *url != tab.url) {
                 let _ = model.set_tab_url(&tab.id, &url);
             }
+        }
+        for (id, url) in links {
+            changed = true;
+            self.new_tab_in(&id, Some(&url), cx);
         }
         if !exited.is_empty() {
             changed = true;
@@ -780,7 +790,7 @@ impl BrowserWindow {
                 // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
                 let panel = self.ext_meta.keys().find(|id| self.panel_url(id).as_deref() == Some(url.as_str())).cloned();
                 // A side panel's links get a regular window, not a tab squeezed into the panel.
-                let from = from.filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_none()));
+                let from = from.filter(|id| !self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()));
                 match (panel, from) {
                     (Some(id), _) => self.open_extension_panel(&id, &url, cx),
                     (None, Some(from)) => {
@@ -789,9 +799,11 @@ impl BrowserWindow {
                             self.openers.insert(child, from);
                         }
                     }
-                    (None, None) => self.with_model(|model| {
-                        let _ = model.create_tab(&url);
-                    }),
+                    (None, None) => {
+                        if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
+                            self.focus_window(&id, cx);
+                        }
+                    }
                 }
             }
             EngineEvent::Alert { message } => self.status = message.into(),
@@ -1228,6 +1240,7 @@ impl BrowserWindow {
             inspectable: settings.inspector,
             user_agent: settings.user_agent.clone(),
             page_zoom: settings.page_zoom,
+            page_font: if settings.ui_font_pages { settings.ui_font.clone() } else { String::new() },
         });
         self.engine.set_shortcuts(if self.recording.is_some() { Vec::new() } else { crate::shortcuts::keymap(&settings) });
         self.compact = settings.compact();
@@ -1447,7 +1460,18 @@ impl BrowserWindow {
     }
 
     /// Gives keys to the active tab's content: its web page, or its terminal on the next render.
+    /// A chrome modal is open: pages are dimmed, take no clicks and must not take keys.
+    fn modal_open(&self) -> bool {
+        self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty()
+    }
+
     pub(crate) fn focus_active_content(&mut self) {
+        // A modal's inputs keep the keys; a tab opened or activated behind it waits until it closes.
+        if self.modal_open() {
+            return;
+        }
+        // Drop GPUI focus too, or a later click on the input that had it fires no Focus and keys stay with the page.
+        self.blur_address = true;
         let Some(tab) = self.model.lock().active_tab().cloned() else {
             return;
         };
@@ -1551,6 +1575,13 @@ impl BrowserWindow {
         self.engine.save_download(download, Some(&path));
         self.status = "Download started".into();
         self.popover = Some(Popover::Downloads);
+    }
+
+    /// Stops the running download recorded as `id` in the model.
+    pub(crate) fn cancel_download(&mut self, id: &str) {
+        if let Some(download) = self.web_downloads.iter().find(|(_, (model_id, _))| model_id == id).map(|(download, _)| *download) {
+            self.engine.cancel_download(download);
+        }
     }
 
     pub(crate) fn export_profile(&mut self, cx: &mut Context<Self>) {
@@ -1808,34 +1839,57 @@ impl BrowserWindow {
     }
 
     fn build_font_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings_open || self.settings_section != SettingsSection::Terminal || self.term_font_picker.is_some() {
+        if !self.settings_open {
             return;
         }
-        let current = self.model.lock().settings.terminal_font.clone();
-        let mut fonts = terminal::monospace_fonts().to_vec();
-        if !fonts.contains(&current) {
-            // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
-            fonts.insert(0, current.clone());
+        let settings = self.model.lock().settings.clone();
+        match self.settings_section {
+            SettingsSection::Terminal if self.term_font_picker.is_none() => {
+                let fonts = terminal::monospace_fonts().iter().map(|name| (name.clone(), name.clone())).collect();
+                let picker = Self::font_picker("terminal-font", "Terminal font", fonts, settings.terminal_font, |s, font| s.terminal_font = font, cx);
+                self.term_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
+            }
+            SettingsSection::Appearance if self.ui_font_picker.is_none() => {
+                let fonts = std::iter::once((String::new(), "System".to_string()))
+                    .chain(terminal::all_fonts().iter().map(|name| (name.clone(), name.clone())))
+                    .collect();
+                let picker = Self::font_picker("ui-font", "Interface font", fonts, settings.ui_font, |s, font| s.ui_font = font, cx);
+                self.ui_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
+            }
+            _ => {}
         }
-        let options = fonts.into_iter().map(|name| (name.clone(), name)).collect::<Vec<_>>();
+    }
+
+    /// A searchable font list of (value, label) saving the pick through `apply`; `current` stays listed even if not installed.
+    fn font_picker(
+        id: &'static str,
+        name: &'static str,
+        mut fonts: Vec<(String, String)>,
+        current: String,
+        apply: fn(&mut browser_core::Settings, String),
+        cx: &mut Context<Self>,
+    ) -> gpuikit::elements::combobox::Combobox<String> {
+        if !fonts.iter().any(|(value, _)| *value == current) {
+            // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
+            fonts.insert(0, (current.clone(), current.clone()));
+        }
         let (pick, create) = (cx.entity().downgrade(), cx.entity().downgrade());
-        let picker = combobox("terminal-font", "Terminal font", options)
+        combobox(id, name, fonts)
             .selected(current)
             .placeholder("Search fonts…")
             .full_width(true)
             .on_change(move |font: Option<String>, _, cx| {
                 if let Some(font) = font {
-                    let _ = pick.update(cx, |this, cx| this.set_pref(cx, |s| s.terminal_font = font));
+                    let _ = pick.update(cx, |this, cx| this.set_pref(cx, |s| apply(s, font)));
                 }
             })
-            // A name not in the list is kept as typed, so fonts CoreText doesn't flag as monospace still work.
+            // A name not in the list is kept as typed, so any installed family works.
             .on_create(move |font, _, cx| {
                 let font = font.trim().to_string();
                 if !font.is_empty() {
-                    let _ = create.update(cx, |this, cx| this.set_pref(cx, |s| s.terminal_font = font));
+                    let _ = create.update(cx, |this, cx| this.set_pref(cx, |s| apply(s, font)));
                 }
-            });
-        self.term_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
+            })
     }
 
     /// Opens the find bar on the active window, unless it's a terminal, which has no page to search.
@@ -2104,6 +2158,8 @@ impl Render for BrowserWindow {
                 }
             }
         }
+        // Read before the tree below, which locks the model again while this statement is still open.
+        let ui_font = self.model.lock().settings.ui_font.clone();
         v_stack()
             .relative()
             .size_full()
@@ -2117,6 +2173,7 @@ impl Render for BrowserWindow {
             .child(div().absolute().track_focus(&self.gesture_focus))
             .text_color(colors.fg)
             .text_size(px(13.))
+            .when(!ui_font.is_empty(), |root| root.font_family(ui_font))
             // Inputs only ask for keys on a GPUI focus change; clicking one that already had GPUI focus while a page
             // held first responder left typing going to the page. Once the click settles, give keys to whoever GPUI focused.
             .capture_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, window, cx| {
@@ -3014,8 +3071,7 @@ impl BrowserWindow {
         if self.self_test.is_some() {
             return;
         }
-        let modal = self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty();
-        self.engine.set_modal(modal);
+        self.engine.set_modal(self.modal_open());
         let Some(stage) = self.stage_bounds else {
             return;
         };

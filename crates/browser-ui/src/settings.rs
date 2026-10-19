@@ -85,7 +85,7 @@ impl SettingsSection {
             Self::Profiles => "new profile icon color rename delete switch export import backup",
             Self::General => "on startup restore session new tab page home focus windows hover click default browser links other apps profile",
             Self::Shortcuts => "keyboard keys reset",
-            Self::Appearance => "theme dark light system page zoom accent color density compact reduce motion site zoom",
+            Self::Appearance => "theme dark light system font typeface page zoom accent color density compact reduce motion site zoom",
             Self::Search => "address bar google duckduckgo",
             Self::Privacy => "save browsing history https ads trackers block pop-ups popups fraudulent warnings clear cookies site data permissions",
             Self::Passwords => "offer save suggest autofill logins vault",
@@ -124,9 +124,13 @@ impl BrowserWindow {
             self.ua_input.update(cx, |input, cx| input.set_content_silent(settings.user_agent, cx));
             // Rebuilt on show, so it lists fonts installed since and selects the saved one.
             self.term_font_picker = None;
+            self.ui_font_picker = None;
             self.term_shell_input.update(cx, |input, cx| input.set_content_silent(settings.terminal_shell, cx));
             self.settings_query.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
             self.select_settings_profile(active, cx);
+        } else {
+            // Keys go back to the page, which may have been opened or activated while settings held them.
+            self.focus_active_content();
         }
         cx.notify();
     }
@@ -599,6 +603,18 @@ impl BrowserWindow {
                         paint,
                         cx,
                     ),
+                    paint,
+                ))
+                .child(row(
+                    "Font",
+                    Some("Used across the browser's interface. Type to search, or type any font name."),
+                    div().w(px(260.)).children(self.ui_font_picker.clone()),
+                    paint,
+                ))
+                .child(row(
+                    "Use font for web pages",
+                    Some("Pages that don't choose their own font use it."),
+                    switch("ui-font-pages", settings.ui_font_pages, |s, v| s.ui_font_pages = v, paint, cx),
                     paint,
                 ))
                 .child(row(

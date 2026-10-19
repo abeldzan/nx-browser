@@ -35,20 +35,37 @@ fn cwd_of(url: &str) -> PathBuf {
 /// Installed monospace font families, sorted. The scan takes over a second, so it runs once,
 /// warmed off the main thread at launch (see `lib.rs`).
 pub fn monospace_fonts() -> &'static [String] {
-    static FONTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    &families().1
+}
+
+/// Every installed font family, sorted; from the same scan as `monospace_fonts`.
+pub fn all_fonts() -> &'static [String] {
+    &families().0
+}
+
+/// (all, monospace) installed families.
+fn families() -> &'static (Vec<String>, Vec<String>) {
+    static FONTS: std::sync::OnceLock<(Vec<String>, Vec<String>)> = std::sync::OnceLock::new();
     FONTS.get_or_init(|| {
         use core_text::font_descriptor::{SymbolicTraitAccessors, TraitAccessors};
         // shortcut: core-text 21's get_descriptors over-retains the array (a one-time leak of the list); fine for a single call.
         let descriptors = core_text::font_collection::create_for_all_families().get_descriptors();
-        let mut names = descriptors
-            .iter()
-            .flat_map(|list| list.iter().filter(|d| d.traits().symbolic_traits().is_monospace()).map(|d| d.family_name()).collect::<Vec<_>>())
-            .filter(|name| !name.starts_with('.'))
-            .collect::<Vec<_>>();
-        names.push("Menlo".into());
-        names.sort_by_key(|name| name.to_lowercase());
-        names.dedup();
-        names
+        let (mut all, mut mono) = (Vec::new(), vec!["Menlo".to_string()]);
+        for descriptor in descriptors.iter().flat_map(|list| list.iter().collect::<Vec<_>>()) {
+            let name = descriptor.family_name();
+            if name.starts_with('.') {
+                continue;
+            }
+            if descriptor.traits().symbolic_traits().is_monospace() {
+                mono.push(name.clone());
+            }
+            all.push(name);
+        }
+        for names in [&mut all, &mut mono] {
+            names.sort_by_key(|name| name.to_lowercase());
+            names.dedup();
+        }
+        (all, mono)
     })
 }
 
@@ -117,6 +134,14 @@ pub fn retain(mut keep: impl FnMut(&str) -> bool, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_lists_share_one_scan() {
+        let (all, mono) = (all_fonts(), monospace_fonts());
+        assert!(all.iter().any(|name| name == "Helvetica") && mono.iter().any(|name| name == "Menlo"));
+        assert!(!mono.iter().any(|name| name == "Helvetica") && mono.iter().all(|name| all.contains(name)));
+        assert!(all.windows(2).all(|pair| pair[0].to_lowercase() < pair[1].to_lowercase()));
+    }
 
     #[test]
     fn font_list_has_monospace_families_only() {

@@ -5,10 +5,11 @@ use super::input::{key_bytes, mouse_bytes, reports_mouse, MouseAction};
 use super::kitty::{Delete, Graphics, Piece, Show, Splitter};
 use super::pty::{self, Pty};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Point, Side};
+use alacritty_terminal::index::{Direction, Point, Side};
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::{Flags, Hyperlink};
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use futures::StreamExt;
@@ -80,6 +81,8 @@ pub struct TerminalView {
     line_height: f32,
     /// The shell exited (or never started); the window closes the tab.
     pub exited: bool,
+    /// A link Cmd-clicked in the output, for the window to open in a new tab.
+    pub open_url: Option<String>,
     _reader: Option<Task<()>>,
 }
 
@@ -108,6 +111,7 @@ impl TerminalView {
             font_size: 0.,
             line_height: 0.,
             exited: false,
+            open_url: None,
             _reader: None,
         };
         view.apply_prefs(settings);
@@ -321,6 +325,20 @@ impl TerminalView {
         Some((row, col, side))
     }
 
+    /// The http(s) link under a cell: an OSC 8 hyperlink, else a URL in the text (following wrapped lines).
+    fn url_at(&self, row: u16, col: u16) -> Option<String> {
+        let term = self.emu.term();
+        let point = self.emu.point_at(row, col);
+        // Image anchors carry an empty uri, so they never pass.
+        if let Some(link) = term.grid()[point].hyperlink().filter(|link| is_web_url(link.uri())) {
+            return Some(link.uri().to_string());
+        }
+        let mut regex = RegexSearch::new(r#"https?://[^\s<>"'`]+"#).ok()?;
+        let (start, end) = (term.line_search_left(point), term.line_search_right(point));
+        let found = RegexIter::new(start, end, Direction::Right, term, &mut regex).find(|range| range.contains(&point))?;
+        Some(trim_url(&term.bounds_to_string(*found.start(), *found.end())).to_string()).filter(|url| is_web_url(url))
+    }
+
     /// Mouse reports go to the program unless Shift forces local selection.
     fn reports(&self, action: MouseAction, modifiers: &gpui::Modifiers) -> bool {
         !self.exited && !modifiers.shift && reports_mouse(self.emu.mode(), action)
@@ -330,6 +348,13 @@ impl TerminalView {
         let Some((row, col, side)) = self.cell_at(event.position) else {
             return PointerEffect::default();
         };
+        // Before mouse reporting, so links open inside vim or tmux too.
+        if event.button == gpui::MouseButton::Left && event.modifiers.platform {
+            if let Some(url) = self.url_at(row, col) {
+                self.open_url = Some(url);
+                return PointerEffect { redraw: true, consumed: true };
+            }
+        }
         let press = MouseAction::Press(event.button);
         if self.reports(press, &event.modifiers) {
             if let Some(bytes) = mouse_bytes(press, row, col, &event.modifiers, self.emu.mode()) {
@@ -841,6 +866,23 @@ fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hs
     TermFrame { spans, backgrounds, cursor: bar, images }
 }
 
+/// Terminal output is untrusted: only web links open, never `file:` or `javascript:`.
+fn is_web_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Drops sentence punctuation after a URL, and a closing bracket the URL didn't open: `(see https://a.b/c).`
+fn trim_url(mut url: &str) -> &str {
+    loop {
+        let unopened = |close: char, open: char| url.ends_with(close) && url.matches(close).count() > url.matches(open).count();
+        if url.ends_with(['.', ',', ';', ':', '!', '?', '\'', '"']) || unopened(')', '(') || unopened(']', '[') {
+            url = &url[..url.len() - 1];
+        } else {
+            return url;
+        }
+    }
+}
+
 /// `(placement key, row within the image)` from an anchor cell's hyperlink id.
 fn anchor(id: &str) -> Option<(u64, usize)> {
     let (key, row) = id.strip_prefix(ANCHOR)?.split_once(':')?;
@@ -905,6 +947,14 @@ fn indexed_color(index: u8) -> gpui::Hsla {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trims_punctuation_after_urls() {
+        assert_eq!(trim_url("https://a.b/c)."), "https://a.b/c");
+        assert_eq!(trim_url("https://en.wikipedia.org/wiki/Rust_(language)"), "https://en.wikipedia.org/wiki/Rust_(language)");
+        assert_eq!(trim_url("https://a.b/?q=1\","), "https://a.b/?q=1");
+        assert!(!is_web_url("file:///etc/passwd") && !is_web_url("javascript:alert(1)"));
+    }
 
     #[test]
     fn dropped_paths_are_shell_escaped() {
