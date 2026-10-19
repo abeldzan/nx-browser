@@ -1,0 +1,25 @@
+name: Check version
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version must be strictly above main
+        run: |
+          set -euo pipefail
+          pr=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          plist=$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\([^<]*\)<\/string>.*/\1/p' crates/app/Info.plist)
+          git fetch -q origin main
+          main=$(git show FETCH_HEAD:Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          echo "PR $pr / Info.plist $plist / main $main"
+          [ "$pr" = "$plist" ] || { echo "::error::Cargo.toml $pr != Info.plist $plist (run scripts/bump-version.sh)"; exit 1; }
+          if [ "$pr" != "$main" ] && [ "$pr" = "$(printf '%s\n%s\n' "$pr" "$main" | sort -V | tail -1)" ]; then
+            echo "OK: $pr > main's $main"
+          else
+            echo "::error::PR version $pr must be strictly above main's $main — run scripts/bump-version.sh <version>"; exit 1
+          fi
