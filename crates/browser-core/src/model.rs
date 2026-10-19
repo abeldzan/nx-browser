@@ -1084,7 +1084,8 @@ impl Model {
         })
     }
 
-    /// Address bar matches as (url, title): bookmarks first, then history by recency, one row per url.
+    /// Address bar matches as (url, title), Chrome-style: ranked by `suggest_score`, and a site's root page
+    /// first when the query names its host (`chat` → `chatgpt.com/`, not the last chat opened there).
     pub fn suggest(&self, query: &str, limit: usize) -> anyhow::Result<Vec<(String, String)>> {
         let query = query.trim();
         if query.is_empty() {
@@ -1092,17 +1093,37 @@ impl Model {
         }
         let key = self.memo_key(query, limit);
         memo(&self.suggest_memo, key, || {
-            let pattern = like_pattern(query);
+            // MAX(at) is the only min/max aggregate, so SQLite takes `title` from the latest row.
             let mut stmt = self.storage.conn().prepare_cached(
-                "SELECT url, title, MIN(rank), MAX(at) FROM (
+                "SELECT url, title, MAX(at), SUM(rank), SUM(rank = 0) > 0 FROM (
                     SELECT url, title, 0 AS rank, created_at AS at FROM bookmarks WHERE profile_id = ?1
                     UNION ALL
                     SELECT url, title, 1 AS rank, visited_at AS at FROM history WHERE profile_id = ?1
                  ) WHERE url LIKE ?2 ESCAPE '\\' OR title LIKE ?2 ESCAPE '\\'
-                 GROUP BY url ORDER BY MIN(rank), MAX(at) DESC LIMIT ?3",
+                 GROUP BY url ORDER BY MAX(at) DESC LIMIT 200",
             )?;
-            let rows = stmt.query_map(params![self.active_profile_id, pattern, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            let bare = query.to_lowercase();
+            let bare = bare.trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.");
+            let now = now_secs();
+            let mut rows = stmt
+                .query_map(params![self.active_profile_id, like_pattern(bare)], |row| {
+                    let (url, title): (String, String) = (row.get(0)?, row.get(1)?);
+                    let score = suggest_score(&url, &title, row.get(3)?, now - row.get::<_, i64>(2)?, row.get(4)?, bare);
+                    Ok((score, url, title))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top = rows.first().map(|(_, url, _)| split_url(url)).filter(|(_, host, path)| host_matches(host, bare) && !is_root(path));
+            if let Some(root_url) = top.map(|(scheme, host, _)| format!("{scheme}://{host}/")) {
+                let host = split_url(&root_url).1.to_string();
+                if let Some(at) = rows.iter().position(|(_, url, _)| url.trim_end_matches('/') == root_url.trim_end_matches('/')) {
+                    let root = rows.remove(at);
+                    rows.insert(0, root);
+                } else if rows.iter().filter(|(_, url, _)| split_url(url).1 == host).count() >= 2 {
+                    rows.insert(0, (0.0, root_url, host));
+                }
+            }
+            Ok(rows.into_iter().take(limit).map(|(_, url, title)| (url, title)).collect())
         })
     }
 
@@ -1524,6 +1545,34 @@ impl Model {
 
 fn like_pattern(query: &str) -> String {
     format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
+/// Chrome-like address bar weight: frecency (visits × recency bucket), times how well `query` matches
+/// (host prefix > word prefix > substring), doubled for a site's root page. `query` is lowercase, without scheme/`www.`.
+fn suggest_score(url: &str, title: &str, visits: i64, age_secs: i64, bookmarked: bool, query: &str) -> f64 {
+    let days = age_secs as f64 / 86_400.0;
+    let recency = if days < 4.0 { 1.0 } else if days < 14.0 { 0.7 } else if days < 31.0 { 0.5 } else { 0.3 };
+    let visits = visits.min(30) as f64 + if bookmarked { 5.0 } else { 0.0 };
+    let (_, host, path) = split_url(url);
+    let word_prefix = |text: &str| text.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|word| word.starts_with(query));
+    let fit = if host_matches(host, query) { 4.0 } else if word_prefix(url) || word_prefix(title) { 2.0 } else { 1.0 };
+    visits * recency * fit * if is_root(path) { 2.0 } else { 1.0 }
+}
+
+/// `https://a.com/x?y` → ("https", "a.com", "/x?y"); a url without `://` is all path.
+fn split_url(url: &str) -> (&str, &str, &str) {
+    let Some((scheme, rest)) = url.split_once("://") else { return ("", "", url) };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    (scheme, &rest[..end], &rest[end..])
+}
+
+fn host_matches(host: &str, query: &str) -> bool {
+    let host = host.to_lowercase();
+    !query.is_empty() && (host.starts_with(query) || host.strip_prefix("www.").is_some_and(|host| host.starts_with(query)))
+}
+
+fn is_root(path: &str) -> bool {
+    path.is_empty() || path == "/"
 }
 
 fn read_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -2030,7 +2079,53 @@ mod tests {
         assert_eq!(model.suggest("example", 10).unwrap().len(), 1);
         model.note_navigation(&tab, "https://example.com/b", "B").unwrap();
         assert_eq!(model.search_history("example", 10).unwrap().len(), 2);
-        assert_eq!(model.suggest("example", 10).unwrap().len(), 2);
+        // Two pages on the typed host also bring in its root.
+        assert_eq!(model.suggest("example", 10).unwrap().len(), 3);
+    }
+
+    fn visit_at(model: &Model, url: &str, title: &str, at: i64) {
+        model
+            .storage
+            .execute(
+                "INSERT INTO history (profile_id, url, title, visited_at) VALUES (?1, ?2, ?3, ?4)",
+                params![model.active_profile_id, url, title, at],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn suggest_prefers_site_root_over_recent_deep_pages() {
+        let model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let now = now_secs();
+        visit_at(&model, "https://chatgpt.com/", "ChatGPT", now - 3600);
+        for (n, title) in ["Rust help", "Trip plan", "Recipe"].iter().enumerate() {
+            visit_at(&model, &format!("https://chatgpt.com/c/{n}"), &format!("ChatGPT - {title}"), now - n as i64);
+        }
+        let top = model.suggest("chat", 4).unwrap();
+        assert_eq!(top[0], ("https://chatgpt.com/".to_string(), "ChatGPT".to_string()));
+        assert_eq!(top.len(), 4);
+    }
+
+    #[test]
+    fn suggest_creates_unvisited_site_root() {
+        let model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        visit_at(&model, "https://chatgpt.com/c/1", "One", now_secs());
+        visit_at(&model, "https://chatgpt.com/c/2", "Two", now_secs());
+        assert_eq!(model.suggest("www.chat", 4).unwrap()[0].0, "https://chatgpt.com/");
+        assert_eq!(model.suggest("Two", 4).unwrap()[0].0, "https://chatgpt.com/c/2", "title matches don't promote the root");
+    }
+
+    #[test]
+    fn suggest_ranks_frequent_over_just_visited() {
+        let model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        let week_ago = now_secs() - 7 * 24 * 60 * 60;
+        for _ in 0..5 {
+            visit_at(&model, "https://news.example/daily", "Daily", week_ago);
+        }
+        visit_at(&model, "https://news.example/once", "Once", now_secs());
+        // "example" isn't the host's start, so no root is promoted and frecency alone decides.
+        let urls: Vec<String> = model.suggest("example", 4).unwrap().into_iter().map(|(url, _)| url).collect();
+        assert_eq!(urls, ["https://news.example/daily", "https://news.example/once"]);
     }
 
     #[test]

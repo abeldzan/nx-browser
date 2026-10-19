@@ -11,7 +11,7 @@ use browser_core::{
 };
 use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
-use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, read_manifest, store_id, Manifest};
+use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
 use gpui::{
     canvas, div, img, prelude::*, px, relative, rems, ClickEvent, Context, CursorStyle, DispatchPhase, Entity, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString,
@@ -616,6 +616,7 @@ impl BrowserWindow {
             self.blur_address = true;
             cx.notify();
             self.close_palette(cx);
+            self.close_menus();
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
             if !already {
@@ -1066,7 +1067,7 @@ impl BrowserWindow {
             let installed = model.installed_extensions().unwrap_or_default().into_iter().find(|(found, ..)| found == id);
             (installed, model.extension_stores(id).unwrap_or_default())
         };
-        let Some((_, path, source)) = installed else {
+        let Some((_, mut path, source)) = installed else {
             self.ext_meta.remove(id);
             self.engine.extensions().unload(id);
             return;
@@ -1074,6 +1075,14 @@ impl BrowserWindow {
         if source == "store" {
             if let Err(error) = patch_missing_apis(&path) {
                 eprintln!("could not add API polyfill to {id}: {error}");
+            }
+        } else if !stores.is_empty() {
+            // Stop it before its running copy is replaced.
+            self.engine.extensions().unload(id);
+            let copy = app_support_dir().join("unpacked").join(id);
+            match patch_unpacked_copy(&path, &copy) {
+                Ok(()) => path = copy,
+                Err(error) => eprintln!("could not add API polyfill to {id}: {error}"),
             }
         }
         self.ext_meta.insert(id.to_string(), read_manifest(&path).unwrap_or_default());
@@ -1150,6 +1159,9 @@ impl BrowserWindow {
         let root = app_support_dir().join("extensions");
         if let Some(record) = record.filter(|record| last && record.source == "store" && record.path.starts_with(&root)) {
             let _ = std::fs::remove_dir_all(&record.path);
+        }
+        if last {
+            let _ = std::fs::remove_dir_all(app_support_dir().join("unpacked").join(id));
         }
     }
 
@@ -1676,11 +1688,26 @@ impl BrowserWindow {
         if self.engine.attach(handle.ns_view.as_ptr()).is_ok() {
             self.attached = true;
             // Page clicks never reach GPUI, so popovers and the palette can't see them as outside presses.
-            // They close at once; refocusing waits for the tick, as raising a window mid-press could drop the click.
+            // They close at once; refocusing waits for the mouse-up, as raising a window mid-press could drop the click.
             let (wake, mut clicks) = futures::channel::mpsc::unbounded();
             self.engine.on_page_click(move || {
                 let _ = wake.unbounded_send(());
             });
+            // Shortcuts and finished page clicks run at once rather than on the next tick.
+            let (wake, mut wakes) = futures::channel::mpsc::unbounded::<()>();
+            self.engine.on_wake(move || {
+                let _ = wake.unbounded_send(());
+            });
+            cx.spawn(async move |this, cx| {
+                while wakes.next().await.is_some() {
+                    // One tick handles everything queued so far.
+                    while wakes.try_recv().is_ok() {}
+                    if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
             cx.spawn(async move |this, cx| {
                 while clicks.next().await.is_some() {
                     let closed = this.update(cx, |view, cx| {
@@ -4061,12 +4088,14 @@ impl BrowserWindow {
         let active = self.active_tab_id()?;
         let from = self.visual_frame(&active)?;
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
-        let others = self
+        let mut others = self
             .shown_tabs(&tabs)
             .into_iter()
             .filter(|tab| tab.id != active)
             .filter_map(|tab| Some((tab.id.clone(), self.visual_frame(&tab.id)?)))
             .collect::<Vec<_>>();
+        // Least to most recently focused, so going back returns to where you came from.
+        others.sort_by_key(|(id, _)| self.order.iter().position(|o| o == id));
         neighbour(from, &others, dir)
     }
 

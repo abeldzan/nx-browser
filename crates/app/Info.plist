@@ -8,7 +8,7 @@
     <key>CFBundleIconName</key><string>nxBrowser</string>
     <key>CFBundleIconFile</key><string>nxBrowser</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.3</string>
+    <key>CFBundleShortVersionString</key><string>0.1.4</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSCameraUsageDescription</key><string>Websites you allow can use your camera.</string>

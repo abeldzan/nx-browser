@@ -45,7 +45,7 @@ thread_local! {
     static KEYMAP: RefCell<HashMap<String, Shortcut>> = RefCell::new(HashMap::new());
     /// The page-first shortcut of the last key handed to a page, fired if the page reports it unhandled.
     /// shortcut: a second key pressed before the page's reply overwrites it; key the reply by event if that bites.
-    static PENDING_PAGE_FIRST: std::cell::Cell<Option<Shortcut>> = const { std::cell::Cell::new(None) };
+    static PENDING_PAGE_FIRST: std::cell::Cell<Option<(isize, Shortcut)>> = const { std::cell::Cell::new(None) };
     /// The compiled block list, once WebKit has it; `views` waits for it with each view's wanted state.
     static BLOCKLIST: RefCell<Blocklist> = RefCell::new(Blocklist::default());
     /// Camera/microphone requests waiting for the user, by `EngineEvent::Permission::request`.
@@ -521,8 +521,8 @@ define_class!(
             message: &WKScriptMessage,
         ) {
             if ns_string(&message.name()) == "nxShortcut" {
-                if let Some(shortcut) = PENDING_PAGE_FIRST.take() {
-                    let _ = self.ivars().events.borrow().send(EngineEvent::Shortcut(shortcut));
+                if let Some((window_no, shortcut)) = PENDING_PAGE_FIRST.take() {
+                    send_shortcut(window_no, shortcut);
                 }
             }
         }
@@ -802,6 +802,11 @@ impl MacEngine {
         with_window(self.window_no, |state| state.on_click = Some(Box::new(notify)));
     }
 
+    /// Runs `notify` when a shortcut arrives or a page click ends, from inside AppKit's event dispatch: it should only wake the UI.
+    pub fn on_wake(&mut self, notify: impl Fn() + Send + 'static) {
+        with_window(self.window_no, |state| state.wake = Some(Box::new(notify)));
+    }
+
     pub fn take_page_click(&mut self) -> Option<String> {
         with_window(self.window_no, |state| state.click.take()).flatten()
     }
@@ -844,7 +849,8 @@ impl MacEngine {
 
     /// Fades the page view; it is a native view, so GPUI opacity does not reach it.
     pub fn set_alpha(&mut self, tab_id: &str, alpha: f64) {
-        if let Some(live) = self.tabs.get(tab_id) {
+        // Runs every frame for every page; most frames change nothing.
+        if let Some(live) = self.tabs.get(tab_id).filter(|live| live.view.alphaValue() != alpha) {
             live.view.setAlphaValue(alpha);
         }
     }
@@ -1787,19 +1793,19 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
     let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
         let window = MainThreadMarker::new().and_then(|mtm| event_ref.window(mtm));
-        let Some(events) = window.and_then(|window| with_window(window.windowNumber(), |state| state.events.clone()).flatten()) else {
+        let Some(window_no) = window.map(|window| window.windowNumber()).filter(|&no| with_window(no, |state| state.events.is_some()) == Some(true)) else {
             return event.as_ptr();
         };
         const ESCAPE: u16 = 53;
         if event_ref.keyCode() == ESCAPE {
-            let _ = events.send(EngineEvent::Shortcut(Shortcut::Dismiss));
+            send_shortcut(window_no, Shortcut::Dismiss);
         }
         let shortcut = bound(event_ref);
         // A focused page gets these first; the key script reports them back if it ignores them.
         let to_page = shortcut.filter(|shortcut| shortcut.page_first() && page_has_focus(event_ref));
-        PENDING_PAGE_FIRST.set(to_page);
+        PENDING_PAGE_FIRST.set(to_page.map(|shortcut| (window_no, shortcut)));
         if let Some(shortcut) = shortcut.filter(|_| to_page.is_none()) {
-            let _ = events.send(EngineEvent::Shortcut(shortcut));
+            send_shortcut(window_no, shortcut);
             return std::ptr::null_mut();
         }
         event.as_ptr()
@@ -1835,6 +1841,20 @@ struct WindowState {
     on_click: Option<Box<dyn Fn() + Send>>,
     /// Where this window's shortcuts go.
     events: Option<Sender<EngineEvent>>,
+    /// Tells the UI a shortcut arrived or a page click ended, so it needn't wait for its next poll.
+    wake: Option<Box<dyn Fn() + Send>>,
+}
+
+/// Queues `shortcut` for window `window_no`'s UI and wakes it.
+fn send_shortcut(window_no: isize, shortcut: Shortcut) {
+    with_window(window_no, |state| {
+        if let Some(events) = &state.events {
+            let _ = events.send(EngineEvent::Shortcut(shortcut));
+        }
+        if let Some(wake) = &state.wake {
+            wake();
+        }
+    });
 }
 
 /// Per browser window, by `windowNumber`.
@@ -1872,6 +1892,15 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
         let Some(content) = window.contentView() else {
             return event.as_ptr();
         };
+        if event_ref.r#type() == NSEventType::LeftMouseUp {
+            // Refocusing a window waits for the press to end; then it needn't wait for the UI tick.
+            with_window(window.windowNumber(), |state| {
+                if let Some(wake) = state.wake.as_ref().filter(|_| state.click.is_some()) {
+                    wake();
+                }
+            });
+            return event.as_ptr();
+        }
         let point = content.convertPoint_fromView(event_ref.locationInWindow(), None);
         with_window(window.windowNumber(), |state| {
             // The latest click wins: a page click still waiting for the UI tick would blur an address field opened since.
@@ -1882,7 +1911,7 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
         });
         event.as_ptr()
     });
-    let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::LeftMouseDown, &block) };
+    let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::LeftMouseDown | NSEventMask::LeftMouseUp, &block) };
     std::mem::forget(block);
     monitor
 }
@@ -2121,12 +2150,13 @@ define_class!(
             let Some(binding) = usize::try_from(item.tag()).ok().and_then(|tag| SHORTCUTS.get(tag)) else {
                 return;
             };
-            let events = [app.keyWindow(), app.mainWindow()]
+            let window_no = [app.keyWindow(), app.mainWindow()]
                 .into_iter()
                 .flatten()
-                .find_map(|window| with_window(window.windowNumber(), |state| state.events.clone()).flatten());
-            if let Some(events) = events {
-                let _ = events.send(EngineEvent::Shortcut(binding.action));
+                .map(|window| window.windowNumber())
+                .find(|&no| with_window(no, |state| state.events.is_some()) == Some(true));
+            if let Some(window_no) = window_no {
+                send_shortcut(window_no, binding.action);
             }
         }
     }

@@ -608,7 +608,7 @@ impl BrowserWindow {
                 .child(row(
                     "Font",
                     Some("Used across the browser's interface. Type to search, or type any font name."),
-                    div().w(px(260.)).children(self.ui_font_picker.clone()),
+                    font_field(self.ui_font_picker.clone(), cx),
                     paint,
                 ))
                 .child(row(
@@ -769,7 +769,7 @@ impl BrowserWindow {
                 .child(row(
                     "Font",
                     Some("Installed monospace fonts. Type to search, or type any font name."),
-                    div().w(px(260.)).children(self.term_font_picker.clone()),
+                    font_field(self.term_font_picker.clone(), cx),
                     paint,
                 ))
                 .child(row(
@@ -1276,6 +1276,30 @@ pub(crate) fn measure_overlay(radius: f64, cx: &mut Context<BrowserWindow>) -> i
     .top_0()
     .left_0()
     .size_full()
+}
+
+/// A font picker whose open list is cut out of web pages; it's taller than the settings card can hold.
+fn font_field(picker: Option<gpui::Entity<gpuikit::elements::combobox::ComboboxState<String>>>, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
+    let watch = cx.entity();
+    let open = picker.clone();
+    div().w(px(260.)).relative().children(picker).child(
+        canvas(
+            move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| {
+                if open.as_ref().is_some_and(|picker| picker.read(cx).is_open()) {
+                    // shortcut: cuts the list's 480px max height below the field even when a filter shortens it; measure the popup if that gap shows.
+                    let mut list = logical(bounds);
+                    list.y += list.height;
+                    list.height = 488.;
+                    watch.update(cx, |view, _| view.overlay_rects.push((list, 8.)));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
 }
 
 fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
