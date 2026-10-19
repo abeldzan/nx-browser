@@ -110,6 +110,18 @@ impl BrowserWindow {
                             .when(done, |detail| detail.group_hover(group.clone(), |style| style.opacity(0.)))
                             .child(detail),
                     )
+                    .when(fraction.is_some(), |row| {
+                        let id = entry.id.clone();
+                        row.child(
+                            icon_button(SharedString::from(format!("stop-{}", entry.id)), Icons::cross_2())
+                                .small()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.cancel_download(&id);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(done, |row| {
                         row.child(
                             div().absolute().right(px(INSET - 10.)).opacity(0.).group_hover(group, |style| style.opacity(1.)).child(

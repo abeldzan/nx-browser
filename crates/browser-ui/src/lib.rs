@@ -54,7 +54,7 @@ pub fn run() {
         });
         model.request_show_active();
         terminal::set_prefs(&model.settings, cx);
-        // Listing fonts takes over a second; done now, the settings font list opens instantly.
+        // Listing fonts takes over a second; done now, the settings font lists open instantly.
         std::thread::spawn(|| terminal::monospace_fonts().len());
         let model: SharedModel = Arc::new(Mutex::new(model));
         update::init(model.clone(), !self_test, cx);
