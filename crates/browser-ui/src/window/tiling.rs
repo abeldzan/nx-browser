@@ -74,7 +74,7 @@ pub(super) fn neighbour(from: Frame, others: &[(String, Frame)], dir: Dir) -> Op
         a < hi && b > lo && gap(*f) > -1.0
     });
     if let Some(nearest) = beside.clone().map(|(_, f)| gap(*f)).min_by(f32::total_cmp) {
-        return beside.filter(|(_, f)| gap(*f) <= nearest + SNAP_INSET).last().map(|(id, _)| id.clone());
+        return beside.filter(|(_, f)| gap(*f) <= nearest + SNAP_INSET).next_back().map(|(id, _)| id.clone());
     }
     let centre = |f: Frame| (f.x + f.w / 2.0, f.y + f.h / 2.0);
     let (fx, fy) = centre(from);

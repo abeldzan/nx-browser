@@ -1688,11 +1688,26 @@ impl BrowserWindow {
         if self.engine.attach(handle.ns_view.as_ptr()).is_ok() {
             self.attached = true;
             // Page clicks never reach GPUI, so popovers and the palette can't see them as outside presses.
-            // They close at once; refocusing waits for the tick, as raising a window mid-press could drop the click.
+            // They close at once; refocusing waits for the mouse-up, as raising a window mid-press could drop the click.
             let (wake, mut clicks) = futures::channel::mpsc::unbounded();
             self.engine.on_page_click(move || {
                 let _ = wake.unbounded_send(());
             });
+            // Shortcuts and finished page clicks run at once rather than on the next tick.
+            let (wake, mut wakes) = futures::channel::mpsc::unbounded::<()>();
+            self.engine.on_wake(move || {
+                let _ = wake.unbounded_send(());
+            });
+            cx.spawn(async move |this, cx| {
+                while wakes.next().await.is_some() {
+                    // One tick handles everything queued so far.
+                    while wakes.try_recv().is_ok() {}
+                    if this.update(cx, |view, cx| view.tick(cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
             cx.spawn(async move |this, cx| {
                 while clicks.next().await.is_some() {
                     let closed = this.update(cx, |view, cx| {
