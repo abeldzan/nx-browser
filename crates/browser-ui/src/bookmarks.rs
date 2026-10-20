@@ -30,7 +30,7 @@ impl BrowserWindow {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.))
+                .text_size(paint.text(12.))
                 .text_color(paint.muted)
                 .child("No bookmarks yet. Press ⌘D on a page.")
         } else {
@@ -81,7 +81,7 @@ impl BrowserWindow {
             .px(px(INSET - 6.))
             .rounded(px(6.))
             .items_center()
-            .text_size(px(12.5))
+            .text_size(paint.text(12.5))
             .cursor_pointer()
             .hover(|style| style.bg(paint.secondary))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -90,7 +90,7 @@ impl BrowserWindow {
             }))
             .child(div().flex_none().child(site_icon(&bookmark.url, 16., false)))
             .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-            .child(div().flex_none().max_w(px(110.)).truncate().text_size(px(11.)).text_color(paint.muted).group_hover(group.clone(), |style| style.opacity(0.)).child(host))
+            .child(div().flex_none().max_w(px(110.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).group_hover(group.clone(), |style| style.opacity(0.)).child(host))
             // The actions take the host's place on hover.
             .child(
                 h_stack()
@@ -153,13 +153,13 @@ impl BrowserWindow {
     pub(crate) fn bookmark_editor(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let paint = paint(cx);
         let id = self.bookmark_edit.clone().and_then(|(id, _)| id);
-        let label = |text: &'static str| div().text_size(px(12.)).text_color(paint.muted).child(text);
+        let label = |text: &'static str| div().text_size(paint.text(12.)).text_color(paint.muted).child(text);
         let card = v_stack()
             .w(px(400.))
             .max_w_full()
             .gap(px(8.))
             .p(px(24.))
-            .child(div().pb(px(6.)).text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit site" } else { "Pin a site" }))
+            .child(div().pb(px(6.)).text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit site" } else { "Pin a site" }))
             .child(label("Name"))
             .child(text_field(&self.bookmark_title, cx).placeholder("Name").full_width(true))
             .child(label("Address"))

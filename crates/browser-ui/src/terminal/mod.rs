@@ -75,7 +75,8 @@ struct Prefs(Settings);
 
 impl Global for Prefs {}
 
-fn prefs(cx: &App) -> &Settings {
+/// The app's current settings, kept here for terminals and read by `paint` for the interface font size.
+pub(crate) fn prefs(cx: &App) -> &Settings {
     cx.try_global::<Prefs>().map_or_else(|| default_settings(), |prefs| &prefs.0)
 }
 

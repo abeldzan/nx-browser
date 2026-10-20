@@ -95,6 +95,8 @@ pub struct BrowserWindow {
     /// The popover a press outside it just closed, and where; that press's click on its own button keeps it closed.
     popover_dismissed: Option<(Popover, gpui::Point<Pixels>)>,
     pub(crate) history_modal: bool,
+    /// The extension whose logs are open in a modal.
+    pub(crate) ext_logs: Option<String>,
     /// Links from other apps waiting for the user to pick a profile.
     pub(crate) pending_links: Vec<String>,
     pub(crate) history_query: Entity<InputState>,
@@ -114,6 +116,8 @@ pub struct BrowserWindow {
     pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
     /// Right-click menu on a tab pill: (tab id, click position).
     pub(crate) tab_menu: Option<(String, gpui::Point<Pixels>)>,
+    /// Right-click menu on a terminal: (tab id, click position).
+    pub(crate) term_menu: Option<(String, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
@@ -214,7 +218,6 @@ pub struct BrowserWindow {
     /// In-flight search-engine completion fetch; replacing it cancels the stale one.
     suggest_task: Option<Task<()>>,
     address_bounds: Option<gpui::Bounds<Pixels>>,
-    pub(crate) compact: bool,
     reduce_motion: bool,
     /// Theme variant and accent last applied, so the global theme is only swapped on change.
     applied_theme: String,
@@ -457,9 +460,11 @@ impl BrowserWindow {
             overlay_rects: Vec::new(),
             rail_menu: None,
             tab_menu: None,
+            term_menu: None,
             popover: None,
             popover_dismissed: None,
             history_modal: false,
+            ext_logs: None,
             pending_links: Vec::new(),
             history_query,
             bookmark_edit: None,
@@ -542,7 +547,6 @@ impl BrowserWindow {
             suggestion: None,
             suggest_task: None,
             address_bounds: None,
-            compact: false,
             reduce_motion: false,
             applied_theme: String::new(),
         };
@@ -717,7 +721,9 @@ impl BrowserWindow {
             let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized)) || !self.is_front(&tab_id);
             let popup_in_front = self.openers.iter().any(|(child, opener)| opener == &tab_id && self.is_front(child));
             let mut model = self.model.lock();
-            if hidden && !popup_in_front {
+            // Audible or capturing tabs stay live so background audio and calls don't cut out.
+            let busy = self.playing.contains(&tab_id) || self.capturing.contains_key(&tab_id);
+            if hidden && !popup_in_front && !busy {
                 changed |= model.mark_suspended(&tab_id).is_ok();
             } else {
                 // Over the cap with every page on screen: candidates come back each tick, which is no change.
@@ -971,6 +977,11 @@ impl BrowserWindow {
                 if let Some(url) = self.model.lock().active_tab().map(|tab| tab.url.clone()) {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
                     self.status = "Copied page address".into();
+                }
+            }
+            Shortcut::ClearTerminal => {
+                if let Some(view) = self.active_tab_id().and_then(|id| terminal::get(&id, cx)) {
+                    view.update(cx, |view, cx| view.clear(cx));
                 }
             }
         }
@@ -1255,7 +1266,6 @@ impl BrowserWindow {
             page_font: if settings.ui_font_pages { settings.ui_font.clone() } else { String::new() },
         });
         self.engine.set_shortcuts(if self.recording.is_some() { Vec::new() } else { crate::shortcuts::keymap(&settings) });
-        self.compact = settings.compact();
         self.reduce_motion = settings.reduce_motion;
         // set_settings reset every page to the default zoom.
         let tabs = self.model.lock().tabs.iter().map(|tab| (tab.id.clone(), tab.url.clone())).collect::<Vec<_>>();
@@ -1306,7 +1316,7 @@ impl BrowserWindow {
         // The model would activate the space's first tab; focus the rest of this window, else the window on top.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let open = |id: &&String| current.contains(id) && !ids.contains(id);
-        let survivor = self.order.iter().rev().filter(open).find(|id| self.group_id(id) == group).cloned().or_else(|| {
+        let survivor = self.order.iter().rev().filter(open).find(|id| self.group_of(id) == group).cloned().or_else(|| {
             self.order
                 .iter()
                 .rev()
@@ -1345,11 +1355,11 @@ impl BrowserWindow {
     }
 
     pub(crate) fn titlebar_h(&self) -> f32 {
-        if self.compact { 30.0 } else { TITLEBAR_H }
+        TITLEBAR_H
     }
 
     fn title_h(&self) -> f64 {
-        if self.compact { 24.0 } else { TITLE_H }
+        TITLE_H
     }
 
     /// Pills and buttons leave a 3px margin above and below in the window title bar.
@@ -1425,7 +1435,7 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    /// Arrow, Enter and Escape in the address bar; keys it doesn't use go on to the input.
+    /// Arrow, Tab, Enter and Escape in the address bar; keys it doesn't use go on to the input.
     fn address_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.suggestions.len();
         match key {
@@ -1435,6 +1445,15 @@ impl BrowserWindow {
                 Some(url) => self.commit_navigation(&url, cx),
                 None => return,
             },
+            // Tab fills the picked suggestion, or the first, into the field to edit before going.
+            "tab" if count > 0 => {
+                let text = self.suggestions[self.suggestion.unwrap_or(0).min(count - 1)].0.clone();
+                self.address.update(cx, |input, cx| {
+                    input.set_content_silent(text.clone(), cx);
+                    input.set_selected_range(text.len()..text.len());
+                });
+                self.update_suggestions(text, cx);
+            }
             "escape" if count > 0 => self.suggestions.clear(),
             "escape" => self.end_address_edit(window, cx),
             _ => return,
@@ -1474,7 +1493,7 @@ impl BrowserWindow {
     /// Gives keys to the active tab's content: its web page, or its terminal on the next render.
     /// A chrome modal is open: pages are dimmed, take no clicks and must not take keys.
     fn modal_open(&self) -> bool {
-        self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty()
+        self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.ext_logs.is_some() || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty()
     }
 
     pub(crate) fn focus_active_content(&mut self) {
@@ -2043,6 +2062,15 @@ pub(crate) struct Paint {
     pub(crate) border: gpui::Hsla,
     pub(crate) accent: gpui::Hsla,
     pub(crate) accent_bg: gpui::Hsla,
+    /// The interface font size setting, in points.
+    pub(crate) font: f32,
+}
+
+impl Paint {
+    /// A text size designed at the 13pt default, scaled to the interface font size setting.
+    pub(crate) fn text(&self, size: f32) -> Pixels {
+        px(size * self.font / 13.)
+    }
 }
 
 /// Neutral macOS-style light palette (gpuikit only ships tinted light themes).
@@ -2085,6 +2113,7 @@ pub(crate) fn paint(cx: &gpui::App) -> Paint {
         border: theme.border(),
         accent: theme.accent(),
         accent_bg: theme.accent_bg(),
+        font: crate::terminal::prefs(cx).ui_font_size as f32,
     }
 }
 
@@ -2152,9 +2181,9 @@ impl Render for BrowserWindow {
             self.reorder = None;
         }
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
-        let live_ids = self.model.lock().tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        self.chrome.retain(|id, _| live_ids.iter().any(|live| live == id));
-        self.order.retain(|id| live_ids.iter().any(|live| live == id));
+        let live_ids = all_tabs.iter().map(|tab| tab.id.as_str()).collect::<HashSet<_>>();
+        self.chrome.retain(|id, _| live_ids.contains(id.as_str()));
+        self.order.retain(|id| live_ids.contains(id.as_str()));
         if self.tab_window {
             // One window filling the OS window; tabs opened any way join it.
             let group = tabs.first().map(|tab| self.group_id(&tab.id));
@@ -2186,7 +2215,10 @@ impl Render for BrowserWindow {
             }
         }
         // Read before the tree below, which locks the model again while this statement is still open.
-        let ui_font = self.model.lock().settings.ui_font.clone();
+        let (ui_font, line_height) = {
+            let settings = &self.model.lock().settings;
+            (settings.ui_font.clone(), settings.ui_line_height as f32)
+        };
         v_stack()
             .relative()
             .size_full()
@@ -2199,7 +2231,8 @@ impl Render for BrowserWindow {
             }))
             .child(div().absolute().track_focus(&self.gesture_focus))
             .text_color(colors.fg)
-            .text_size(px(13.))
+            .text_size(paint(cx).text(13.))
+            .line_height(gpui::relative(line_height))
             .when(!ui_font.is_empty(), |root| root.font_family(ui_font))
             // Inputs only ask for keys on a GPUI focus change; clicking one that already had GPUI focus while a page
             // held first responder left typing going to the page. Once the click settles, give keys to whoever GPUI focused.
@@ -2260,10 +2293,12 @@ impl Render for BrowserWindow {
                 None => root,
             })
             .when(self.history_modal, |root| root.child(self.history_modal(cx)))
+            .when_some(self.ext_logs.clone(), |root, id| root.child(self.ext_logs_modal(&id, cx)))
             .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
             .when(self.passwords.edit.is_some(), |root| root.child(self.login_editor(cx)))
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
             .when_some(self.tab_menu.clone(), |root, menu| root.child(self.tab_menu_view(menu, cx)))
+            .when_some(self.term_menu.clone(), |root, menu| root.child(self.term_menu_view(menu, cx)))
     }
 }
 
@@ -2326,7 +2361,7 @@ impl BrowserWindow {
                 .border_1()
                 .border_color(paint.border)
                 .shadow_md()
-                .text_size(px(12.))
+                .text_size(paint.text(12.))
                 .occlude()
                 .child(measure_overlay(10., cx))
                 .child(div().opacity(p).truncate().child(self.toast.0.clone())),
@@ -2363,7 +2398,7 @@ impl BrowserWindow {
                     .py(px(5.))
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .text_size(px(12.))
+                    .text_size(paint.text(12.))
                     .when(picked, |row| row.bg(paint.accent_bg))
                     .hover(|row| row.bg(paint.secondary))
                     .when(*search, |row| row.child(Icons::magnifying_glass().size(px(12.)).text_color(paint.muted)))
@@ -2404,8 +2439,8 @@ impl BrowserWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         let paint = paint(cx);
-        // Sized to match the 36px profile badges.
-        let rail_button = |id: &'static str, icon| icon_button(id, icon).box_size(rems(2.25)).icon_size(rems(1.125));
+        // Sized to match the 30px profile badges.
+        let rail_button = |id: &'static str, icon| icon_button(id, icon).box_size(rems(1.875)).icon_size(rems(1.));
         let mut profile_list = v_stack().w_full().items_center().gap(px(8.)).py(px(4.));
         let ids = profiles.iter().map(|profile| profile.id.clone()).collect::<Vec<_>>();
         let activity = self.profile_activity();
@@ -2416,7 +2451,7 @@ impl BrowserWindow {
             let dragged = RailDrag(profile.clone());
             let (grab, offset) = (self.rail_grab.clone(), self.slide_offset(&id));
             let tint = profile_tint(profile, paint);
-            let badge = profile_badge(profile, active, 36., paint)
+            let badge = profile_badge(profile, active, 30., paint)
                 .left(offset.x)
                 .top(offset.y)
                 .group(SharedString::from(format!("rail-{id}")))
@@ -2424,10 +2459,10 @@ impl BrowserWindow {
                 .child(
                     div()
                         .absolute()
-                        .left(px(-10.))
-                        .top(px(if active { 8. } else { 14. }))
+                        .left(px(-7.))
+                        .top(px(if active { 7. } else { 12. }))
                         .w(px(3.))
-                        .h(px(if active { 20. } else { 8. }))
+                        .h(px(if active { 16. } else { 6. }))
                         .rounded_r(px(3.))
                         .bg(tint)
                         .when(!active, |pill| pill.opacity(0.).group_hover(format!("rail-{id}"), |style| style.opacity(0.6))),
@@ -2465,7 +2500,7 @@ impl BrowserWindow {
             profile_list = profile_list.child(badge);
         }
         v_stack()
-            .w(px(56.))
+            .w(px(44.))
             .h_full()
             .py(px(8.))
             .items_center()
@@ -2479,7 +2514,7 @@ impl BrowserWindow {
                     scroll_area("rail-profiles").vertical().full_height(true).child(profile_list),
                 ),
             )
-            .child(div().w(px(28.)).h(px(1.)).flex_none().bg(paint.border))
+            .child(div().w(px(24.)).h(px(1.)).flex_none().bg(paint.border))
             .child(
                 v_stack()
                     .items_center()
@@ -2487,9 +2522,17 @@ impl BrowserWindow {
                     .child(rail_button("new-profile-rail", Icons::plus()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.open_new_profile(cx);
                     })))
-                    .child(rail_button("downloads-list", Icons::download()).selected(self.popover == Some(Popover::Downloads)).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                        this.toggle_popover(Popover::Downloads, event, cx);
-                    })))
+                    .child(
+                        div()
+                            .relative()
+                            .child(rail_button("downloads-list", Icons::download()).selected(self.popover == Some(Popover::Downloads)).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                this.toggle_popover(Popover::Downloads, event, cx);
+                            })))
+                            // web_downloads holds exactly the downloads still being written.
+                            .when(!self.web_downloads.is_empty(), |button| {
+                                button.child(div().absolute().top(px(4.)).right(px(4.)).size(px(6.)).rounded_full().bg(paint.accent))
+                            }),
+                    )
                     .child(rail_button("open-settings", Icons::gear()).selected(self.settings_open).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.toggle_settings(cx);
                     }))),
@@ -2858,7 +2901,7 @@ impl BrowserWindow {
         let others = self
             .chrome
             .iter()
-            .filter(|(id, _)| self.group_id(id) != group && current.contains(id))
+            .filter(|(id, _)| self.group_of(id) != group && current.contains(id))
             // Partners move with the border, so they must not attract it back to where they were.
             .filter(|(id, entry)| **id != gesture.tab_id && !entry.minimized && !entry.maximized)
             .filter(|(id, _)| !gesture.partners.iter().any(|(partner, _)| partner == *id))
@@ -2924,7 +2967,7 @@ impl BrowserWindow {
                     // Hovering a profile opens it, taking the window along into its open space.
                     if let Some(profile) = profile.filter(|profile| *profile != active) {
                         let group = self.group_id(&gesture.tab_id);
-                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
                         let space = {
                             let model = self.model.lock();
                             let mut spaces = model.sessions.iter().filter(|session| session.profile_id == profile);
@@ -2946,7 +2989,7 @@ impl BrowserWindow {
                     // Hovering a space opens it, taking the window along to be dragged down into it.
                     if let Some(space) = space.filter(|space| *space != active) {
                         let group = self.group_id(&gesture.tab_id);
-                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
                         self.with_model(|model| {
                             let _ = model.move_tabs_to_session(&ids, &space);
                             let _ = model.switch_session(&space);
@@ -2963,7 +3006,7 @@ impl BrowserWindow {
                         .order
                         .iter()
                         .rev()
-                        .filter(|other| current.contains(other) && self.group_id(other) != group && self.is_front(other))
+                        .filter(|other| current.contains(other) && self.group_of(other) != group && self.is_front(other))
                         .find(|other| {
                             self.chrome.get(*other).is_some_and(|entry| {
                                 entry.snap.is_some() && !entry.minimized && !entry.maximized && entry.frame.is_some_and(inside)
@@ -3025,7 +3068,7 @@ impl BrowserWindow {
         if let (Some(at), GestureKind::Move, None) = (out, gesture.kind, &self.model.detached) {
             let snap = gesture.from.map(|(snap, ..)| snap);
             let group = self.group_id(&gesture.tab_id);
-            let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+            let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
             for id in ids {
                 if let Some(entry) = self.chrome.get_mut(&id) {
                     entry.home = Some((gesture.start, snap, gesture.restore));
@@ -3236,7 +3279,7 @@ impl BrowserWindow {
         // Tiled windows need none of this; their tree moves the border.
         let partners = if snapped {
             let group = self.group_id(id);
-            self.snapped_windows().into_iter().filter(|(other, _)| self.group_id(other) != group).collect()
+            self.snapped_windows().into_iter().filter(|(other, _)| self.group_of(other) != group).collect()
         } else {
             Vec::new()
         };
@@ -3266,7 +3309,7 @@ impl BrowserWindow {
     ) -> gpui::Div {
         let shown = self.shown_tabs(tabs);
         let watch = entity.clone();
-        let paint_watch = entity.clone();
+        let paint_watch = entity;
         let mut stage = div()
             .relative()
             .flex_1()
@@ -3306,7 +3349,7 @@ impl BrowserWindow {
                 continue;
             }
             let group = self.group_id(&tab.id);
-            let members = tabs.iter().filter(|other| self.group_id(&other.id) == group).collect::<Vec<_>>();
+            let members = tabs.iter().filter(|other| self.group_of(&other.id) == group).collect::<Vec<_>>();
             if let Some(window) = self.floating_window(tab, &members, cx) {
                 stage = stage.child(window);
             }
@@ -3321,7 +3364,7 @@ impl BrowserWindow {
         let others = self
             .chrome
             .iter()
-            .filter(|(other, entry)| current.contains(other) && self.group_id(other) != group && self.is_front(other) && !entry.minimized && !entry.maximized)
+            .filter(|(other, entry)| current.contains(other) && self.group_of(other) != group && self.is_front(other) && !entry.minimized && !entry.maximized)
             .filter_map(|(_, entry)| Some((entry.snap?, entry.frame?)))
             .collect::<Vec<_>>();
         fit_snap(snap, sw, sh, &others)
@@ -3464,6 +3507,15 @@ impl BrowserWindow {
                                 this.focus_window(&id, cx);
                             })
                         })
+                        // Only right clicks the program didn't take reach here; see TerminalView's handler.
+                        .on_mouse_down(MouseButton::Right, {
+                            let id = tab.id.clone();
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.close_menus();
+                                this.term_menu = Some((id.clone(), event.position));
+                                cx.notify();
+                            })
+                        })
                         .flex_1()
                         .min_h(px(0.))
                         .mx(px(PAGE_INSET as f32))
@@ -3590,7 +3642,7 @@ impl BrowserWindow {
     /// Small centred tab pills; clicking the shown tab widens it into the address field.
     fn compact_tabs(&self, front: &str, members: &[&browser_core::Tab], cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
-        let mut row = h_stack().min_w(px(0.)).h_full().items_center().gap(px(2.)).text_size(px(12.));
+        let mut row = h_stack().min_w(px(0.)).h_full().items_center().gap(px(2.)).text_size(paint.text(12.));
         let ids = members.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         for id in shown_row(self.reorder.as_ref(), &self.group_id(front), &ids) {
             let Some(tab) = members.iter().find(|tab| tab.id == id) else {
@@ -3726,7 +3778,7 @@ impl BrowserWindow {
                     this.begin_move(&move_id, event.position, window, cx);
                 }))
                 .child(extension_icon(&meta.name, meta.icon.clone(), 16.))
-                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.)).child(meta.name.clone()))
+                .child(div().flex_1().min_w(px(0.)).truncate().text_size(paint.text(12.)).child(meta.name.clone()))
                 .child(self.hit_guard(format!("tools-guard-{tab_id}"), close, cx)),
         )
     }
@@ -3758,7 +3810,7 @@ impl BrowserWindow {
             .overflow_hidden()
             .bg(paint.secondary)
             .border_1()
-            .text_size(px(12.));
+            .text_size(paint.text(12.));
         if editing {
             return self.address_field(pill.border_color(paint.accent.opacity(0.6)), 12., cx);
         }
@@ -3799,6 +3851,7 @@ impl BrowserWindow {
             .capture_action(cx.listener(|this, _: &bindings::Down, window, cx| this.address_key("down", window, cx)))
             .capture_action(cx.listener(|this, _: &bindings::Up, window, cx| this.address_key("up", window, cx)))
             .capture_action(cx.listener(|this, _: &bindings::Enter, window, cx| this.address_key("enter", window, cx)))
+            .capture_action(cx.listener(|this, _: &bindings::Tab, window, cx| this.address_key("tab", window, cx)))
             .capture_action(cx.listener(|this, _: &bindings::Escape, window, cx| this.address_key("escape", window, cx)))
             .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.address_bounds = Some(bounds)), |_, _, _, _| {}).absolute().size_full())
             .child(
@@ -3807,7 +3860,7 @@ impl BrowserWindow {
                     .cursor_color(paint.accent)
                     .flex_1()
                     .h_full()
-                    .text_size(px(size))
+                    .text_size(paint.text(size))
                     .text_color(paint.fg),
             )
     }
@@ -3836,7 +3889,7 @@ impl BrowserWindow {
                 pill.id(SharedString::from(format!("home-field-{id}")))
                     .border_color(paint.border)
                     .cursor_text()
-                    .text_size(px(16.))
+                    .text_size(paint.text(16.))
                     .text_color(paint.muted)
                     .child("Search or enter an address")
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -3896,7 +3949,7 @@ impl BrowserWindow {
                 .cursor_pointer()
                 .hover(|tile| tile.bg(paint.secondary))
                 .child(site_icon(url, 32., false))
-                .child(div().w_full().text_size(px(11.)).text_center().truncate().child(name))
+                .child(div().w_full().text_size(paint.text(11.)).text_center().truncate().child(name))
                 .child(h_stack().absolute().top(px(2.)).right(px(2.)).gap(px(2.)).opacity(0.).group_hover(SharedString::from(key), |style| style.opacity(1.)).child(actions))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.focus_window(&window_id, cx);
@@ -3927,7 +3980,7 @@ impl BrowserWindow {
                 .text_color(paint.muted)
                 .hover(|tile| tile.bg(paint.secondary))
                 .child(div().size(px(32.)).flex().items_center().justify_center().rounded_full().bg(paint.secondary).child(Icons::plus().size(px(14.))))
-                .child(div().text_size(px(11.)).child("Add"))
+                .child(div().text_size(paint.text(11.)).child("Add"))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_bookmark_editor(None, cx))),
         );
         column = column.child(v_stack().gap(px(6.)).child(self.section_label("Pinned", paint)).child(grid));
@@ -3958,7 +4011,7 @@ impl BrowserWindow {
                     .border_1()
                     .border_color(paint.border)
                     .bg(paint.secondary)
-                    .text_size(px(12.))
+                    .text_size(paint.text(12.))
                     .cursor_pointer()
                     .hover(|chip| chip.border_color(paint.accent.opacity(0.5)))
                     .child(site_icon(&bookmark.url, 14., false))
@@ -3978,7 +4031,7 @@ impl BrowserWindow {
                     .flex()
                     .items_center()
                     .rounded(px(8.))
-                    .text_size(px(12.))
+                    .text_size(paint.text(12.))
                     .text_color(paint.muted)
                     .cursor_pointer()
                     .hover(|chip| chip.bg(paint.secondary))
@@ -4027,8 +4080,7 @@ impl BrowserWindow {
         let peek = self.chrome.get(tab_id).is_some_and(|chrome| chrome.peek);
         let bookmarked = {
             let model = self.model.lock();
-            let url = model.tabs.iter().find(|tab| tab.id == tab_id).map(|tab| tab.url.clone());
-            url.is_some_and(|url| model.bookmarks().unwrap_or_default().iter().any(|bookmark| bookmark.url == url))
+            model.tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| model.is_bookmarked(&tab.url).unwrap_or_default())
         };
         h_stack()
             .items_center()
@@ -4079,7 +4131,7 @@ impl BrowserWindow {
     /// Closes every tab of the window holding `id`.
     fn close_window(&mut self, id: &str, cx: &mut Context<Self>) {
         let group = self.group_id(id);
-        let members = self.chrome.keys().filter(|other| self.group_id(other) == group).cloned().collect::<Vec<_>>();
+        let members = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
         self.close_tabs(members, cx);
     }
 
@@ -4189,7 +4241,7 @@ impl BrowserWindow {
                     .gap(px(6.))
                     .items_center()
                     .rounded(px(6.))
-                    .text_size(px(12.))
+                    .text_size(paint.text(12.))
                     .cursor_pointer()
                     .text_color(if active { paint.fg } else { paint.muted })
                     .when(active, |chip| chip.bg(paint.secondary))
@@ -4206,7 +4258,7 @@ impl BrowserWindow {
                     .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.space_chips.push((chip_id, bounds))), |_, _, _, _| {}).absolute().size_full())
                     .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
                     .map(|chip| match self.space_rename.as_deref() == Some(session.id.as_str()) {
-                        true => chip.child(input(&self.space_input, cx).w(px(96.)).text_size(px(12.)).text_color(paint.fg)),
+                        true => chip.child(input(&self.space_input, cx).w(px(96.)).text_size(paint.text(12.)).text_color(paint.fg)),
                         false => chip.child(session.name.clone()),
                     })
                     .when(closable, |chip| {
@@ -4346,7 +4398,7 @@ impl BrowserWindow {
                 .rounded(px(6.))
                 .bg(paint.accent)
                 .text_color(paint.bg)
-                .text_size(px(12.))
+                .text_size(paint.text(12.))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .cursor_pointer()
                 .hover(|style| style.opacity(0.88))
@@ -4611,7 +4663,7 @@ impl BrowserWindow {
     /// Moves the window holding `id` into a new space and opens that space in an OS window at `at` (screen point).
     fn detach_window(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
-        let ids = self.chrome.keys().filter(|other| self.group_id(other) == group).cloned().collect::<Vec<_>>();
+        let ids = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
         let Ok(space) = self.with_model(|model| model.create_empty_session()) else {
             return;
         };
@@ -4662,7 +4714,7 @@ impl BrowserWindow {
     pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
-        chrome.window = Some(group.clone());
+        chrome.window = Some(group);
         let created = self.with_model(|model| model.create_tab_beside(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string), id));
         let Ok(new) = created else {
             return;
@@ -4718,7 +4770,7 @@ impl BrowserWindow {
     /// Moves a tab into the window holding `target`, in front, sharing its frame.
     fn move_tab_to_window(&mut self, id: &str, target: &str, cx: &mut Context<Self>) {
         let group = self.group_id(target);
-        if self.group_id(id) == group {
+        if self.group_of(id) == group {
             return;
         }
         let mut chrome = self.chrome.get(target).cloned().unwrap_or_default();
@@ -4787,7 +4839,7 @@ impl BrowserWindow {
         let (id, frame) = self.carried()?;
         let paint = paint(cx);
         let group = self.group_id(&id);
-        let members = tabs.iter().filter(|tab| self.group_id(&tab.id) == group).collect::<Vec<_>>();
+        let members = tabs.iter().filter(|tab| self.group_of(&tab.id) == group).collect::<Vec<_>>();
         let title = (self.title_h() as f32).min(frame.h * 0.2);
         Some(
             div()
@@ -4881,7 +4933,7 @@ impl BrowserWindow {
         groups
             .into_iter()
             .map(|group| {
-                let ids = tabs.iter().filter(|id| self.group_id(id) == group).cloned().collect();
+                let ids = tabs.iter().filter(|id| self.group_of(id) == group).cloned().collect();
                 (group, ids)
             })
             .collect()
@@ -4953,7 +5005,7 @@ impl BrowserWindow {
     /// A tab dropped on a window lands where the drag showed it in that window's tabs.
     fn drop_tab_on(&mut self, id: &str, target: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(target);
-        let own = self.group_id(id) == group;
+        let own = self.group_of(id) == group;
         if own && self.tab_press.take().is_some_and(|press| (at - press).magnitude() < TAP_SLOP) {
             self.reorder = None;
             self.click_tab(id, cx);
@@ -5028,7 +5080,7 @@ impl BrowserWindow {
                 .bg(paint.secondary)
                 .border_1()
                 .border_color(paint.accent)
-                .text_size(px(12.))
+                .text_size(paint.text(12.))
                 .text_color(paint.fg)
                 .child(measure_overlay(8.0, cx))
                 .child(favicon(tab, false))
@@ -5067,18 +5119,23 @@ impl BrowserWindow {
 
     /// The window a tab belongs to; a tab never added to another window is its own.
     fn group_id(&self, id: &str) -> String {
-        self.chrome.get(id).and_then(|chrome| chrome.window.clone()).unwrap_or_else(|| id.to_string())
+        self.group_of(id).to_string()
+    }
+
+    /// `group_id` without the allocation, for the per-render comparisons over every tab.
+    fn group_of<'a>(&'a self, id: &'a str) -> &'a str {
+        self.chrome.get(id).and_then(|chrome| chrome.window.as_deref()).unwrap_or(id)
     }
 
     pub(crate) fn group_len(&self, id: &str) -> usize {
-        let group = self.group_id(id);
-        self.chrome.keys().filter(|other| self.group_id(other) == group).count()
+        let group = self.group_of(id);
+        self.chrome.keys().filter(|other| self.group_of(other) == group).count()
     }
 
     /// Whether this tab is the one its window shows: the group member raised most recently.
     pub(crate) fn is_front(&self, id: &str) -> bool {
-        let group = self.group_id(id);
-        raised_last(&self.order, id, |other| self.group_id(other) == group)
+        let group = self.group_of(id);
+        raised_last(&self.order, id, |other| self.group_of(other) == group)
     }
 
     /// Copies each window's frame and state from its shown tab to the hidden ones, so whichever is raised next sits in place.
@@ -5171,7 +5228,7 @@ impl BrowserWindow {
                     text_field(&self.find_input, cx)
                         .placeholder("Find in page")
                         .full_width(true)
-                        .when(typed, |field| field.suffix(Adornment::element(div().text_size(px(11.)).text_color(paint.muted).child(tally)))),
+                        .when(typed, |field| field.suffix(Adornment::element(div().text_size(paint.text(11.)).text_color(paint.muted).child(tally)))),
                 ),
             )
             .child(div().w(px(4.)))
@@ -5216,7 +5273,7 @@ impl BrowserWindow {
                 .border_1()
                 .border_color(paint.border)
                 .shadow_md()
-                .text_size(px(13.))
+                .text_size(paint.text(13.))
                 .occlude()
                 .child(measure_overlay(10., cx))
                 .child(format!("{host} wants to use {what}."))
@@ -5233,7 +5290,7 @@ impl BrowserWindow {
     fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
         div()
             .mt(px(4.))
-            .text_size(px(12.))
+            .text_size(paint.text(12.))
             .text_color(paint.muted)
             .child(label)
     }
@@ -5980,7 +6037,7 @@ struct SpaceDragPreview(SharedString, Paint);
 
 impl Render for SpaceDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().px(px(8.)).py(px(3.)).rounded(px(6.)).text_size(px(12.)).bg(self.1.secondary).text_color(self.1.fg).child(self.0.clone())
+        div().px(px(8.)).py(px(3.)).rounded(px(6.)).text_size(self.1.text(12.)).bg(self.1.secondary).text_color(self.1.fg).child(self.0.clone())
     }
 }
 
@@ -6098,7 +6155,7 @@ struct RailDragPreview(browser_core::Profile, Paint);
 
 impl Render for RailDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        profile_badge(&self.0, false, 36., self.1).opacity(0.85)
+        profile_badge(&self.0, false, 30., self.1).opacity(0.85)
     }
 }
 

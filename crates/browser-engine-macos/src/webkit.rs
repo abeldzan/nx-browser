@@ -184,8 +184,11 @@ struct DelegateIvars {
     extensions: TabNotifier,
     /// The error page's "visit anyway" link: its one-time token, the URL it opens, and the host whose certificate
     /// it accepts (none when it falls back to http). The token keeps other pages from following the link.
-    proceed: RefCell<Option<(String, Retained<NSURL>, Option<String>)>>,
+    proceed: RefCell<Option<Proceed>>,
 }
+
+/// The "visit anyway" link's token, the URL it opens, and the host whose certificate it accepts.
+type Proceed = (String, Retained<NSURL>, Option<String>);
 
 /// Hosts whose untrusted certificate the user accepted this run, in any window; never saved, as in Safari.
 static TRUSTED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1274,7 +1277,10 @@ impl WebEngine for MacEngine {
             return;
         };
         let Some(bounds) = bounds else {
-            live.view.setHidden(true);
+            // Render hides every background tab each frame; most already are.
+            if !live.view.isHidden() {
+                live.view.setHidden(true);
+            }
             return;
         };
         let Some(content) = self.content.clone() else {
@@ -2121,7 +2127,7 @@ fn reply_json(reply: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>, j
 /// The menu bar's shortcut menus, as `SHORTCUTS` ids; "-" is a separator.
 const MENUS: &[(&str, &[&str])] = &[
     ("File", &["new_tab", "new_terminal", "new_space", "-", "close_tab", "close_window", "reopen_tab", "-", "print"]),
-    ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "command_palette", "-", "inspect"]),
+    ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "clear_terminal", "command_palette", "-", "inspect"]),
     ("History", &["back", "forward", "-", "history", "downloads"]),
     ("Bookmarks", &["bookmark", "bookmarks"]),
     ("Window", &[

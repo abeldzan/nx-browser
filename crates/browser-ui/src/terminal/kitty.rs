@@ -42,7 +42,20 @@ impl Splitter {
     pub fn split(&mut self, input: &[u8]) -> Vec<Piece> {
         let mut out = Vec::new();
         let mut text = Vec::new();
-        for &byte in input {
+        let mut rest = input;
+        while let Some((&byte, tail)) = rest.split_first() {
+            if byte != 0x1b && matches!(self.state, State::Text | State::Apc) {
+                // Text and image payloads are most of the stream: copy each run up to the next escape at once.
+                let len = rest.iter().position(|&b| b == 0x1b).unwrap_or(rest.len());
+                if self.state == State::Text {
+                    text.extend_from_slice(&rest[..len]);
+                } else {
+                    self.push_apc(&rest[..len]);
+                }
+                rest = &rest[len..];
+                continue;
+            }
+            rest = tail;
             match self.state {
                 State::Text if byte == 0x1b => self.state = State::Esc,
                 State::Text => text.push(byte),

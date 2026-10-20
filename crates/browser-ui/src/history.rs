@@ -19,7 +19,7 @@ const LABEL_H: f32 = 24.;
 const FOOTER_H: f32 = 32.;
 
 /// Title on the left, actions on the right, one hairline under it.
-pub(crate) fn popover_header(title: &'static str, actions: gpui::Div, paint: Paint) -> gpui::Div {
+pub(crate) fn popover_header(title: impl Into<SharedString>, actions: gpui::Div, paint: Paint) -> gpui::Div {
     h_stack()
         .flex_none()
         .w_full()
@@ -30,8 +30,8 @@ pub(crate) fn popover_header(title: &'static str, actions: gpui::Div, paint: Pai
         .justify_between()
         .border_b_1()
         .border_color(paint.border)
-        .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(title))
-        .child(actions.items_center().gap(px(2.)))
+        .child(div().text_size(paint.text(13.)).font_weight(FontWeight::SEMIBOLD).truncate().child(title.into()))
+        .child(actions.flex_none().items_center().gap(px(2.)))
 }
 
 /// A small text action for popover headers and footers.
@@ -41,7 +41,7 @@ pub(crate) fn text_action(id: &'static str, label: &'static str, paint: Paint) -
         .px(px(6.))
         .py(px(2.))
         .rounded(px(5.))
-        .text_size(px(12.))
+        .text_size(paint.text(12.))
         .text_color(paint.muted)
         .cursor_pointer()
         .hover(|style| style.bg(paint.secondary).text_color(paint.fg))
@@ -149,7 +149,7 @@ impl BrowserWindow {
     fn history_groups(&self, entries: &[HistoryEntry], empty: &'static str, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         if entries.is_empty() {
-            return div().w_full().h(px(56.)).flex().items_center().justify_center().text_size(px(12.)).text_color(paint.muted).child(empty);
+            return div().w_full().h(px(56.)).flex().items_center().justify_center().text_size(paint.text(12.)).text_color(paint.muted).child(empty);
         }
         // Rows are inset by 6px so their hover fill sits inside the popover's edges, with text still on the 12px line.
         let mut column = v_stack().w_full().px(px(6.)).pb(px(8.));
@@ -164,7 +164,7 @@ impl BrowserWindow {
                         .flex()
                         .items_end()
                         .pb(px(4.))
-                        .text_size(px(11.))
+                        .text_size(paint.text(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(paint.muted)
                         .child(label.clone()),
@@ -188,14 +188,14 @@ impl BrowserWindow {
             .px(px(INSET - 6.))
             .rounded(px(6.))
             .items_center()
-            .text_size(px(12.5))
+            .text_size(paint.text(12.5))
             .cursor_pointer()
             .hover(|style| style.bg(paint.secondary))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_history_url(&url, cx)))
             .child(div().flex_none().child(site_icon(&entry.url, 16., false)))
             .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-            .child(div().flex_none().max_w(px(110.)).truncate().text_size(px(11.)).text_color(paint.muted).child(host))
-            .child(h_stack().flex_none().w(px(52.)).justify_end().text_size(px(11.)).text_color(paint.muted).child(clock_label(entry.visited_at)))
+            .child(div().flex_none().max_w(px(110.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).child(host))
+            .child(h_stack().flex_none().w(px(52.)).justify_end().text_size(paint.text(11.)).text_color(paint.muted).child(clock_label(entry.visited_at)))
     }
 }
 

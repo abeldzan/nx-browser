@@ -85,7 +85,7 @@ impl SettingsSection {
             Self::Profiles => "new profile icon color rename delete switch export import backup",
             Self::General => "on startup restore session new tab page home focus windows hover click default browser links other apps profile",
             Self::Shortcuts => "keyboard keys reset",
-            Self::Appearance => "theme dark light system font typeface page zoom accent color density compact reduce motion site zoom",
+            Self::Appearance => "theme dark light system font typeface page zoom accent color size line height reduce motion site zoom",
             Self::Search => "address bar google duckduckgo",
             Self::Privacy => "save browsing history https ads trackers block pop-ups popups fraudulent warnings clear cookies site data permissions",
             Self::Passwords => "offer save suggest autofill logins vault",
@@ -198,7 +198,7 @@ impl BrowserWindow {
             .max_w_full()
             .gap(px(14.))
             .p(px(24.))
-            .child(title("New profile"))
+            .child(title("New profile", paint))
             .child(div().text_color(paint.muted).child("Each profile keeps its own tabs, history, cookies and site data."))
             .child(
                 h_stack()
@@ -254,7 +254,7 @@ impl BrowserWindow {
             .max_w_full()
             .gap(px(10.))
             .p(px(24.))
-            .child(title(format!("Delete “{name}”?")))
+            .child(title(format!("Delete “{name}”?"), paint))
             .child(div().text_color(paint.muted).child(
                 "Its tabs, sessions, history, bookmarks, cookies and site data will be removed. This can't be undone.",
             ))
@@ -314,7 +314,7 @@ impl BrowserWindow {
             .max_w_full()
             .gap(px(10.))
             .p(px(24.))
-            .child(title(heading))
+            .child(title(heading, paint))
             .child(div().text_color(paint.muted).truncate().child(self.pending_links.first().cloned().unwrap_or_default()))
             .child(list);
         self.modal_shell("link-profile-modal", card, |this, cx| {
@@ -388,6 +388,27 @@ impl BrowserWindow {
         menu_card("rail-menu", position, rows, cx)
     }
 
+    /// Right-click menu on a terminal's screen.
+    pub(crate) fn term_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+        let view = crate::terminal::get(&id, cx);
+        let selected = view.as_ref().is_some_and(|view| view.read(cx).has_selection());
+        let on = |run: fn(&mut crate::terminal::TerminalView, &mut Context<crate::terminal::TerminalView>)| {
+            let view = view.clone();
+            move |_: &mut Self, cx: &mut Context<Self>| {
+                if let Some(view) = &view {
+                    view.update(cx, run);
+                }
+            }
+        };
+        let rows = vec![
+            menu_item("Copy", selected, false, on(|view, cx| view.copy(cx)), cx),
+            menu_item("Paste", true, false, on(|view, cx| view.paste(cx)), cx),
+            menu_divider(cx),
+            menu_item("Clear", true, false, on(|view, cx| view.clear(cx)), cx),
+        ];
+        menu_card("term-menu", position, rows, cx)
+    }
+
     /// Right-click menu on a tab pill; "other" and "to the right" stay within the tab's window.
     pub(crate) fn tab_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
         let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
@@ -442,6 +463,7 @@ impl BrowserWindow {
     pub(crate) fn close_menus(&mut self) {
         self.rail_menu = None;
         self.tab_menu = None;
+        self.term_menu = None;
     }
 
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
@@ -472,7 +494,7 @@ impl BrowserWindow {
             .border_r_1()
             .border_color(paint.border)
             .child(div().pb(px(6.)).child(text_field(&self.settings_query, cx).placeholder("Search").full_width(true)))
-            .when(shown.is_empty(), |nav| nav.child(div().px(px(10.)).py(px(6.)).text_size(px(13.)).text_color(paint.muted).child("No matches")));
+            .when(shown.is_empty(), |nav| nav.child(div().px(px(10.)).py(px(6.)).text_size(paint.text(13.)).text_color(paint.muted).child("No matches")));
         for section in shown {
             let selected = current == Some(section);
             nav = nav.child(
@@ -482,7 +504,7 @@ impl BrowserWindow {
                     .px(px(10.))
                     .flex()
                     .items_center()
-                    .text_size(px(13.))
+                    .text_size(paint.text(13.))
                     .rounded(px(6.))
                     .cursor_pointer()
                     .bg(if selected { paint.accent_bg } else { gpui::transparent_black() })
@@ -510,7 +532,7 @@ impl BrowserWindow {
                     .items_center()
                     .border_b_1()
                     .border_color(paint.border)
-                    .child(title("Settings"))
+                    .child(title("Settings", paint))
                     .child(icon_button("settings-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx),
                     ))),
             )
@@ -531,7 +553,7 @@ impl BrowserWindow {
                         .py(px(8.))
                         .border_t_1()
                         .border_color(paint.border)
-                        .text_size(px(12.))
+                        .text_size(paint.text(12.))
                         .text_color(paint.muted)
                         .child(note),
                 )
@@ -544,7 +566,7 @@ impl BrowserWindow {
         let page = v_stack()
             .w_full()
             .gap(px(4.))
-            .child(div().pb(px(8.)).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(section.label()));
+            .child(div().pb(px(8.)).text_size(paint.text(17.)).font_weight(FontWeight::SEMIBOLD).child(section.label()));
         match section {
             SettingsSection::Profiles => page.child(self.profiles_settings(paint, cx)),
             SettingsSection::General => page
@@ -618,6 +640,30 @@ impl BrowserWindow {
                     paint,
                 ))
                 .child(row(
+                    "Font size",
+                    Some("Size of the browser's interface text."),
+                    stepper(
+                        "ui-size",
+                        format!("{:.0} pt", settings.ui_font_size),
+                        |s| s.ui_font_size = (s.ui_font_size - 1.0).max(10.0),
+                        |s| s.ui_font_size = (s.ui_font_size + 1.0).min(18.0),
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
+                    "Line height",
+                    Some("Line height as a multiple of the font size."),
+                    stepper(
+                        "ui-line",
+                        format!("{:.2}", settings.ui_line_height),
+                        |s| s.ui_line_height = ((s.ui_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
+                        |s| s.ui_line_height = ((s.ui_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
+                        cx,
+                    ),
+                    paint,
+                ))
+                .child(row(
                     "Page zoom",
                     Some("Default zoom for web pages."),
                     stepper(
@@ -630,19 +676,6 @@ impl BrowserWindow {
                     paint,
                 ))
                 .child(row("Accent color", Some("Highlights, focus rings and the active window border."), self.accent_picker(&settings.accent, paint, cx), paint))
-                .child(row(
-                    "Density",
-                    Some("Height of the title bar and window bars."),
-                    choice(
-                        "density",
-                        vec![("Comfortable", "comfortable".to_string()), ("Compact", "compact".into())],
-                        settings.density.clone(),
-                        |s, v| s.density = v,
-                        paint,
-                        cx,
-                    ),
-                    paint,
-                ))
                 .child(row(
                     "Reduce motion",
                     Some("Panels, windows and messages appear without animating."),
@@ -928,7 +961,7 @@ impl BrowserWindow {
                     .child(profile_badge(profile, is_active, 28., paint))
                     .child(div().flex_1().child(profile.name.clone()))
                     .child(if is_active {
-                        div().px(px(8.)).text_size(px(11.)).text_color(paint.muted).child("Active")
+                        div().px(px(8.)).text_size(paint.text(11.)).text_color(paint.muted).child("Active")
                     } else {
                         // Its own click must not also expand the row.
                         div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
@@ -992,7 +1025,7 @@ impl BrowserWindow {
                 h_stack()
                     .justify_between()
                     .items_center()
-                    .child(div().text_size(px(12.)).text_color(paint.muted).child("Click a profile to edit it."))
+                    .child(div().text_size(paint.text(12.)).text_color(paint.muted).child("Click a profile to edit it."))
                     .child(action_button("settings-new-profile", "New profile…", Kind::Primary, true, cx, |this, cx| {
                         this.open_new_profile(cx);
                     })),
@@ -1101,7 +1134,7 @@ impl BrowserWindow {
                         v_stack()
                             .flex_1()
                             .child(origin.clone())
-                            .child(div().text_size(px(11.)).text_color(paint.muted).child(format!("{kind}: {decision}"))),
+                            .child(div().text_size(paint.text(11.)).text_color(paint.muted).child(format!("{kind}: {decision}"))),
                     )
                     .children(actions),
             );
@@ -1111,11 +1144,11 @@ impl BrowserWindow {
 }
 
 pub(crate) fn heading(label: &'static str, paint: Paint) -> gpui::Div {
-    div().pt(px(14.)).pb(px(4.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(label)
+    div().pt(px(14.)).pb(px(4.)).text_size(paint.text(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(label)
 }
 
-pub(crate) fn title(text: impl Into<SharedString>) -> gpui::Div {
-    div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(text.into())
+pub(crate) fn title(text: impl Into<SharedString>, paint: Paint) -> gpui::Div {
+    div().text_size(paint.text(17.)).font_weight(FontWeight::SEMIBOLD).child(text.into())
 }
 
 pub(crate) fn row(title: &'static str, detail: Option<&str>, control: impl IntoElement, paint: Paint) -> gpui::Div {
@@ -1134,7 +1167,7 @@ pub(crate) fn row(title: &'static str, detail: Option<&str>, control: impl IntoE
                 .gap(px(3.))
                 .child(title)
                 .when_some(detail.map(str::to_string), |column, detail| {
-                    column.child(div().text_size(px(11.)).text_color(paint.muted).child(detail))
+                    column.child(div().text_size(paint.text(11.)).text_color(paint.muted).child(detail))
                 }),
         )
         .child(control)

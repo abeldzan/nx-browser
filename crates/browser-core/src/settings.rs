@@ -36,10 +36,12 @@ pub struct Settings {
     /// `#rrggbb`; empty means the theme's own accent.
     pub accent: String,
     pub reduce_motion: bool,
-    /// "comfortable" or "compact".
-    pub density: String,
     /// Font family for the browser's own UI; empty means the system font.
     pub ui_font: String,
+    /// Base size of the browser's own text, in points; smaller and larger labels scale with it.
+    pub ui_font_size: f64,
+    /// Line height of the browser's own text, as a multiple of the font size.
+    pub ui_line_height: f64,
     /// Pages that set no font of their own use `ui_font`.
     pub ui_font_pages: bool,
     /// Page zoom per host, for hosts zoomed away from `page_zoom`.
@@ -95,8 +97,9 @@ impl Default for Settings {
             inspector: true,
             accent: String::new(),
             reduce_motion: false,
-            density: "comfortable".into(),
             ui_font: String::new(),
+            ui_font_size: 13.0,
+            ui_line_height: 1.6,
             ui_font_pages: false,
             site_zoom: BTreeMap::new(),
             detached_spaces: Vec::new(),
@@ -141,10 +144,6 @@ impl Settings {
         self.site_zoom.get(host).copied().unwrap_or(self.page_zoom)
     }
 
-    pub fn compact(&self) -> bool {
-        self.density == "compact"
-    }
-
     pub fn new_tab_url(&self) -> String {
         let home = self.home_page.trim();
         if home.is_empty() { "nxbrowser://home".into() } else { crate::normalize_url(home, self.search_template(), self.https_only) }
@@ -161,7 +160,7 @@ mod tests {
         assert_eq!(parsed.search_engine, "Google");
         assert_eq!(parsed.max_live_tabs, Settings::default().max_live_tabs);
         assert!(parsed.search_template().starts_with("https://www.google.com/"));
-        assert!(!parsed.compact() && !parsed.reduce_motion && parsed.accent.is_empty());
+        assert!(parsed.ui_font_size == 13.0 && !parsed.reduce_motion && parsed.accent.is_empty());
         assert!(parsed.ui_font.is_empty() && !parsed.ui_font_pages);
         assert_eq!(parsed.zoom_for("example.com"), parsed.page_zoom);
         assert_eq!((parsed.terminal_font.as_str(), parsed.terminal_scrollback), ("Menlo", 10_000));

@@ -1,6 +1,7 @@
 //! The local shell behind a terminal tab (adapted from kubenx's local_shell).
 
-use futures::channel::mpsc::{unbounded, UnboundedReceiver};
+use futures::channel::mpsc::{channel, Receiver};
+use futures::SinkExt;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -15,7 +16,7 @@ pub struct Pty {
 }
 
 /// Starts `shell` (or `$SHELL`) as `-l -i` in `cwd`. Output arrives on the receiver, which ends when the shell exits.
-pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, UnboundedReceiver<Vec<u8>>)> {
+pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Receiver<Vec<u8>>)> {
     let pair = native_pty_system().openpty(size)?;
     let shell = Some(shell.trim().to_string()).filter(|shell| !shell.is_empty());
     let shell = shell.or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(|| "/bin/zsh".into());
@@ -47,11 +48,12 @@ pub fn spawn(shell: &str, cwd: &Path, size: PtySize) -> anyhow::Result<(Pty, Unb
             }
         }
     });
-    let (tx, rx) = unbounded();
+    // Bounded so a flood (`yes`, a huge `cat`) waits on the shell instead of queueing without limit.
+    let (mut tx, rx) = channel(8);
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 || tx.unbounded_send(buf[..n].to_vec()).is_err() {
+            if n == 0 || futures::executor::block_on(tx.send(buf[..n].to_vec())).is_err() {
                 break;
             }
         }

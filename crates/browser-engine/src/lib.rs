@@ -183,6 +183,8 @@ pub enum Shortcut {
     Downloads,
     Bookmarks,
     CopyUrl,
+    /// Clears the active terminal's screen and scrollback.
+    ClearTerminal,
     /// Escape; the page still gets the key.
     Dismiss,
 }
@@ -256,6 +258,7 @@ pub const SHORTCUTS: &[Binding] = &[
     bind("zoom_out", "Page", "Zoom out", "cmd--", Shortcut::ZoomOut),
     bind("zoom_reset", "Page", "Reset zoom", "cmd-0", Shortcut::ZoomReset),
     bind("inspect", "Page", "Inspect page", "alt-cmd-i", Shortcut::Inspect),
+    bind("clear_terminal", "Page", "Clear terminal", "cmd-shift-k", Shortcut::ClearTerminal),
     bind("command_palette", "App", "Command palette", "cmd-k", Shortcut::CommandPalette),
     bind("settings", "App", "Open settings", "cmd-,", Shortcut::Settings),
     bind("history", "App", "Show history", "cmd-y", Shortcut::History),

@@ -220,13 +220,10 @@ impl BrowserWindow {
             }
             // Zen-style toggles; the label says what picking it will do.
             let on_off = |on: bool| if on { "Turn off" } else { "Turn on" };
-            let toggles: [(String, Toggle); 8] = [
+            let toggles: [(String, Toggle); 7] = [
                 ("Use dark theme".into(), |s| s.theme = "dark".into()),
                 ("Use light theme".into(), |s| s.theme = "light".into()),
                 ("Use system theme".into(), |s| s.theme = "system".into()),
-                (format!("{} compact mode", on_off(settings.compact())), |s| {
-                    s.density = if s.compact() { "comfortable" } else { "compact" }.into();
-                }),
                 (format!("{} reduced motion", on_off(settings.reduce_motion)), |s| s.reduce_motion = !s.reduce_motion),
                 (format!("{} HTTPS-only mode", on_off(settings.https_only)), |s| s.https_only = !s.https_only),
                 (format!("{} JavaScript", on_off(settings.javascript)), |s| s.javascript = !s.javascript),
@@ -429,7 +426,7 @@ impl BrowserWindow {
         for (index, entry) in items.iter().cloned().enumerate() {
             if entry.section != last_section {
                 last_section = entry.section;
-                list = list.child(div().px(px(10.)).pt(px(if index == 0 { 2. } else { 8. })).pb(px(2.)).text_size(px(11.)).text_color(paint.muted).child(entry.section));
+                list = list.child(div().px(px(10.)).pt(px(if index == 0 { 2. } else { 8. })).pb(px(2.)).text_size(paint.text(11.)).text_color(paint.muted).child(entry.section));
             }
             let (label, hint, icon) = (entry.label.clone(), entry.hint.clone(), entry.icon);
             list = list.child(
@@ -445,7 +442,7 @@ impl BrowserWindow {
                     .items_center()
                     .children(icon.map(|url| site_icon(url, 16., false)))
                     .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(div().flex_none().max_w(px(220.)).truncate().text_size(px(11.)).text_color(paint.muted).child(hint))
+                    .child(div().flex_none().max_w(px(220.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).child(hint))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         let new_tab = event.modifiers().platform;
                         this.run_palette(entry.clone(), new_tab, cx);
@@ -488,7 +485,7 @@ impl BrowserWindow {
                             .rounded(px(6.))
                             .bg(paint.accent_bg)
                             .text_color(paint.accent)
-                            .text_size(px(12.))
+                            .text_size(paint.text(12.))
                             .child(site_icon(template, 14., false))
                             .child(*site)
                     }))
@@ -500,7 +497,7 @@ impl BrowserWindow {
                         })
                         .cursor_color(paint.accent)
                         .flex_1()
-                        .text_size(px(14.))
+                        .text_size(paint.text(14.))
                         .text_color(paint.fg),
                 ),
             )

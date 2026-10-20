@@ -86,7 +86,7 @@ impl BrowserWindow {
         for binding in SHORTCUTS.iter().filter(|binding| matches(binding, query)) {
             if binding.group != group {
                 group = binding.group;
-                page = page.child(div().pt(px(18.)).pb(px(2.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(group));
+                page = page.child(div().pt(px(18.)).pb(px(2.)).text_size(paint.text(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(group));
             }
             let keys = keys(settings, binding);
             let recording = self.recording == Some(binding.id);
