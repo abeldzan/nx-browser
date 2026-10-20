@@ -721,7 +721,9 @@ impl BrowserWindow {
             let hidden = entry.is_some_and(|chrome| chrome.minimized) || (maximized && !entry.is_some_and(|chrome| chrome.maximized)) || !self.is_front(&tab_id);
             let popup_in_front = self.openers.iter().any(|(child, opener)| opener == &tab_id && self.is_front(child));
             let mut model = self.model.lock();
-            if hidden && !popup_in_front {
+            // Audible or capturing tabs stay live so background audio and calls don't cut out.
+            let busy = self.playing.contains(&tab_id) || self.capturing.contains_key(&tab_id);
+            if hidden && !popup_in_front && !busy {
                 changed |= model.mark_suspended(&tab_id).is_ok();
             } else {
                 // Over the cap with every page on screen: candidates come back each tick, which is no change.
