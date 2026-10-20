@@ -177,7 +177,7 @@ impl BrowserWindow {
                     }
                 }))
             })
-            .child(div().flex_none().when(!enabled, |icon| icon.opacity(0.4)).child(extension_icon(&name, meta.icon.clone(), 28.)))
+            .child(div().flex_none().when(!enabled, |icon| icon.opacity(0.4)).child(extension_icon(&name, meta.icon, 28.)))
             .child(
                 v_stack()
                     .flex_1()
@@ -242,7 +242,6 @@ impl BrowserWindow {
                         )
                     })
                     .child(div().ml(px(6.)).child(toggle(SharedString::from(format!("ext-toggle-{id}")), enabled, paint).on_click(cx.listener({
-                        let id = id.clone();
                         move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             let _ = this.model.lock().set_extension_enabled(&id, !enabled);

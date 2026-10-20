@@ -195,7 +195,7 @@ mod tests {
         let app = stage(&release, &dir).unwrap();
         assert!(app.join("Contents/MacOS/nxbrowser").is_file());
         assert!(!dir.join("mount").join("NxBrowser.app").exists(), "DMG left mounted");
-        let mut broken = release.clone();
+        let mut broken = release;
         broken.sha256 = Some("0".repeat(64));
         assert!(stage(&broken, &dir).unwrap_err().to_string().contains("checksum"));
         std::fs::remove_dir_all(&dir).unwrap();

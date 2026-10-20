@@ -1306,7 +1306,7 @@ impl BrowserWindow {
         // The model would activate the space's first tab; focus the rest of this window, else the window on top.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let open = |id: &&String| current.contains(id) && !ids.contains(id);
-        let survivor = self.order.iter().rev().filter(open).find(|id| self.group_id(id) == group).cloned().or_else(|| {
+        let survivor = self.order.iter().rev().filter(open).find(|id| self.group_of(id) == group).cloned().or_else(|| {
             self.order
                 .iter()
                 .rev()
@@ -2152,9 +2152,9 @@ impl Render for BrowserWindow {
             self.reorder = None;
         }
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
-        let live_ids = self.model.lock().tabs.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        self.chrome.retain(|id, _| live_ids.iter().any(|live| live == id));
-        self.order.retain(|id| live_ids.iter().any(|live| live == id));
+        let live_ids = all_tabs.iter().map(|tab| tab.id.as_str()).collect::<HashSet<_>>();
+        self.chrome.retain(|id, _| live_ids.contains(id.as_str()));
+        self.order.retain(|id| live_ids.contains(id.as_str()));
         if self.tab_window {
             // One window filling the OS window; tabs opened any way join it.
             let group = tabs.first().map(|tab| self.group_id(&tab.id));
@@ -2858,7 +2858,7 @@ impl BrowserWindow {
         let others = self
             .chrome
             .iter()
-            .filter(|(id, _)| self.group_id(id) != group && current.contains(id))
+            .filter(|(id, _)| self.group_of(id) != group && current.contains(id))
             // Partners move with the border, so they must not attract it back to where they were.
             .filter(|(id, entry)| **id != gesture.tab_id && !entry.minimized && !entry.maximized)
             .filter(|(id, _)| !gesture.partners.iter().any(|(partner, _)| partner == *id))
@@ -2924,7 +2924,7 @@ impl BrowserWindow {
                     // Hovering a profile opens it, taking the window along into its open space.
                     if let Some(profile) = profile.filter(|profile| *profile != active) {
                         let group = self.group_id(&gesture.tab_id);
-                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
                         let space = {
                             let model = self.model.lock();
                             let mut spaces = model.sessions.iter().filter(|session| session.profile_id == profile);
@@ -2946,7 +2946,7 @@ impl BrowserWindow {
                     // Hovering a space opens it, taking the window along to be dragged down into it.
                     if let Some(space) = space.filter(|space| *space != active) {
                         let group = self.group_id(&gesture.tab_id);
-                        let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+                        let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
                         self.with_model(|model| {
                             let _ = model.move_tabs_to_session(&ids, &space);
                             let _ = model.switch_session(&space);
@@ -2963,7 +2963,7 @@ impl BrowserWindow {
                         .order
                         .iter()
                         .rev()
-                        .filter(|other| current.contains(other) && self.group_id(other) != group && self.is_front(other))
+                        .filter(|other| current.contains(other) && self.group_of(other) != group && self.is_front(other))
                         .find(|other| {
                             self.chrome.get(*other).is_some_and(|entry| {
                                 entry.snap.is_some() && !entry.minimized && !entry.maximized && entry.frame.is_some_and(inside)
@@ -3025,7 +3025,7 @@ impl BrowserWindow {
         if let (Some(at), GestureKind::Move, None) = (out, gesture.kind, &self.model.detached) {
             let snap = gesture.from.map(|(snap, ..)| snap);
             let group = self.group_id(&gesture.tab_id);
-            let ids = self.chrome.keys().filter(|id| self.group_id(id) == group).cloned().collect::<Vec<_>>();
+            let ids = self.chrome.keys().filter(|id| self.group_of(id) == group).cloned().collect::<Vec<_>>();
             for id in ids {
                 if let Some(entry) = self.chrome.get_mut(&id) {
                     entry.home = Some((gesture.start, snap, gesture.restore));
@@ -3236,7 +3236,7 @@ impl BrowserWindow {
         // Tiled windows need none of this; their tree moves the border.
         let partners = if snapped {
             let group = self.group_id(id);
-            self.snapped_windows().into_iter().filter(|(other, _)| self.group_id(other) != group).collect()
+            self.snapped_windows().into_iter().filter(|(other, _)| self.group_of(other) != group).collect()
         } else {
             Vec::new()
         };
@@ -3266,7 +3266,7 @@ impl BrowserWindow {
     ) -> gpui::Div {
         let shown = self.shown_tabs(tabs);
         let watch = entity.clone();
-        let paint_watch = entity.clone();
+        let paint_watch = entity;
         let mut stage = div()
             .relative()
             .flex_1()
@@ -3306,7 +3306,7 @@ impl BrowserWindow {
                 continue;
             }
             let group = self.group_id(&tab.id);
-            let members = tabs.iter().filter(|other| self.group_id(&other.id) == group).collect::<Vec<_>>();
+            let members = tabs.iter().filter(|other| self.group_of(&other.id) == group).collect::<Vec<_>>();
             if let Some(window) = self.floating_window(tab, &members, cx) {
                 stage = stage.child(window);
             }
@@ -3321,7 +3321,7 @@ impl BrowserWindow {
         let others = self
             .chrome
             .iter()
-            .filter(|(other, entry)| current.contains(other) && self.group_id(other) != group && self.is_front(other) && !entry.minimized && !entry.maximized)
+            .filter(|(other, entry)| current.contains(other) && self.group_of(other) != group && self.is_front(other) && !entry.minimized && !entry.maximized)
             .filter_map(|(_, entry)| Some((entry.snap?, entry.frame?)))
             .collect::<Vec<_>>();
         fit_snap(snap, sw, sh, &others)
@@ -4027,8 +4027,7 @@ impl BrowserWindow {
         let peek = self.chrome.get(tab_id).is_some_and(|chrome| chrome.peek);
         let bookmarked = {
             let model = self.model.lock();
-            let url = model.tabs.iter().find(|tab| tab.id == tab_id).map(|tab| tab.url.clone());
-            url.is_some_and(|url| model.bookmarks().unwrap_or_default().iter().any(|bookmark| bookmark.url == url))
+            model.tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| model.is_bookmarked(&tab.url).unwrap_or_default())
         };
         h_stack()
             .items_center()
@@ -4079,7 +4078,7 @@ impl BrowserWindow {
     /// Closes every tab of the window holding `id`.
     fn close_window(&mut self, id: &str, cx: &mut Context<Self>) {
         let group = self.group_id(id);
-        let members = self.chrome.keys().filter(|other| self.group_id(other) == group).cloned().collect::<Vec<_>>();
+        let members = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
         self.close_tabs(members, cx);
     }
 
@@ -4611,7 +4610,7 @@ impl BrowserWindow {
     /// Moves the window holding `id` into a new space and opens that space in an OS window at `at` (screen point).
     fn detach_window(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
-        let ids = self.chrome.keys().filter(|other| self.group_id(other) == group).cloned().collect::<Vec<_>>();
+        let ids = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
         let Ok(space) = self.with_model(|model| model.create_empty_session()) else {
             return;
         };
@@ -4662,7 +4661,7 @@ impl BrowserWindow {
     pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
-        chrome.window = Some(group.clone());
+        chrome.window = Some(group);
         let created = self.with_model(|model| model.create_tab_beside(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string), id));
         let Ok(new) = created else {
             return;
@@ -4718,7 +4717,7 @@ impl BrowserWindow {
     /// Moves a tab into the window holding `target`, in front, sharing its frame.
     fn move_tab_to_window(&mut self, id: &str, target: &str, cx: &mut Context<Self>) {
         let group = self.group_id(target);
-        if self.group_id(id) == group {
+        if self.group_of(id) == group {
             return;
         }
         let mut chrome = self.chrome.get(target).cloned().unwrap_or_default();
@@ -4787,7 +4786,7 @@ impl BrowserWindow {
         let (id, frame) = self.carried()?;
         let paint = paint(cx);
         let group = self.group_id(&id);
-        let members = tabs.iter().filter(|tab| self.group_id(&tab.id) == group).collect::<Vec<_>>();
+        let members = tabs.iter().filter(|tab| self.group_of(&tab.id) == group).collect::<Vec<_>>();
         let title = (self.title_h() as f32).min(frame.h * 0.2);
         Some(
             div()
@@ -4881,7 +4880,7 @@ impl BrowserWindow {
         groups
             .into_iter()
             .map(|group| {
-                let ids = tabs.iter().filter(|id| self.group_id(id) == group).cloned().collect();
+                let ids = tabs.iter().filter(|id| self.group_of(id) == group).cloned().collect();
                 (group, ids)
             })
             .collect()
@@ -4953,7 +4952,7 @@ impl BrowserWindow {
     /// A tab dropped on a window lands where the drag showed it in that window's tabs.
     fn drop_tab_on(&mut self, id: &str, target: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(target);
-        let own = self.group_id(id) == group;
+        let own = self.group_of(id) == group;
         if own && self.tab_press.take().is_some_and(|press| (at - press).magnitude() < TAP_SLOP) {
             self.reorder = None;
             self.click_tab(id, cx);
@@ -5067,18 +5066,23 @@ impl BrowserWindow {
 
     /// The window a tab belongs to; a tab never added to another window is its own.
     fn group_id(&self, id: &str) -> String {
-        self.chrome.get(id).and_then(|chrome| chrome.window.clone()).unwrap_or_else(|| id.to_string())
+        self.group_of(id).to_string()
+    }
+
+    /// `group_id` without the allocation, for the per-render comparisons over every tab.
+    fn group_of<'a>(&'a self, id: &'a str) -> &'a str {
+        self.chrome.get(id).and_then(|chrome| chrome.window.as_deref()).unwrap_or(id)
     }
 
     pub(crate) fn group_len(&self, id: &str) -> usize {
-        let group = self.group_id(id);
-        self.chrome.keys().filter(|other| self.group_id(other) == group).count()
+        let group = self.group_of(id);
+        self.chrome.keys().filter(|other| self.group_of(other) == group).count()
     }
 
     /// Whether this tab is the one its window shows: the group member raised most recently.
     pub(crate) fn is_front(&self, id: &str) -> bool {
-        let group = self.group_id(id);
-        raised_last(&self.order, id, |other| self.group_id(other) == group)
+        let group = self.group_of(id);
+        raised_last(&self.order, id, |other| self.group_of(other) == group)
     }
 
     /// Copies each window's frame and state from its shown tab to the hidden ones, so whichever is raised next sits in place.

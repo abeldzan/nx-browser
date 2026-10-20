@@ -547,7 +547,7 @@ impl Render for TerminalView {
             }))
             .on_mouse_down(gpui::MouseButton::Left, on_down(weak.clone(), self.focus.clone()))
             .on_mouse_down(gpui::MouseButton::Middle, on_down(weak.clone(), self.focus.clone()))
-            .on_mouse_down(gpui::MouseButton::Right, on_down(weak.clone(), self.focus.clone()))
+            .on_mouse_down(gpui::MouseButton::Right, on_down(weak, self.focus.clone()))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 if this.scroll_wheel(event).redraw {
                     cx.notify();

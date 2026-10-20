@@ -64,7 +64,6 @@ pub struct Feed {
     /// Bytes the remote end asked for (cursor position, device attributes);
     /// they must reach its stdin or full-screen programs stall waiting.
     pub reply: Vec<u8>,
-    pub bell: bool,
     /// Window title the program set (OSC 0/2): `Some(Some(t))` sets it,
     /// `Some(None)` resets it, `None` leaves it alone. The last one wins.
     pub title: Option<Option<String>>,
@@ -94,7 +93,6 @@ impl Emulator {
         for event in self.events.borrow_mut().drain(..) {
             match event {
                 Event::PtyWrite(text) => feed.reply.extend_from_slice(text.as_bytes()),
-                Event::Bell => feed.bell = true,
                 Event::Title(title) => feed.title = Some(Some(title)),
                 Event::ResetTitle => feed.title = Some(None),
                 _ => {}
@@ -303,8 +301,6 @@ mod tests {
         let feed = emu.feed(b"ab\x1b[6n");
         // Cursor is on row 1, column 3 (1-based) after "ab".
         assert_eq!(feed.reply, b"\x1b[1;3R");
-        assert!(!feed.bell);
-        assert!(emu.feed(b"\x07").bell);
     }
 
     #[test]

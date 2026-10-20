@@ -200,14 +200,20 @@ type MemoKey = (u64, String, String, usize);
 type Memo<T> = RefCell<Option<(MemoKey, T)>>;
 
 fn memo<T: Clone>(slot: &Memo<T>, key: MemoKey, load: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    memo_with(slot, key, load, T::clone)
+}
+
+/// `memo` that answers from the cached value by reference, for per-frame questions that need no copy of it.
+fn memo_with<T, R>(slot: &Memo<T>, key: MemoKey, load: impl FnOnce() -> anyhow::Result<T>, read: impl FnOnce(&T) -> R) -> anyhow::Result<R> {
     if let Some((cached, value)) = &*slot.borrow() {
         if *cached == key {
-            return Ok(value.clone());
+            return Ok(read(value));
         }
     }
     let value = load()?;
-    *slot.borrow_mut() = Some((key, value.clone()));
-    Ok(value)
+    let answer = read(&value);
+    *slot.borrow_mut() = Some((key, value));
+    Ok(answer)
 }
 
 impl Model {
@@ -337,7 +343,7 @@ impl Model {
         let session_id = self.insert_session(&profile.id, "Session 1")?;
         self.insert_tab(&session_id, "nxbrowser://home", "New Tab", true, 0, TabState::Suspended)?;
         tx.commit()?;
-        self.active_profile_id = profile.id.clone();
+        self.active_profile_id = profile.id;
         self.active_session_id = session_id;
         self.save_active()?;
         self.reload()?;
@@ -749,6 +755,10 @@ impl Model {
         }
         // Title updates and in-page URL events re-report the current URL; they refresh the entry instead of adding one.
         let same_url = self.tabs.iter().any(|tab| tab.id == tab_id && tab.url == url);
+        // Pages re-report an unchanged title too (timers, unread counts); skip the writes, which also drop every memo.
+        if same_url && self.tabs.iter().any(|tab| tab.id == tab_id && tab.title == title) {
+            return Ok(());
+        }
         self.storage.execute(
             "UPDATE tabs SET url = ?1, title = ?2 WHERE id = ?3",
             params![url, title, tab_id],
@@ -870,24 +880,31 @@ impl Model {
         Ok(true)
     }
 
-    /// Newest first. Memoized: the star button and new-tab page ask every frame.
+    /// Newest first. Memoized: the new-tab page asks every frame.
     pub fn bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
-        memo(&self.bookmarks_memo, self.memo_key("", 0), || {
-            let mut stmt = self.storage.conn().prepare_cached(
-                "SELECT id, profile_id, url, title, created_at, pinned FROM bookmarks WHERE profile_id = ?1 ORDER BY created_at DESC",
-            )?;
-            let rows = stmt.query_map(params![self.active_profile_id], |row| {
-                Ok(Bookmark {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    url: row.get(2)?,
-                    title: row.get(3)?,
-                    created_at: row.get(4)?,
-                    pinned: row.get(5)?,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })
+        memo(&self.bookmarks_memo, self.memo_key("", 0), || self.load_bookmarks())
+    }
+
+    /// Whether `url` is bookmarked; the star button asks every frame, so this reads the memo without copying it.
+    pub fn is_bookmarked(&self, url: &str) -> anyhow::Result<bool> {
+        memo_with(&self.bookmarks_memo, self.memo_key("", 0), || self.load_bookmarks(), |bookmarks| bookmarks.iter().any(|b| b.url == url))
+    }
+
+    fn load_bookmarks(&self) -> anyhow::Result<Vec<Bookmark>> {
+        let mut stmt = self.storage.conn().prepare_cached(
+            "SELECT id, profile_id, url, title, created_at, pinned FROM bookmarks WHERE profile_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![self.active_profile_id], |row| {
+            Ok(Bookmark {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                url: row.get(2)?,
+                title: row.get(3)?,
+                created_at: row.get(4)?,
+                pinned: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Edits bookmark `id`, or the one already saved for `url`, or adds a new one.
@@ -1815,6 +1832,9 @@ mod tests {
         model.reload().unwrap();
         assert_eq!(live, model.active_tab().map(|tab| (tab.url.clone(), tab.title.clone())));
         assert_eq!(model.history().unwrap().len(), 1, "same url refreshes the entry");
+        let writes = model.storage.generation();
+        model.note_navigation(&tab, "https://example.com/", "Example 2").unwrap();
+        assert_eq!(model.storage.generation(), writes, "an unchanged title writes nothing");
     }
 
     #[test]

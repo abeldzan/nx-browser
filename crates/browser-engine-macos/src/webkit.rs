@@ -184,8 +184,11 @@ struct DelegateIvars {
     extensions: TabNotifier,
     /// The error page's "visit anyway" link: its one-time token, the URL it opens, and the host whose certificate
     /// it accepts (none when it falls back to http). The token keeps other pages from following the link.
-    proceed: RefCell<Option<(String, Retained<NSURL>, Option<String>)>>,
+    proceed: RefCell<Option<Proceed>>,
 }
+
+/// The "visit anyway" link's token, the URL it opens, and the host whose certificate it accepts.
+type Proceed = (String, Retained<NSURL>, Option<String>);
 
 /// Hosts whose untrusted certificate the user accepted this run, in any window; never saved, as in Safari.
 static TRUSTED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1274,7 +1277,10 @@ impl WebEngine for MacEngine {
             return;
         };
         let Some(bounds) = bounds else {
-            live.view.setHidden(true);
+            // Render hides every background tab each frame; most already are.
+            if !live.view.isHidden() {
+                live.view.setHidden(true);
+            }
             return;
         };
         let Some(content) = self.content.clone() else {
