@@ -1,3 +1,4 @@
+use crate::history::{popover_header, INSET};
 use crate::settings::{measure_overlay, toggle};
 use crate::ui::{action_button, Kind};
 use crate::window::{paint, site_color, BrowserWindow, Paint};
@@ -32,7 +33,7 @@ impl BrowserWindow {
                     .py(px(8.))
                     .items_center()
                     .child(div().size(px(28.)).flex_none().rounded(px(7.)).bg(paint.secondary))
-                    .child(v_stack().gap(px(2.)).child("Installing…").child(div().text_size(px(11.)).text_color(paint.muted).child(id.clone()))),
+                    .child(v_stack().gap(px(2.)).child("Installing…").child(div().text_size(paint.text(11.)).text_color(paint.muted).child(id.clone()))),
             );
         }
         if extensions.is_empty() && self.installing.is_empty() {
@@ -44,7 +45,7 @@ impl BrowserWindow {
                     .px(px(24.))
                     .child(gpui::svg().path(crate::PUZZLE_ICON).size(px(28.)).text_color(paint.muted))
                     .child(div().mt(px(4.)).font_weight(FontWeight::MEDIUM).child("No extensions yet"))
-                    .child(div().text_size(px(12.)).text_color(paint.muted).text_center().child("Add one from the Chrome Web Store, or load an unpacked folder.")),
+                    .child(div().text_size(paint.text(12.)).text_color(paint.muted).text_center().child("Add one from the Chrome Web Store, or load an unpacked folder.")),
             );
         }
         for extension in &extensions {
@@ -82,8 +83,8 @@ impl BrowserWindow {
                     .child(
                         v_stack()
                             .gap(px(2.))
-                            .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child("Extensions"))
-                            .child(div().text_size(px(12.)).text_color(paint.muted).child(summary)),
+                            .child(div().text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child("Extensions"))
+                            .child(div().text_size(paint.text(12.)).text_color(paint.muted).child(summary)),
                     )
                     .child(icon_button("extensions-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.popover = None;
@@ -187,10 +188,10 @@ impl BrowserWindow {
                     .child(match errors.first() {
                         Some(first) => div()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(paint.text(11.))
                             .text_color(danger)
                             .child(if errors.len() > 1 { format!("{} issues · {first}", errors.len()) } else { first.clone() }),
-                        None => div().truncate().text_size(px(11.)).text_color(paint.muted).child(detail),
+                        None => div().truncate().text_size(paint.text(11.)).text_color(paint.muted).child(detail),
                     }),
             )
             .child(
@@ -215,6 +216,15 @@ impl BrowserWindow {
                                     }
                                 })))
                             })
+                            .child(icon_button(SharedString::from(format!("ext-logs-{id}")), Icons::activity_log()).small().on_click(cx.listener({
+                                let id = id.clone();
+                                move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.popover = None;
+                                    this.ext_logs = Some(id.clone());
+                                    cx.notify();
+                                }
+                            })))
                             .child(icon_button(SharedString::from(format!("ext-remove-{id}")), Icons::trash()).small().on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _: &ClickEvent, _, cx| {
@@ -252,6 +262,47 @@ impl BrowserWindow {
             )
     }
 
+    /// An extension's errors, one per line, with a button that copies them all.
+    // shortcut: WebKit exposes only the error list (runtime errors and console.error), not console.log; capture
+    // console output in the polyfill if full logs are needed.
+    pub(crate) fn ext_logs_modal(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let paint = paint(cx);
+        let name = self.ext_meta.get(id).map(|meta| meta.name.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| id.to_string());
+        let lines = self.engine.extensions().errors(id);
+        let text = lines.join("\n");
+        let mut list = v_stack().w_full().gap(px(6.)).p(px(INSET)).font_family("Menlo").text_size(paint.text(11.));
+        if lines.is_empty() {
+            list = list.child(div().py(px(24.)).text_center().text_color(paint.muted).child("No logs"));
+        }
+        for line in lines {
+            list = list.child(div().w_full().pb(px(6.)).border_b_1().border_color(paint.border).child(line));
+        }
+        let card = v_stack()
+            .w(px(640.))
+            .h(px(480.))
+            .max_w_full()
+            .max_h_full()
+            .child(popover_header(
+                format!("Logs · {name}"),
+                h_stack()
+                    .child(action_button("ext-logs-copy", "Copy", Kind::Secondary, !text.is_empty(), cx, move |this, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                        this.status = "Copied logs".into();
+                    }))
+                    .child(icon_button("ext-logs-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.close_ext_logs(cx);
+                    }))),
+                paint,
+            ))
+            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(scroll_area("ext-logs-list").vertical().full_height(true).child(list)));
+        self.modal_shell("ext-logs-modal", card, Self::close_ext_logs, cx)
+    }
+
+    fn close_ext_logs(&mut self, cx: &mut Context<Self>) {
+        self.ext_logs = None;
+        cx.notify();
+    }
+
     fn store_banner(&self, id: String, paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
         h_stack()
             .mx(px(12.))
@@ -262,7 +313,7 @@ impl BrowserWindow {
             .rounded(px(8.))
             .bg(paint.accent.opacity(0.12))
             .child(gpui::svg().path(crate::PUZZLE_ICON).size(px(16.)).flex_none().text_color(paint.accent))
-            .child(div().flex_1().text_size(px(12.)).child("This page is a Chrome Web Store listing."))
+            .child(div().flex_1().text_size(paint.text(12.)).child("This page is a Chrome Web Store listing."))
             .child(action_button("add-from-store", "Add to NxBrowser", Kind::Primary, true, cx, move |this, cx| {
                 this.install_from_store(id.clone());
                 cx.notify();
@@ -287,7 +338,7 @@ impl BrowserWindow {
                     .gap(px(10.))
                     .items_center()
                     .child(extension_icon(&name, icon, 20.))
-                    .child(div().flex_1().min_w(px(0.)).text_size(px(12.)).child(format!("{name} wants {request}"))),
+                    .child(div().flex_1().min_w(px(0.)).text_size(paint.text(12.)).child(format!("{name} wants {request}"))),
             )
             .child(
                 h_stack()
@@ -336,7 +387,7 @@ impl BrowserWindow {
                     .rounded(px(6.))
                     .bg(paint.accent)
                     .text_color(paint.bg)
-                    .text_size(px(12.))
+                    .text_size(paint.text(12.))
                     .cursor_pointer()
                     .child("Add to NxBrowser")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -394,7 +445,7 @@ fn link(
 ) -> impl IntoElement {
     div()
         .id(id)
-        .text_size(px(12.))
+        .text_size(paint.text(12.))
         .text_color(paint.muted)
         .cursor_pointer()
         .hover(|style| style.text_color(paint.fg))

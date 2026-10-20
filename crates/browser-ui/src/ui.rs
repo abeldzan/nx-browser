@@ -38,7 +38,7 @@ pub(crate) fn action_button(
         .border_color(border)
         .bg(bg)
         .text_color(fg)
-        .text_size(px(13.))
+        .text_size(paint.text(13.))
         .font_weight(FontWeight::MEDIUM)
         .child(label.into())
         .when(!enabled, |button| button.opacity(0.45))

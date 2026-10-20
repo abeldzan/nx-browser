@@ -277,23 +277,12 @@ impl TerminalView {
         let copy = (m.platform && !m.shift && keys.key == "c") || (m.control && m.shift && keys.key == "c");
         let paste = (m.platform && !m.shift && keys.key == "v") || (m.control && m.shift && keys.key == "v");
         if copy {
-            if let Some(text) = self.emu.selected_text() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            self.copy(cx);
             cx.stop_propagation();
             return;
         }
         if paste {
-            if let Some(item) = cx.read_from_clipboard() {
-                match item.text() {
-                    Some(text) => {
-                        let bytes = paste_bytes(&text, self.emu.bracketed_paste());
-                        self.write_input(&bytes, cx);
-                    }
-                    // An image (a screenshot): Ctrl+V makes agent CLIs read it from the clipboard and attach it.
-                    None => self.write_input(&[0x16], cx),
-                }
-            }
+            self.paste(cx);
             cx.stop_propagation();
             return;
         }
@@ -301,6 +290,39 @@ impl TerminalView {
             self.write_input(&bytes, cx);
             cx.stop_propagation();
         }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.emu.selection_range().is_some()
+    }
+
+    pub fn copy(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.emu.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(item) = cx.read_from_clipboard() {
+            match item.text() {
+                Some(text) => {
+                    let bytes = paste_bytes(&text, self.emu.bracketed_paste());
+                    self.write_input(&bytes, cx);
+                }
+                // An image (a screenshot): Ctrl+V makes agent CLIs read it from the clipboard and attach it.
+                None => self.write_input(&[0x16], cx),
+            }
+        }
+    }
+
+    /// Wipes the screen and scrollback, then sends Ctrl+L so the shell redraws its prompt at the top.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        // A full-screen program (vim, htop) owns the screen and would just be redrawn over.
+        if self.emu.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        self.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        self.write_input(&[0x0c], cx);
     }
 
     fn write_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
@@ -547,7 +569,16 @@ impl Render for TerminalView {
             }))
             .on_mouse_down(gpui::MouseButton::Left, on_down(weak.clone(), self.focus.clone()))
             .on_mouse_down(gpui::MouseButton::Middle, on_down(weak.clone(), self.focus.clone()))
-            .on_mouse_down(gpui::MouseButton::Right, on_down(weak, self.focus.clone()))
+            // A right click no program asked for goes on up to the window's terminal menu.
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let focus = self.focus.clone();
+                move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    focus.focus(window, cx);
+                    if pointer_event(&weak, cx, |term| term.mouse_down(event)).consumed {
+                        cx.stop_propagation();
+                    }
+                }
+            })
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 if this.scroll_wheel(event).redraw {
                     cx.notify();

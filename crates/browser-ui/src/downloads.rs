@@ -59,7 +59,7 @@ impl BrowserWindow {
                     .px(px(INSET - 6.))
                     .rounded(px(6.))
                     .items_center()
-                    .text_size(px(12.5))
+                    .text_size(paint.text(12.5))
                     .when(done, |row| {
                         row.cursor_pointer()
                             .hover(|style| style.bg(paint.secondary))
@@ -104,7 +104,7 @@ impl BrowserWindow {
                             .flex_none()
                             .max_w(px(150.))
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(paint.text(11.))
                             .text_color(if failed { danger } else { paint.muted })
                             // The reveal button takes the size's place on hover.
                             .when(done, |detail| detail.group_hover(group.clone(), |style| style.opacity(0.)))
@@ -174,7 +174,7 @@ impl BrowserWindow {
                         .gap(px(6.))
                         .items_center()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(paint.text(12.))
                         .text_color(paint.muted)
                         .child(Icons::download().size(px(18.)).text_color(paint.muted))
                         .child("No downloads yet"),

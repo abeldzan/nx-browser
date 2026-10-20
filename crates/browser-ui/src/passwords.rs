@@ -228,7 +228,7 @@ impl BrowserWindow {
                 .border_1()
                 .border_color(paint.border)
                 .shadow_md()
-                .text_size(px(13.))
+                .text_size(paint.text(13.))
                 .occlude()
                 .child(measure_overlay(10., cx))
                 .child(
@@ -318,7 +318,7 @@ impl BrowserWindow {
             let (is_weak, is_reused) = self.passwords.health.get(&login.id).copied().unwrap_or_default();
             let (reveal, copy, edit) = (login.id.clone(), login.id.clone(), login.id.clone());
             let badge = |text: &'static str| {
-                div().flex_none().px(px(6.)).py(px(1.)).rounded(px(4.)).text_size(px(10.5)).bg(paint.secondary).text_color(paint.muted).child(text)
+                div().flex_none().px(px(6.)).py(px(1.)).rounded(px(4.)).text_size(paint.text(10.5)).bg(paint.secondary).text_color(paint.muted).child(text)
             };
             list = list.child(
                 h_stack()
@@ -334,7 +334,7 @@ impl BrowserWindow {
                             .flex_1()
                             .min_w(px(0.))
                             .child(div().truncate().child(site_of(&login.origin).to_string()))
-                            .child(div().truncate().text_size(px(11.)).text_color(paint.muted).child(if login.username.is_empty() {
+                            .child(div().truncate().text_size(paint.text(11.)).text_color(paint.muted).child(if login.username.is_empty() {
                                 "No username".to_string()
                             } else {
                                 login.username.clone()
@@ -342,7 +342,7 @@ impl BrowserWindow {
                     )
                     .when(is_weak, |row| row.child(badge("Weak")))
                     .when(is_reused, |row| row.child(badge("Reused")))
-                    .child(div().flex_none().w(px(140.)).truncate().text_size(px(12.)).text_color(paint.muted).child(
+                    .child(div().flex_none().w(px(140.)).truncate().text_size(paint.text(12.)).text_color(paint.muted).child(
                         revealed.cloned().unwrap_or_else(|| "••••••••".into()),
                     ))
                     .child(
@@ -391,7 +391,7 @@ impl BrowserWindow {
             .w_full()
             .child(actions)
             .child(heading("Saved passwords (current profile)", paint))
-            .child(div().pb(px(8.)).text_size(px(11.)).text_color(paint.muted).child(summary))
+            .child(div().pb(px(8.)).text_size(paint.text(11.)).text_color(paint.muted).child(summary))
             .when(!logins.is_empty(), |column| {
                 column.child(div().w(px(260.)).pb(px(8.)).child(text_field(&self.passwords.search, cx).placeholder("Search sites and usernames").full_width(true)))
             })
@@ -529,7 +529,7 @@ impl BrowserWindow {
     pub(crate) fn login_editor(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let paint = paint(cx);
         let id = self.passwords.edit.clone().flatten();
-        let label = |text: &'static str| div().text_size(px(12.)).text_color(paint.muted).child(text);
+        let label = |text: &'static str| div().text_size(paint.text(12.)).text_color(paint.muted).child(text);
         let close = |this: &mut Self, cx: &mut Context<Self>| {
             this.passwords.edit = None;
             cx.notify();
@@ -539,7 +539,7 @@ impl BrowserWindow {
             .max_w_full()
             .gap(px(8.))
             .p(px(24.))
-            .child(div().pb(px(6.)).text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit password" } else { "Add password" }))
+            .child(div().pb(px(6.)).text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit password" } else { "Add password" }))
             .child(label("Website"))
             .child(text_field(&self.passwords.site, cx).placeholder("example.com").full_width(true))
             .child(label("Username"))

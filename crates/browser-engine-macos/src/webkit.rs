@@ -2127,7 +2127,7 @@ fn reply_json(reply: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>, j
 /// The menu bar's shortcut menus, as `SHORTCUTS` ids; "-" is a separator.
 const MENUS: &[(&str, &[&str])] = &[
     ("File", &["new_tab", "new_terminal", "new_space", "-", "close_tab", "close_window", "reopen_tab", "-", "print"]),
-    ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "command_palette", "-", "inspect"]),
+    ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "clear_terminal", "command_palette", "-", "inspect"]),
     ("History", &["back", "forward", "-", "history", "downloads"]),
     ("Bookmarks", &["bookmark", "bookmarks"]),
     ("Window", &[
