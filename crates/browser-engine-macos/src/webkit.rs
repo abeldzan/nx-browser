@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
@@ -525,7 +525,7 @@ define_class!(
         ) {
             if ns_string(&message.name()) == "nxShortcut" {
                 if let Some((window_no, shortcut)) = PENDING_PAGE_FIRST.take() {
-                    send_shortcut(window_no, shortcut);
+                    send_event(window_no, EngineEvent::Shortcut(shortcut));
                 }
             }
         }
@@ -1804,14 +1804,14 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
         };
         const ESCAPE: u16 = 53;
         if event_ref.keyCode() == ESCAPE {
-            send_shortcut(window_no, Shortcut::Dismiss);
+            send_event(window_no, EngineEvent::Shortcut(Shortcut::Dismiss));
         }
         let shortcut = bound(event_ref);
         // A focused page gets these first; the key script reports them back if it ignores them.
         let to_page = shortcut.filter(|shortcut| shortcut.page_first() && page_has_focus(event_ref));
         PENDING_PAGE_FIRST.set(to_page.map(|shortcut| (window_no, shortcut)));
         if let Some(shortcut) = shortcut.filter(|_| to_page.is_none()) {
-            send_shortcut(window_no, shortcut);
+            send_event(window_no, EngineEvent::Shortcut(shortcut));
             return std::ptr::null_mut();
         }
         event.as_ptr()
@@ -1851,11 +1851,11 @@ struct WindowState {
     wake: Option<Box<dyn Fn() + Send>>,
 }
 
-/// Queues `shortcut` for window `window_no`'s UI and wakes it.
-fn send_shortcut(window_no: isize, shortcut: Shortcut) {
+/// Queues `event` for window `window_no`'s UI and wakes it.
+fn send_event(window_no: isize, event: EngineEvent) {
     with_window(window_no, |state| {
         if let Some(events) = &state.events {
-            let _ = events.send(EngineEvent::Shortcut(shortcut));
+            let _ = events.send(event);
         }
         if let Some(wake) = &state.wake {
             wake();
@@ -1956,7 +1956,7 @@ fn install_hit_proxy(chrome: &NSView) {
     });
     unsafe {
         objc2::ffi::object_setClass(std::ptr::from_ref(chrome).cast_mut().cast(), *class);
-        let types = NSArray::from_slice(&[ns_string!("public.file-url")]);
+        let types = NSArray::from_slice(&[ns_string!("public.file-url"), ns_string!("public.url")]);
         let _: () = msg_send![chrome, registerForDraggedTypes: &*types];
     }
 }
@@ -1977,25 +1977,67 @@ fn drag_window(this: &AnyObject) -> Option<Retained<objc2_app_kit::NSWindow>> {
     unsafe { &*std::ptr::from_ref(this).cast::<NSView>() }.window()
 }
 
+/// The http(s) link (not a file) dragged over the chrome, and where (window coordinates, top-left origin).
+fn dragged_link(this: &AnyObject, info: *mut AnyObject) -> Option<(isize, String, (f64, f64))> {
+    let info = unsafe { info.as_ref() }?;
+    let window = drag_window(this)?;
+    let content = window.contentView()?;
+    let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![info, draggingPasteboard] };
+    // Files keep going to GPUI's window handlers.
+    if pasteboard.types().is_some_and(|types| types.containsObject(ns_string!("public.file-url"))) {
+        return None;
+    }
+    let url = pasteboard.stringForType(ns_string!("public.url"))?.to_string();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return None;
+    }
+    let location = content.convertPoint_fromView(unsafe { msg_send![info, draggingLocation] }, None);
+    Some((window.windowNumber(), url, (location.x, content.bounds().size.height - location.y)))
+}
+
+/// Tells the UI where a dragged link is, so the tab row under it opens a gap.
+fn hover_link(this: &AnyObject, info: *mut AnyObject) -> Option<usize> {
+    let (window_no, _, at) = dragged_link(this, info)?;
+    send_event(window_no, EngineEvent::LinkDrag { at: Some(at) });
+    Some(NSDragOperation::Copy.0)
+}
+
 extern "C-unwind" fn drag_entered(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> usize {
+    if let Some(operation) = hover_link(this, info) {
+        return operation;
+    }
     drag_window(this).map_or(0, |window| unsafe { msg_send![&*window, draggingEntered: info] })
 }
 
 extern "C-unwind" fn drag_updated(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> usize {
+    if let Some(operation) = hover_link(this, info) {
+        return operation;
+    }
     drag_window(this).map_or(0, |window| unsafe { msg_send![&*window, draggingUpdated: info] })
 }
 
 extern "C-unwind" fn drag_exited(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) {
+    if let Some((window_no, _, _)) = dragged_link(this, info) {
+        send_event(window_no, EngineEvent::LinkDrag { at: None });
+        return;
+    }
     if let Some(window) = drag_window(this) {
         let _: () = unsafe { msg_send![&*window, draggingExited: info] };
     }
 }
 
 extern "C-unwind" fn drag_perform(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) -> Bool {
+    if let Some((window_no, url, at)) = dragged_link(this, info) {
+        send_event(window_no, EngineEvent::LinkDrop { url, at });
+        return Bool::YES;
+    }
     drag_window(this).map_or(Bool::NO, |window| unsafe { msg_send![&*window, performDragOperation: info] })
 }
 
 extern "C-unwind" fn drag_conclude(this: &AnyObject, _cmd: Sel, info: *mut AnyObject) {
+    if dragged_link(this, info).is_some() {
+        return;
+    }
     if let Some(window) = drag_window(this) {
         let _: () = unsafe { msg_send![&*window, concludeDragOperation: info] };
     }
@@ -2162,7 +2204,7 @@ define_class!(
                 .map(|window| window.windowNumber())
                 .find(|&no| with_window(no, |state| state.events.is_some()) == Some(true));
             if let Some(window_no) = window_no {
-                send_shortcut(window_no, binding.action);
+                send_event(window_no, EngineEvent::Shortcut(binding.action));
             }
         }
     }

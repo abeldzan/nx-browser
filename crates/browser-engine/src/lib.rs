@@ -86,6 +86,15 @@ pub enum EngineEvent {
     CloseTab {
         tab_id: String,
     },
+    /// A link dragged over the chrome (not a page), at window coordinates (top-left origin); `None` once it leaves.
+    LinkDrag {
+        at: Option<(f64, f64)>,
+    },
+    /// That link dropped on the chrome.
+    LinkDrop {
+        url: String,
+        at: (f64, f64),
+    },
     /// ⌥-clicked link, to show in a floating preview over its page.
     Peek {
         url: String,
