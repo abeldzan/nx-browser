@@ -1,6 +1,7 @@
 mod default_browser;
 mod drag;
 mod extensions;
+mod screenshot;
 mod updates;
 mod vault;
 // Delegate method names mirror their Objective-C selectors.

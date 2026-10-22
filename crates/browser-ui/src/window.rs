@@ -9,7 +9,7 @@ use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model, TabState,
 };
-use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
+use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
 use gpui::{
@@ -118,6 +118,8 @@ pub struct BrowserWindow {
     pub(crate) tab_menu: Option<(String, gpui::Point<Pixels>)>,
     /// Right-click menu on a terminal: (tab id, click position).
     pub(crate) term_menu: Option<(String, gpui::Point<Pixels>)>,
+    /// The screenshot button's menu: (tab id, where it was clicked).
+    pub(crate) shot_menu: Option<(String, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
@@ -198,6 +200,8 @@ pub struct BrowserWindow {
     tab_grab: Rc<Cell<gpui::Point<Pixels>>>,
     /// A tab or profile being dragged, and the row it would drop into.
     reorder: Option<Reorder>,
+    /// Where a link dragged from a page is over the chrome; applied to the tab rows on the next render.
+    link_hover: Option<(f64, f64)>,
     find: Tween,
     /// Status message shown as a toast, and when it changed.
     toast: (SharedString, Instant),
@@ -283,6 +287,8 @@ fn shown_row(state: Option<&Reorder>, key: &str, ids: &[String]) -> Vec<String> 
 }
 
 const RAIL_ROW: &str = "rail";
+/// Stands in for the tab a link dragged from a page would become, so a tab row opens a gap for it.
+const LINK_DROP: &str = "link-drop";
 
 struct SelfTest {
     stage: u8,
@@ -461,6 +467,7 @@ impl BrowserWindow {
             rail_menu: None,
             tab_menu: None,
             term_menu: None,
+            shot_menu: None,
             popover: None,
             popover_dismissed: None,
             history_modal: false,
@@ -535,6 +542,7 @@ impl BrowserWindow {
             rail_grab: Rc::default(),
             tab_grab: Rc::default(),
             reorder: None,
+            link_hover: None,
             find: Tween::new(false),
             toast: ("Ready".into(), Instant::now() - TOAST_LIFE),
             load_bar: 0.0,
@@ -785,6 +793,18 @@ impl BrowserWindow {
                     self.status = format!("Download {status}").into();
                 }
             }
+            EngineEvent::Screenshot { path, error } => {
+                self.status = match error {
+                    Some(error) => format!("Screenshot failed: {error}").into(),
+                    None => {
+                        let id = Uuid::new_v4().to_string();
+                        let model = self.model.lock();
+                        let _ = model.add_download(&id, &format!("file://{path}"), &path);
+                        let _ = model.update_download(&id, "done", &path);
+                        "Screenshot saved to downloads".into()
+                    }
+                };
+            }
             EngineEvent::Permission { origin, kind, request, .. } => {
                 // One prompt at a time: a newer request turns down the one still showing.
                 if let Some((older, _, _)) = self.permission.replace((request, origin, kind)) {
@@ -847,6 +867,17 @@ impl BrowserWindow {
             }
             EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
             EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
+            EngineEvent::LinkDrag { at } => {
+                self.link_hover = at;
+                if at.is_none() {
+                    self.reorder = self.reorder.take().filter(|state| state.id != LINK_DROP);
+                }
+                cx.notify();
+            }
+            EngineEvent::LinkDrop { url, at } => {
+                self.link_hover = None;
+                self.drop_link(&url, at, cx);
+            }
             EngineEvent::Peek { url } => self.open_peek(&url, cx),
             EngineEvent::Audio { tab_id, playing } => {
                 if playing { self.playing.insert(tab_id) } else { self.playing.remove(&tab_id) };
@@ -915,6 +946,23 @@ impl BrowserWindow {
             Shortcut::Print => {
                 if let Some(id) = self.active_tab_id() {
                     self.engine.print(&id);
+                }
+            }
+            Shortcut::Screenshot | Shortcut::ScreenshotElement => {
+                if let Some(id) = self.active_tab_id() {
+                    let dir = {
+                        let model = self.model.lock();
+                        let dir = [&model.settings.screenshot_dir, &model.settings.download_dir].into_iter().find(|dir| !dir.is_empty()).cloned();
+                        dir
+                    };
+                    let dir = dir.map_or_else(downloads_dir, std::path::PathBuf::from);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = unique_path(&dir, &format!("Screenshot {}.png", browser_core::now_secs()));
+                    let area = if shortcut == Shortcut::ScreenshotElement { ScreenshotArea::Element } else { ScreenshotArea::Page };
+                    self.engine.screenshot(&id, area, path);
+                    if area == ScreenshotArea::Element {
+                        self.status = "Click an element, then Capture (Esc to cancel)".into();
+                    }
                 }
             }
             Shortcut::CommandPalette => self.open_palette(cx),
@@ -2129,7 +2177,11 @@ impl Render for BrowserWindow {
         self.overlay_rects.clear();
         self.space_chips.clear();
         self.rail_badges.clear();
-        if !cx.has_active_drag() {
+        // A link drag is AppKit's, not GPUI's: its gap stays until the engine says it left or dropped.
+        // Once a frame, against the slots last laid out, as AppKit reports moves far more often.
+        if let Some(at) = self.link_hover {
+            self.preview_link(at);
+        } else if !cx.has_active_drag() {
             // A drag dropped nowhere puts its item back in its gap.
             if let Some(state) = self.reorder.take().filter(|state| state.row.is_none()) {
                 self.land(&state.id, state.at);
@@ -2178,7 +2230,7 @@ impl Render for BrowserWindow {
         let colors = paint(cx);
         if !cx.has_active_drag() {
             self.tab_drag = None;
-            self.reorder = None;
+            self.reorder = self.reorder.take().filter(|state| state.id == LINK_DROP);
         }
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
         let live_ids = all_tabs.iter().map(|tab| tab.id.as_str()).collect::<HashSet<_>>();
@@ -2299,6 +2351,7 @@ impl Render for BrowserWindow {
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
             .when_some(self.tab_menu.clone(), |root, menu| root.child(self.tab_menu_view(menu, cx)))
             .when_some(self.term_menu.clone(), |root, menu| root.child(self.term_menu_view(menu, cx)))
+            .when_some(self.shot_menu.clone(), |root, menu| root.child(self.shot_menu_view(menu, cx)))
     }
 }
 
@@ -4071,6 +4124,7 @@ impl BrowserWindow {
         let reload_id = tab_id.to_string();
         let loading = self.engine.progress(tab_id).is_some();
         let bookmark_id = tab_id.to_string();
+        let shot_id = tab_id.to_string();
         let min_id = tab_id.to_string();
         let zoom_id = tab_id.to_string();
         let close_id = tab_id.to_string();
@@ -4103,6 +4157,12 @@ impl BrowserWindow {
             .child(self.tool_button(format!("bookmark-{bookmark_id}"), if bookmarked { Icons::star_filled() } else { Icons::star() }, false, cx, move |this, _, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
+            }))
+            .child(self.tool_button(format!("shot-{shot_id}"), Icons::camera(), false, cx, move |this, event, cx| {
+                this.focus_window(&shot_id, cx);
+                if let ClickEvent::Mouse(click) = event {
+                    this.shot_menu = Some((shot_id.clone(), click.down.position));
+                }
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
             .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, _, cx| this.minimize_window(&min_id, cx)))
@@ -4890,19 +4950,24 @@ impl BrowserWindow {
         }
         let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
         let start = before.iter().filter_map(|id| self.slots.get(id)).map(|slot| along(slot.origin)).reduce(|a, b| if b < a { b } else { a });
-        let (Some(mut next), Some(size)) = (start, self.reorder.as_ref().map(|state| state.size)) else {
+        let (Some(start), Some(size)) = (start, self.reorder.as_ref().map(|state| state.size)) else {
             return;
         };
+        // A dragged item new to the row has no slot here yet, but its size is known.
+        let slot_of = |id: &String| self.slots.get(id).copied().filter(|_| before.contains(id));
+        let span = |id: &String| slot_of(id).map_or(size, |slot| slot.size);
+        let length = |ids: &[String]| ids.iter().map(|id| if vertical { span(id).height } else { span(id).width } + px(gap)).fold(px(0.), |a, b| a + b);
+        // Tab rows sit centred in their title bar, so one that grows or shrinks moves its start by half the change.
+        let mut next = if vertical { start } else { start - (length(after) - length(before)) / 2. };
         let now = Instant::now();
         for id in after {
-            // A dragged item new to the row has no slot here yet, but its size is known.
-            let slot = self.slots.get(id).copied().filter(|_| before.contains(id));
+            let slot = slot_of(id);
             let target = match slot {
                 Some(slot) if vertical => gpui::point(slot.origin.x, next),
                 Some(slot) => gpui::point(next, slot.origin.y),
                 None => gpui::Point::default(),
             };
-            let span = slot.map_or(size, |slot| slot.size);
+            let span = span(id);
             next += if vertical { span.height } else { span.width } + px(gap);
             match slot {
                 Some(slot) => {
@@ -5022,24 +5087,63 @@ impl BrowserWindow {
             self.move_tab_to_window(id, target, cx);
         }
         if let Some(order) = &order {
-            // The window's row is a slice of the space's tab order: land before the next tab in it, or after the one before.
-            let mut rest = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-            rest.retain(|other| other != id);
-            let at_row = order.iter().position(|other| other == id).unwrap_or(0);
-            let index = match (order.get(at_row + 1), at_row.checked_sub(1).and_then(|before| order.get(before))) {
-                (Some(next), _) => rest.iter().position(|other| other == next),
-                (None, Some(before)) => rest.iter().position(|other| other == before).map(|index| index + 1),
-                (None, None) => None,
-            };
-            if let Some(index) = index {
-                self.with_model(|model| { let _ = model.move_tab(id, index); });
-            }
+            self.move_into_gap(id, order);
         }
         // Its slot is the gap it was dropped into, or its own when dropped off the row of its own window.
         if order.is_some() || own {
             self.land(id, at - self.tab_grab.get());
         }
         cx.notify();
+    }
+
+    /// Moves `id` to its place in `order`, a window's row as dropped.
+    fn move_into_gap(&mut self, id: &str, order: &[String]) {
+        // The window's row is a slice of the space's tab order: land before the next tab in it, or after the one before.
+        let mut rest = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        rest.retain(|other| other != id);
+        let at_row = order.iter().position(|other| other == id).unwrap_or(0);
+        let index = match (order.get(at_row + 1), at_row.checked_sub(1).and_then(|before| order.get(before))) {
+            (Some(next), _) => rest.iter().position(|other| other == next),
+            (None, Some(before)) => rest.iter().position(|other| other == before).map(|index| index + 1),
+            (None, None) => None,
+        };
+        if let Some(index) = index {
+            self.with_model(|model| { let _ = model.move_tab(id, index); });
+        }
+    }
+
+    /// Opens a gap in the tab row under a link dragged from a page, as for a dragged tab.
+    fn preview_link(&mut self, at: (f64, f64)) {
+        let size = gpui::size(px(120.), px(self.pill_h()));
+        if self.reorder.as_ref().is_none_or(|state| state.id != LINK_DROP) {
+            self.reorder = Some(Reorder { id: LINK_DROP.into(), size, at: gpui::Point::default(), row: None, order: Vec::new() });
+        }
+        let origin = gpui::point(px(at.0 as f32), px(at.1 as f32)) - gpui::point(size.width / 2., size.height / 2.);
+        let rows = self.tab_rows();
+        self.preview_drag(LINK_DROP, origin, rows, false, 2.0);
+    }
+
+    /// A link dropped into a tab row's gap opens there as a new tab of that window.
+    fn drop_link(&mut self, url: &str, at: (f64, f64), cx: &mut Context<Self>) {
+        self.preview_link(at);
+        let dropped = self.reorder.take().and_then(|state| state.row.map(|_| state.order));
+        cx.notify();
+        let Some(mut order) = dropped else {
+            return;
+        };
+        let Some(member) = order.iter().find(|id| *id != LINK_DROP).cloned() else {
+            return;
+        };
+        self.new_tab_in(&member, Some(url), cx);
+        let Some(new) = self.active_tab_id() else {
+            return;
+        };
+        for id in &mut order {
+            if id == LINK_DROP {
+                id.clone_from(&new);
+            }
+        }
+        self.move_into_gap(&new, &order);
     }
 
     /// Glides a dropped item from where its drag preview was into its slot; the others already sit in theirs.

@@ -86,6 +86,15 @@ pub enum EngineEvent {
     CloseTab {
         tab_id: String,
     },
+    /// A link dragged over the chrome (not a page), at window coordinates (top-left origin); `None` once it leaves.
+    LinkDrag {
+        at: Option<(f64, f64)>,
+    },
+    /// That link dropped on the chrome.
+    LinkDrop {
+        url: String,
+        at: (f64, f64),
+    },
     /// ⌥-clicked link, to show in a floating preview over its page.
     Peek {
         url: String,
@@ -99,6 +108,11 @@ pub enum EngineEvent {
         tab_id: String,
         camera: bool,
         microphone: bool,
+    },
+    /// A screenshot written to `path` as PNG, or why it couldn't be.
+    Screenshot {
+        path: String,
+        error: Option<String>,
     },
 }
 
@@ -133,6 +147,15 @@ impl Default for EngineSettings {
     }
 }
 
+/// What a screenshot captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenshotArea {
+    /// The whole document, scrolling through it.
+    Page,
+    /// An element the user picks.
+    Element,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
     Left,
@@ -163,6 +186,10 @@ pub enum Shortcut {
     NextTab,
     PrevTab,
     Print,
+    /// Captures the whole page as a PNG.
+    Screenshot,
+    /// Lets the user click an element on the page, then captures it as a PNG.
+    ScreenshotElement,
     CommandPalette,
     Inspect,
     NewTerminal,
@@ -254,6 +281,8 @@ pub const SHORTCUTS: &[Binding] = &[
     bind("find", "Page", "Find in page", "cmd-f", Shortcut::Find),
     bind("bookmark", "Page", "Bookmark page", "cmd-d", Shortcut::Bookmark),
     bind("print", "Page", "Print page", "cmd-p", Shortcut::Print),
+    bind("screenshot_page", "Page", "Screenshot page", "cmd-shift-s", Shortcut::Screenshot),
+    bind("screenshot_element", "Page", "Screenshot element", "alt-cmd-s", Shortcut::ScreenshotElement),
     bind("zoom_in", "Page", "Zoom in", "cmd-=", Shortcut::ZoomIn),
     bind("zoom_out", "Page", "Zoom out", "cmd--", Shortcut::ZoomOut),
     bind("zoom_reset", "Page", "Reset zoom", "cmd-0", Shortcut::ZoomReset),
