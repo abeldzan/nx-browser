@@ -30,6 +30,8 @@ pub struct Settings {
     pub user_agent: String,
     pub download_dir: String,
     pub ask_download_path: bool,
+    /// Where screenshots go; empty means `download_dir`.
+    pub screenshot_dir: String,
     pub suspend_after_secs: i64,
     pub max_live_tabs: usize,
     pub inspector: bool,
@@ -92,6 +94,7 @@ impl Default for Settings {
             user_agent: String::new(),
             download_dir: crate::downloads_dir().display().to_string(),
             ask_download_path: false,
+            screenshot_dir: String::new(),
             suspend_after_secs: 120,
             max_live_tabs: 6,
             inspector: true,

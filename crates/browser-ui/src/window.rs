@@ -9,7 +9,7 @@ use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model, TabState,
 };
-use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine};
+use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
 use gpui::{
@@ -118,6 +118,8 @@ pub struct BrowserWindow {
     pub(crate) tab_menu: Option<(String, gpui::Point<Pixels>)>,
     /// Right-click menu on a terminal: (tab id, click position).
     pub(crate) term_menu: Option<(String, gpui::Point<Pixels>)>,
+    /// The screenshot button's menu: (tab id, where it was clicked).
+    pub(crate) shot_menu: Option<(String, gpui::Point<Pixels>)>,
     address_focused: bool,
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
@@ -465,6 +467,7 @@ impl BrowserWindow {
             rail_menu: None,
             tab_menu: None,
             term_menu: None,
+            shot_menu: None,
             popover: None,
             popover_dismissed: None,
             history_modal: false,
@@ -790,6 +793,18 @@ impl BrowserWindow {
                     self.status = format!("Download {status}").into();
                 }
             }
+            EngineEvent::Screenshot { path, error } => {
+                self.status = match error {
+                    Some(error) => format!("Screenshot failed: {error}").into(),
+                    None => {
+                        let id = Uuid::new_v4().to_string();
+                        let model = self.model.lock();
+                        let _ = model.add_download(&id, &format!("file://{path}"), &path);
+                        let _ = model.update_download(&id, "done", &path);
+                        "Screenshot saved to downloads".into()
+                    }
+                };
+            }
             EngineEvent::Permission { origin, kind, request, .. } => {
                 // One prompt at a time: a newer request turns down the one still showing.
                 if let Some((older, _, _)) = self.permission.replace((request, origin, kind)) {
@@ -931,6 +946,23 @@ impl BrowserWindow {
             Shortcut::Print => {
                 if let Some(id) = self.active_tab_id() {
                     self.engine.print(&id);
+                }
+            }
+            Shortcut::Screenshot | Shortcut::ScreenshotElement => {
+                if let Some(id) = self.active_tab_id() {
+                    let dir = {
+                        let model = self.model.lock();
+                        let dir = [&model.settings.screenshot_dir, &model.settings.download_dir].into_iter().find(|dir| !dir.is_empty()).cloned();
+                        dir
+                    };
+                    let dir = dir.map_or_else(downloads_dir, std::path::PathBuf::from);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = unique_path(&dir, &format!("Screenshot {}.png", browser_core::now_secs()));
+                    let area = if shortcut == Shortcut::ScreenshotElement { ScreenshotArea::Element } else { ScreenshotArea::Page };
+                    self.engine.screenshot(&id, area, path);
+                    if area == ScreenshotArea::Element {
+                        self.status = "Click an element, then Capture (Esc to cancel)".into();
+                    }
                 }
             }
             Shortcut::CommandPalette => self.open_palette(cx),
@@ -2319,6 +2351,7 @@ impl Render for BrowserWindow {
             .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
             .when_some(self.tab_menu.clone(), |root, menu| root.child(self.tab_menu_view(menu, cx)))
             .when_some(self.term_menu.clone(), |root, menu| root.child(self.term_menu_view(menu, cx)))
+            .when_some(self.shot_menu.clone(), |root, menu| root.child(self.shot_menu_view(menu, cx)))
     }
 }
 
@@ -4091,6 +4124,7 @@ impl BrowserWindow {
         let reload_id = tab_id.to_string();
         let loading = self.engine.progress(tab_id).is_some();
         let bookmark_id = tab_id.to_string();
+        let shot_id = tab_id.to_string();
         let min_id = tab_id.to_string();
         let zoom_id = tab_id.to_string();
         let close_id = tab_id.to_string();
@@ -4123,6 +4157,12 @@ impl BrowserWindow {
             .child(self.tool_button(format!("bookmark-{bookmark_id}"), if bookmarked { Icons::star_filled() } else { Icons::star() }, false, cx, move |this, _, cx| {
                 this.focus_window(&bookmark_id, cx);
                 this.bookmark();
+            }))
+            .child(self.tool_button(format!("shot-{shot_id}"), Icons::camera(), false, cx, move |this, event, cx| {
+                this.focus_window(&shot_id, cx);
+                if let ClickEvent::Mouse(click) = event {
+                    this.shot_menu = Some((shot_id.clone(), click.down.position));
+                }
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
             .child(self.tool_button(format!("min-{min_id}"), Icons::minus(), false, cx, move |this, _, cx| this.minimize_window(&min_id, cx)))

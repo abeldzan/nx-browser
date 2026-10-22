@@ -90,7 +90,7 @@ impl SettingsSection {
             Self::Privacy => "save browsing history https ads trackers block pop-ups popups fraudulent warnings clear cookies site data permissions",
             Self::Passwords => "offer save suggest autofill logins vault",
             Self::Content => "javascript custom user agent",
-            Self::Downloads => "location folder ask where save file",
+            Self::Downloads => "location folder ask where save file screenshot",
             Self::Terminal => "font size line height cursor scrollback shell",
             Self::Performance => "suspend background tabs maximum live tabs memory",
             Self::Developer => "web inspector inspect element",
@@ -409,6 +409,17 @@ impl BrowserWindow {
         menu_card("term-menu", position, rows, cx)
     }
 
+    /// The title bar's screenshot button menu.
+    pub(crate) fn shot_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+        let url = self.model.lock().session_tabs().into_iter().find(|tab| tab.id == id).map(|tab| tab.url.clone()).unwrap_or_default();
+        let web = !url.is_empty() && !is_terminal(&url);
+        let rows = vec![
+            menu_item("Whole Page", web, false, |this, cx| this.on_shortcut(Shortcut::Screenshot, cx), cx),
+            menu_item("Select Element", web, false, |this, cx| this.on_shortcut(Shortcut::ScreenshotElement, cx), cx),
+        ];
+        menu_card("shot-menu", position, rows, cx)
+    }
+
     /// Right-click menu on a tab pill; "other" and "to the right" stay within the tab's window.
     pub(crate) fn tab_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
         let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
@@ -464,6 +475,7 @@ impl BrowserWindow {
         self.rail_menu = None;
         self.tab_menu = None;
         self.term_menu = None;
+        self.shot_menu = None;
     }
 
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
@@ -780,16 +792,20 @@ impl BrowserWindow {
                 .child(row(
                     "Location",
                     Some(settings.download_dir.as_str()),
-                    action_button("download-dir", "Change…", Kind::Secondary, true, cx, |_, cx| {
-                        // gpui's sheet, not runModal: a modal loop inside this click lets gpui's timers re-enter and abort.
-                        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
-                        cx.spawn(async move |this, cx| {
-                            let Ok(Ok(Some(paths))) = paths.await else { return };
-                            let Some(path) = paths.into_iter().next() else { return };
-                            let _ = this.update(cx, |this, cx| this.set_pref(cx, |s| s.download_dir = path.display().to_string()));
+                    action_button("download-dir", "Change…", Kind::Secondary, true, cx, |_, cx| pick_folder(cx, |s, dir| s.download_dir = dir)),
+                    paint,
+                ))
+                .child(row(
+                    "Screenshot location",
+                    Some(if settings.screenshot_dir.is_empty() { "Same as downloads" } else { settings.screenshot_dir.as_str() }),
+                    h_stack()
+                        .gap(px(6.))
+                        .when(!settings.screenshot_dir.is_empty(), |buttons| {
+                            buttons.child(action_button("screenshot-dir-reset", "Use Downloads", Kind::Secondary, true, cx, |this, cx| {
+                                this.set_pref(cx, |s| s.screenshot_dir.clear())
+                            }))
                         })
-                        .detach();
-                    }),
+                        .child(action_button("screenshot-dir", "Change…", Kind::Secondary, true, cx, |_, cx| pick_folder(cx, |s, dir| s.screenshot_dir = dir))),
                     paint,
                 ))
                 .child(row(
@@ -1369,6 +1385,18 @@ fn menu_item(
         })
         .child(label)
         .into_any_element()
+}
+
+/// Asks for a folder, then stores it with `set`.
+fn pick_folder(cx: &mut Context<BrowserWindow>, set: fn(&mut Settings, String)) {
+    // gpui's sheet, not runModal: a modal loop inside this click lets gpui's timers re-enter and abort.
+    let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
+    cx.spawn(async move |this, cx| {
+        let Ok(Ok(Some(paths))) = paths.await else { return };
+        let Some(path) = paths.into_iter().next() else { return };
+        let _ = this.update(cx, |this, cx| this.set_pref(cx, |s| set(s, path.display().to_string())));
+    })
+    .detach();
 }
 
 fn menu_divider(cx: &mut Context<BrowserWindow>) -> gpui::AnyElement {

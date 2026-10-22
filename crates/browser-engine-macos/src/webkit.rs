@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, Shortcut, WebEngine, SHORTCUTS};
+use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine, SHORTCUTS};
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
@@ -889,6 +889,13 @@ impl MacEngine {
         unsafe {
             operation.runOperationModalForWindow_delegate_didRunSelector_contextInfo(&window, None, None, std::ptr::null_mut())
         };
+    }
+
+    /// Writes `area` of the page to `path` as PNG; see `screenshot::capture`.
+    pub fn screenshot(&mut self, tab_id: &str, area: ScreenshotArea, path: PathBuf) {
+        if let Some(live) = self.tabs.get(tab_id) {
+            crate::screenshot::capture(live.view.clone(), self.events_tx.clone(), area, path);
+        }
     }
 
     pub fn load_html(&mut self, tab_id: &str, html: &str, base_url: Option<&str>) {
@@ -2168,7 +2175,7 @@ fn reply_json(reply: &block2::DynBlock<dyn Fn(*mut AnyObject, *mut NSString)>, j
 
 /// The menu bar's shortcut menus, as `SHORTCUTS` ids; "-" is a separator.
 const MENUS: &[(&str, &[&str])] = &[
-    ("File", &["new_tab", "new_terminal", "new_space", "-", "close_tab", "close_window", "reopen_tab", "-", "print"]),
+    ("File", &["new_tab", "new_terminal", "new_space", "-", "close_tab", "close_window", "reopen_tab", "-", "screenshot_page", "screenshot_element", "print"]),
     ("View", &["reload", "hard_reload", "-", "zoom_in", "zoom_out", "zoom_reset", "-", "find", "clear_terminal", "command_palette", "-", "inspect"]),
     ("History", &["back", "forward", "-", "history", "downloads"]),
     ("Bookmarks", &["bookmark", "bookmarks"]),
