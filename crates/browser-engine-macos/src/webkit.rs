@@ -156,15 +156,10 @@ define_class!(
         /// same way as the same NSEvent object; nothing past the page wants them, so drop them too.
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            thread_local! {
-                // Retained so a fresh event can't reuse the address and pass for a resend.
-                static LAST_KEY_DOWN: RefCell<Option<Retained<NSEvent>>> = const { RefCell::new(None) };
+            let resent = take_sent_key(event);
+            if !resent {
+                note_sent_key(event);
             }
-            let resent = LAST_KEY_DOWN.with_borrow_mut(|last| {
-                let resent = last.as_deref().is_some_and(|last| std::ptr::eq(last, event));
-                *last = Some(objc2::Message::retain(event));
-                resent
-            });
             let flags = event.modifierFlags();
             let page_first = bound(event).is_some_and(Shortcut::page_first);
             let ignored_plain_key = resent && !flags.contains(NSEventModifierFlags::Command);
@@ -172,8 +167,43 @@ define_class!(
                 let _: () = unsafe { msg_send![super(self), keyDown: event] };
             }
         }
+
+        /// Arrows and other function keys reach the focused page through here, not keyDown:, and their resend
+        /// comes to keyDown: only; note them so it is known for one. WebKit declines resends here, so they aren't noted.
+        #[unsafe(method(performKeyEquivalent:))]
+        fn perform_key_equivalent(&self, event: &NSEvent) -> Bool {
+            let taken: Bool = unsafe { msg_send![super(self), performKeyEquivalent: event] };
+            if taken.as_bool() {
+                note_sent_key(event);
+            }
+            taken
+        }
     }
 );
+
+thread_local! {
+    // Key-downs sent to a page. Retained so a fresh event can't reuse the address and pass for a resend. Several,
+    // since repeated or quick taps arrive before the page has answered the earlier ones.
+    static SENT_KEY_DOWNS: RefCell<Vec<Retained<NSEvent>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn note_sent_key(event: &NSEvent) {
+    SENT_KEY_DOWNS.with_borrow_mut(|sent| {
+        // Keys the page handled never come back; keep only the latest.
+        if sent.len() == 16 {
+            sent.remove(0);
+        }
+        sent.push(event.retain());
+    });
+}
+
+/// Whether `event` is WebKit resending a key the page ignored; forgets it.
+fn take_sent_key(event: &NSEvent) -> bool {
+    SENT_KEY_DOWNS.with_borrow_mut(|sent| {
+        let at = sent.iter().position(|sent| std::ptr::eq(&**sent, event));
+        at.map(|at| sent.remove(at)).is_some()
+    })
+}
 
 struct DelegateIvars {
     /// Swapped when the page moves to another window's engine.
