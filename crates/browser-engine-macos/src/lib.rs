@@ -1,3 +1,4 @@
+mod debug_lifecycle;
 mod default_browser;
 mod drag;
 mod extensions;
@@ -8,6 +9,7 @@ mod vault;
 #[allow(non_snake_case)]
 mod webkit;
 
+pub use debug_lifecycle::{debug_install_lifecycle_log, debug_log};
 pub use default_browser::make_default_browser;
 pub use drag::drag_file;
 pub use updates::on_check_for_updates;

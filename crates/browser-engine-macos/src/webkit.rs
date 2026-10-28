@@ -409,6 +409,13 @@ define_class!(
             challenge: &NSURLAuthenticationChallenge,
             completion_handler: &block2::DynBlock<dyn Fn(NSURLSessionAuthChallengeDisposition, *mut NSURLCredential)>,
         ) {
+            // WebKit's private challenge class does not implement `protectionSpace`. The dev-build
+            // message check aborts the process, which is what closed the window on launch.
+            let responds: Bool = msg_send![challenge, respondsToSelector: sel!(protectionSpace)];
+            if !responds.as_bool() {
+                completion_handler.call((NSURLSessionAuthChallengeDisposition::PerformDefaultHandling, std::ptr::null_mut()));
+                return;
+            }
             let space = challenge.protectionSpace();
             let host = ns_string(&space.host());
             let server_trust = ns_string(&space.authenticationMethod()) == "NSURLAuthenticationMethodServerTrust";

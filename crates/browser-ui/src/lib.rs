@@ -28,9 +28,46 @@ pub fn run() {
     app.on_open_urls(move |urls| {
         let _ = link_tx.unbounded_send(urls);
     });
+    // Dock clicks with no visible window land here. The model is filled in once startup has opened the database.
+    let reopen_model: Arc<Mutex<Option<SharedModel>>> = Arc::new(Mutex::new(None));
+    let reopen_slot = reopen_model.clone();
+    app.on_reopen(move |cx| {
+        let open = cx.windows().len();
+        // #region agent log
+        browser_engine_macos::debug_log("A", "lib.rs:on_reopen", "gpui on_reopen", &format!(r#"{{"gpuiWindows":{open}}}"#));
+        // #endregion
+        if open == 0 {
+            let Some(model) = reopen_slot.lock().ok().and_then(|slot| slot.clone()) else {
+                return;
+            };
+            let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
+            let _ = open_browser_window(cx, bounds, move |cx| BrowserWindow::new(model, None, false, std::time::Instant::now(), cx));
+        } else if let Some(window) = cx.active_window().or_else(|| cx.windows().into_iter().next()) {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+        cx.activate(true);
+    });
     app.run(move |cx: &mut App| {
         gpuikit::init(cx);
         gpuikit::input::bind_input_keys(cx, None);
+        // #region agent log
+        browser_engine_macos::debug_install_lifecycle_log();
+        let quit_when_empty = !self_test;
+        std::mem::forget(cx.on_window_closed(move |cx, id| {
+            let remaining = cx.windows().len();
+            browser_engine_macos::debug_log(
+                "A",
+                "lib.rs:on_window_closed",
+                "gpui window closed",
+                &format!(r#"{{"id":{},"gpuiWindows":{remaining}}}"#, id.as_u64()),
+            );
+            // The process was staying in the Dock with no window, and a Dock click had nothing to focus.
+            if quit_when_empty && remaining == 0 {
+                browser_engine_macos::debug_log("A", "lib.rs:on_window_closed", "quit after last window", r#"{"quit":true}"#);
+                cx.quit();
+            }
+        }));
+        // #endregion
         let storage = browser_storage::Storage::open(&browser_core::app_support_dir().join("nxbrowser.sqlite"))
             .expect("open browser database");
         let mut model = browser_core::Model::open(storage).expect("open browser model");
@@ -57,6 +94,7 @@ pub fn run() {
         // Listing fonts takes over a second; done now, the settings font lists open instantly.
         std::thread::spawn(|| terminal::monospace_fonts().len());
         let model: SharedModel = Arc::new(Mutex::new(model));
+        *reopen_model.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model.clone());
         update::init(model.clone(), !self_test, cx);
         let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
         let shared = model.clone();
