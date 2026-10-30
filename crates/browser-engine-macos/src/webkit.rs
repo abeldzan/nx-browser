@@ -21,7 +21,7 @@ use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
+    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLProtectionSpace, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
@@ -409,7 +409,20 @@ define_class!(
             challenge: &NSURLAuthenticationChallenge,
             completion_handler: &block2::DynBlock<dyn Fn(NSURLSessionAuthChallengeDisposition, *mut NSURLCredential)>,
         ) {
-            let space = challenge.protectionSpace();
+            // objc2's debug check looks up `protectionSpace` on WebKit's private subclass and
+            // aborts, even though the real send succeeds. Call it directly.
+            extern "C" {
+                fn objc_msgSend();
+            }
+            let space = {
+                let send: unsafe extern "C-unwind" fn(*const NSURLAuthenticationChallenge, Sel) -> *mut NSURLProtectionSpace =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let Some(space) = Retained::retain(send(challenge, sel!(protectionSpace))) else {
+                    completion_handler.call((NSURLSessionAuthChallengeDisposition::PerformDefaultHandling, std::ptr::null_mut()));
+                    return;
+                };
+                space
+            };
             let host = ns_string(&space.host());
             let server_trust = ns_string(&space.authenticationMethod()) == "NSURLAuthenticationMethodServerTrust";
             if server_trust && TRUSTED_HOSTS.lock().unwrap_or_else(PoisonError::into_inner).contains(&host) {

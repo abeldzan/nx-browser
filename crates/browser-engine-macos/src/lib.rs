@@ -1,4 +1,5 @@
 mod default_browser;
+mod dock;
 mod drag;
 mod extensions;
 mod screenshot;
@@ -9,6 +10,7 @@ mod vault;
 mod webkit;
 
 pub use default_browser::make_default_browser;
+pub use dock::install_dock_reopen;
 pub use drag::drag_file;
 pub use updates::on_check_for_updates;
 pub use vault::{authenticate, vault_key};
