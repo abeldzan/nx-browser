@@ -32,11 +32,7 @@ pub fn run() {
     let reopen_model: Arc<Mutex<Option<SharedModel>>> = Arc::new(Mutex::new(None));
     let reopen_slot = reopen_model.clone();
     app.on_reopen(move |cx| {
-        let open = cx.windows().len();
-        // #region agent log
-        browser_engine_macos::debug_log("A", "lib.rs:on_reopen", "gpui on_reopen", &format!(r#"{{"gpuiWindows":{open}}}"#));
-        // #endregion
-        if open == 0 {
+        if cx.windows().is_empty() {
             let Some(model) = reopen_slot.lock().ok().and_then(|slot| slot.clone()) else {
                 return;
             };
@@ -50,24 +46,15 @@ pub fn run() {
     app.run(move |cx: &mut App| {
         gpuikit::init(cx);
         gpuikit::input::bind_input_keys(cx, None);
-        // #region agent log
-        browser_engine_macos::debug_install_lifecycle_log();
+        browser_engine_macos::install_dock_reopen();
         let quit_when_empty = !self_test;
-        std::mem::forget(cx.on_window_closed(move |cx, id| {
-            let remaining = cx.windows().len();
-            browser_engine_macos::debug_log(
-                "A",
-                "lib.rs:on_window_closed",
-                "gpui window closed",
-                &format!(r#"{{"id":{},"gpuiWindows":{remaining}}}"#, id.as_u64()),
-            );
+        cx.on_window_closed(move |cx, _| {
             // The process was staying in the Dock with no window, and a Dock click had nothing to focus.
-            if quit_when_empty && remaining == 0 {
-                browser_engine_macos::debug_log("A", "lib.rs:on_window_closed", "quit after last window", r#"{"quit":true}"#);
+            if quit_when_empty && cx.windows().is_empty() {
                 cx.quit();
             }
-        }));
-        // #endregion
+        })
+        .detach();
         let storage = browser_storage::Storage::open(&browser_core::app_support_dir().join("nxbrowser.sqlite"))
             .expect("open browser database");
         let mut model = browser_core::Model::open(storage).expect("open browser model");
