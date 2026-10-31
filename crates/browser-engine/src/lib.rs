@@ -163,6 +163,8 @@ pub enum DialogKind {
     Prompt,
     /// `beforeunload`: stay on the page or leave it.
     Leave,
+    /// A link only another app can open (`zoommtg:`, `mailto:`); the message is that app's name.
+    OpenApp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

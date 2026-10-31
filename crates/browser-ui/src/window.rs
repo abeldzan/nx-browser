@@ -5492,6 +5492,7 @@ impl BrowserWindow {
             DialogKind::Leave => ("Leave this page?".to_string(), "Changes you made may not be saved.".to_string(), Some("Stay"), "Leave"),
             DialogKind::Alert => (format!("{host} says"), dialog.message.clone(), None, "OK"),
             DialogKind::Confirm | DialogKind::Prompt => (format!("{host} says"), dialog.message.clone(), Some("Cancel"), "OK"),
+            DialogKind::OpenApp => (format!("Open \u{201c}{}\u{201d}?", dialog.message), format!("{host} wants to open this app."), Some("Cancel"), "Open"),
         };
         let answer = move |ok: bool| move |this: &mut Self, cx: &mut Context<Self>| this.answer_dialog(request, ok, cx);
         div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
