@@ -1292,9 +1292,7 @@ impl BrowserWindow {
         if entry.panel.is_none() {
             entry.panel = Some(id.to_string());
             if let Some(bounds) = self.stage_bounds {
-                let (sw, sh) = (f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32);
-                let w = 380f32.min(sw - 20.0);
-                entry.frame = Some(Frame { x: sw - w - 10.0, y: 10.0, w, h: sh - 20.0 });
+                entry.frame = Some(panel_frame(f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32));
             }
         }
         self.focus_window(&tab_id, cx);
@@ -2611,6 +2609,10 @@ impl BrowserWindow {
                 continue;
             };
             let mut chrome = saved.chrome;
+            // A panel is always its own window; a tab saved inside one (an older bug) comes back as a window of its own.
+            if chrome.panel.is_some() && chrome.window.is_some() {
+                chrome = TabChrome::default();
+            }
             let (ow, oh) = saved.stage;
             if chrome.snap.is_some() {
                 chrome.frame = chrome.frame.map(|frame| rescale_snapped(frame, ow, oh, sw, sh));
@@ -2664,6 +2666,10 @@ impl BrowserWindow {
             if free && entry.snap == Some(Snap::Tiled) {
                 // Free space: tiled windows (switched over, or carried in from a tiled space) float where they are.
                 entry.snap = None;
+            }
+            if entry.panel.is_some() && entry.frame.is_none() {
+                // A panel pushed off a shrunk stage would otherwise stay in the dock but never show.
+                entry.frame = Some(panel_frame(sw, sh));
             }
             if entry.frame.is_some() || entry.panel.is_some() || entry.snap.is_some() {
                 continue;
@@ -4772,6 +4778,15 @@ impl BrowserWindow {
     /// Opens a new tab inside the window holding `id`, sharing its frame. `None` opens the new-tab page
     /// with the address field focused.
     pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
+        if self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()) {
+            // A side panel holds only its extension page: the new tab gets a regular window.
+            let Ok(new) = self.with_model(|model| model.create_tab(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string))) else {
+                return;
+            };
+            self.focus_window(&new, cx);
+            self.focus_address = url.is_none();
+            return;
+        }
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
         chrome.window = Some(group);
@@ -6023,6 +6038,12 @@ fn subtract(a: &LogicalRect, b: &LogicalRect) -> Vec<LogicalRect> {
     .into_iter()
     .filter(|part| part.width > 0.0 && part.height > 0.0)
     .collect()
+}
+
+/// A side panel's place: a narrow column down the stage's right edge.
+fn panel_frame(sw: f32, sh: f32) -> Frame {
+    let w = 380f32.min(sw - 20.0);
+    Frame { x: sw - w - 10.0, y: 10.0, w, h: sh - 20.0 }
 }
 
 fn mostly_off(frame: Frame, sw: f32, sh: f32) -> bool {
