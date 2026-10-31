@@ -9,7 +9,7 @@ use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model, TabState,
 };
-use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
+use browser_engine::{DialogKind, Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
 use gpui::{
@@ -159,6 +159,12 @@ pub struct BrowserWindow {
     space_input: Entity<InputState>,
     /// Camera/microphone request the page is waiting on: (request, origin, kind).
     permission: Option<(u64, String, String)>,
+    /// Page dialogs waiting on the user, oldest first; only the first one shows.
+    dialogs: Vec<PageDialog>,
+    dialog_input: Entity<InputState>,
+    /// Holds the keys while an alert or confirm shows, so Enter and Escape answer it.
+    dialog_focus: FocusHandle,
+    focus_dialog: bool,
     pub(crate) passwords: PasswordState,
     /// Downloads WebKit is writing, by engine id: (download id in the model, file path).
     web_downloads: HashMap<u64, (String, String)>,
@@ -310,6 +316,7 @@ impl BrowserWindow {
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let dialog_input = cx.new(InputState::new_singleline);
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -348,6 +355,11 @@ impl BrowserWindow {
                 }
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
+            }),
+            cx.subscribe(&dialog_input, |this, _, event, _| {
+                if let InputStateEvent::Focus = event {
+                    this.engine.focus_chrome();
+                }
             }),
             cx.subscribe(&space_input, |this, input, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
@@ -511,6 +523,10 @@ impl BrowserWindow {
             space_rename: None,
             space_input,
             permission: None,
+            dialogs: Vec::new(),
+            dialog_input,
+            dialog_focus: cx.focus_handle(),
+            focus_dialog: false,
             web_downloads: HashMap::new(),
             attached: false,
             playing: HashSet::new(),
@@ -833,7 +849,13 @@ impl BrowserWindow {
                     }
                 }
             }
-            EngineEvent::Alert { message } => self.status = message.into(),
+            EngineEvent::Dialog { tab_id, origin, kind, message, default, request } => {
+                self.dialogs.push(PageDialog { tab_id, origin, kind, message, default, request });
+                if self.dialogs.len() == 1 {
+                    self.raise_dialog(cx);
+                }
+                cx.notify();
+            }
             EngineEvent::Eval { tab_id, token, value } if token == "find-count" => {
                 if tab_id == self.find_tab {
                     self.find_count = value.parse().ok();
@@ -1375,6 +1397,13 @@ impl BrowserWindow {
             cx.notify();
             return;
         }
+        // A closed page can't wait on its dialogs; answer them so WebKit lets go of their handlers.
+        let front = self.dialogs.first().map(|dialog| dialog.request);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dialogs).into_iter().partition(|dialog| ids.contains(&dialog.tab_id));
+        self.dialogs = kept;
+        for dialog in gone {
+            self.engine.answer_dialog(dialog.request, false, "");
+        }
         self.openers.retain(|child, _| !ids.contains(child));
         self.playing.retain(|id| !ids.contains(id));
         self.finished_url.retain(|id, _| !ids.contains(id));
@@ -1387,6 +1416,9 @@ impl BrowserWindow {
         self.refresh_url(cx);
         if let Some(survivor) = survivor {
             self.focus_window(&survivor, cx);
+        }
+        if !self.dialogs.is_empty() && self.dialogs.first().map(|dialog| dialog.request) != front {
+            self.raise_dialog(cx);
         }
         cx.notify();
     }
@@ -2042,6 +2074,18 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&find.focus_handle(cx), cx));
     }
 
+    fn request_dialog_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_dialog) {
+            return;
+        }
+        let Some(dialog) = self.dialogs.first() else {
+            return;
+        };
+        let handle = if dialog.kind == DialogKind::Prompt { self.dialog_input.focus_handle(cx) } else { self.dialog_focus.clone() };
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+    }
+
     fn request_history_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.focus_history) {
             return;
@@ -2193,6 +2237,7 @@ impl Render for BrowserWindow {
         self.request_palette_focus(window, cx);
         self.request_history_focus(window, cx);
         self.request_find_focus(window, cx);
+        self.request_dialog_focus(window, cx);
         self.request_terminal_focus(window, cx);
         self.build_font_picker(window, cx);
         let _subscriptions = &self.subscriptions;
@@ -2329,6 +2374,7 @@ impl Render for BrowserWindow {
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
             .child(self.permission_prompt(cx))
+            .child(self.dialog_card(cx))
             .child(self.save_password_prompt(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
@@ -5406,6 +5452,86 @@ impl BrowserWindow {
         )
     }
 
+    /// Brings the first waiting dialog's page to the front, with the prompt's preset text and the keys.
+    fn raise_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.first() else {
+            return;
+        };
+        let (tab_id, default) = (dialog.tab_id.clone(), dialog.default.clone());
+        self.dialog_input.update(cx, |input, cx| input.set_content_silent(default, cx));
+        self.focus_window(&tab_id, cx);
+        self.focus_dialog = true;
+    }
+
+    /// Answers dialog `request` if it is the one showing: a key and a click can both land on the same one.
+    fn answer_dialog(&mut self, request: u64, ok: bool, cx: &mut Context<Self>) {
+        if self.dialogs.first().map(|dialog| dialog.request) != Some(request) {
+            return;
+        }
+        self.dialogs.remove(0);
+        let text = self.dialog_input.read(cx).content().to_string();
+        self.engine.answer_dialog(request, ok, &text);
+        if self.dialogs.is_empty() {
+            self.focus_active_content();
+        } else {
+            self.raise_dialog(cx);
+        }
+        cx.notify();
+    }
+
+    /// The page dialog in front, floating at the top of the window while the page waits.
+    fn dialog_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(dialog) = self.dialogs.first() else {
+            return div();
+        };
+        let paint = paint(cx);
+        let request = dialog.request;
+        let host = dialog.origin.split("://").nth(1).filter(|host| !host.is_empty()).unwrap_or("This page");
+        // Browsers stopped showing a page's own beforeunload text, since pages used it to scare people into staying.
+        let (title, message, cancel, ok) = match dialog.kind {
+            DialogKind::Leave => ("Leave this page?".to_string(), "Changes you made may not be saved.".to_string(), Some("Stay"), "Leave"),
+            DialogKind::Alert => (format!("{host} says"), dialog.message.clone(), None, "OK"),
+            DialogKind::Confirm | DialogKind::Prompt => (format!("{host} says"), dialog.message.clone(), Some("Cancel"), "OK"),
+        };
+        let answer = move |ok: bool| move |this: &mut Self, cx: &mut Context<Self>| this.answer_dialog(request, ok, cx);
+        div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
+            v_stack()
+                .relative()
+                .w(px(400.))
+                .p(px(14.))
+                .gap(px(10.))
+                .rounded(px(10.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(paint.text(13.))
+                .occlude()
+                .track_focus(&self.dialog_focus)
+                // The prompt's input binds Enter and Escape to its own actions, which run before key-down listeners.
+                .capture_action(cx.listener(move |this, _: &bindings::Enter, _, cx| this.answer_dialog(request, true, cx)))
+                .capture_action(cx.listener(move |this, _: &bindings::Escape, _, cx| this.answer_dialog(request, false, cx)))
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
+                    "enter" => this.answer_dialog(request, true, cx),
+                    "escape" => this.answer_dialog(request, false, cx),
+                    _ => {}
+                }))
+                .child(measure_overlay(10., cx))
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                .when(!message.is_empty(), |card| card.child(div().id("dialog-message").max_h(px(320.)).overflow_y_scroll().child(message)))
+                .when(dialog.kind == DialogKind::Prompt, |card| {
+                    card.child(text_field(&self.dialog_input, cx).full_width(true))
+                })
+                .child(
+                    h_stack()
+                        .gap(px(8.))
+                        .justify_end()
+                        .children(cancel.map(|label| action_button("dialog-cancel", label, Kind::Secondary, true, cx, answer(false))))
+                        .child(action_button("dialog-ok", ok, Kind::Primary, true, cx, answer(true))),
+                ),
+        )
+    }
+
     fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
         div()
             .mt(px(4.))
@@ -5414,6 +5540,16 @@ impl BrowserWindow {
             .child(label)
     }
 
+}
+
+/// A page's alert, confirm, prompt or leave-page question, waiting on `answer_dialog`.
+struct PageDialog {
+    tab_id: String,
+    origin: String,
+    kind: DialogKind,
+    message: String,
+    default: String,
+    request: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

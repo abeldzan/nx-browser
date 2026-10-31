@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine, SHORTCUTS};
+use browser_engine::{DialogKind, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine, SHORTCUTS};
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
@@ -53,6 +53,8 @@ thread_local! {
     /// Password-script messages waiting for the UI, by `EngineEvent::Passwords::request`.
     /// shortcut: a tab closed before the UI answers leaves its entry here; evict on close if that ever matters.
     static PASSWORD_ASKS: RefCell<HashMap<u64, ScriptReply>> = RefCell::new(HashMap::new());
+    /// Page dialogs waiting for the user, by `EngineEvent::Dialog::request`.
+    static DIALOGS: RefCell<HashMap<u64, DialogReply>> = RefCell::new(HashMap::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
     /// Downloads WebKit is running, by `EngineEvent::Download::download`.
     static DOWNLOADS: RefCell<HashMap<u64, Download>> = RefCell::new(HashMap::new());
@@ -460,13 +462,33 @@ define_class!(
             &self,
             _web_view: &WKWebView,
             message: &NSString,
-            _frame: &objc2_web_kit::WKFrameInfo,
+            frame: &objc2_web_kit::WKFrameInfo,
             completion_handler: &block2::DynBlock<dyn Fn()>,
         ) {
-            let _ = self.ivars().events.borrow().send(EngineEvent::Alert {
-                message: ns_string(message),
-            });
-            completion_handler.call(());
+            self.ask(frame, DialogKind::Alert, message, None, DialogReply::Done(completion_handler.copy()));
+        }
+
+        #[unsafe(method(webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+        unsafe fn webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            message: &NSString,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(Bool)>,
+        ) {
+            self.ask(frame, DialogKind::Confirm, message, None, DialogReply::Bool(completion_handler.copy()));
+        }
+
+        #[unsafe(method(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:))]
+        unsafe fn webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            prompt: &NSString,
+            default_text: Option<&NSString>,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSString)>,
+        ) {
+            self.ask(frame, DialogKind::Prompt, prompt, default_text, DialogReply::Text(completion_handler.copy()));
         }
 
         // `<input type=file>`: without this WebKit on macOS shows no picker at all.
@@ -527,6 +549,18 @@ define_class!(
     }
 
     impl NxWebDelegate {
+        /// `beforeunload` (WKUIDelegatePrivate, as Safari uses): without it WebKit leaves without asking.
+        #[unsafe(method(_webView:runBeforeUnloadConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+        unsafe fn run_before_unload(
+            &self,
+            _web_view: &WKWebView,
+            message: &NSString,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(Bool)>,
+        ) {
+            self.ask(frame, DialogKind::Leave, message, None, DialogReply::Bool(completion_handler.copy()));
+        }
+
         /// KVO on the view's `URL` and `title`: in-page navigations (pushState, as on YouTube) never
         /// reach the navigation delegate, so the address bar would lag behind them.
         #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
@@ -610,6 +644,24 @@ impl NxWebDelegate {
     fn new(mtm: MainThreadMarker, ivars: DelegateIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Holds a page dialog's handler until the UI answers; WebKit keeps the page waiting meanwhile.
+    fn ask(&self, frame: &objc2_web_kit::WKFrameInfo, kind: DialogKind, message: &NSString, default: Option<&NSString>, reply: DialogReply) {
+        let origin = unsafe {
+            let origin = frame.securityOrigin();
+            format!("{}://{}", ns_string(&origin.protocol()), ns_string(&origin.host()))
+        };
+        let request = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+        DIALOGS.with_borrow_mut(|dialogs| dialogs.insert(request, reply));
+        let _ = self.ivars().events.borrow().send(EngineEvent::Dialog {
+            tab_id: self.ivars().tab_id.clone(),
+            origin,
+            kind,
+            message: ns_string(message),
+            default: default.map(ns_string).unwrap_or_default(),
+            request,
+        });
     }
 
     fn track_download(&self, download: &WKDownload) {
@@ -1063,6 +1115,19 @@ impl MacEngine {
     pub fn answer_permission(&mut self, request: u64, allow: bool) {
         if let Some(handler) = ASKS.with_borrow_mut(|asks| asks.remove(&request)) {
             handler.call((if allow { WKPermissionDecision::Grant } else { WKPermissionDecision::Deny },));
+        }
+    }
+
+    /// Answers a page dialog: OK (with prompt's text) or cancel; an unknown or already answered one is ignored.
+    pub fn answer_dialog(&mut self, request: u64, ok: bool, text: &str) {
+        match DIALOGS.with_borrow_mut(|dialogs| dialogs.remove(&request)) {
+            Some(DialogReply::Done(reply)) => reply.call(()),
+            Some(DialogReply::Bool(reply)) => reply.call((Bool::new(ok),)),
+            Some(DialogReply::Text(reply)) => {
+                let text = ok.then(|| NSString::from_str(text));
+                reply.call((text.as_ref().map_or(std::ptr::null_mut(), |text| Retained::as_ptr(text).cast_mut()),));
+            }
+            None => {}
         }
     }
 
@@ -1875,6 +1940,11 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
 
 type PermissionReply = RcBlock<dyn Fn(WKPermissionDecision)>;
 type ScriptReply = RcBlock<dyn Fn(*mut AnyObject, *mut NSString)>;
+enum DialogReply {
+    Done(RcBlock<dyn Fn()>),
+    Bool(RcBlock<dyn Fn(Bool)>),
+    Text(RcBlock<dyn Fn(*mut NSString)>),
+}
 /// Pages and the URL each will load, per data store.
 type HeldLoads = Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>;
 
