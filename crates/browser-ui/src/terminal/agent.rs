@@ -23,6 +23,13 @@ pub enum Status {
     Done,
 }
 
+/// The agent in a terminal's foreground and what it is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentState {
+    pub agent: Agent,
+    pub status: Status,
+}
+
 impl Agent {
     pub fn from_process(name: &str) -> Option<Self> {
         Some(match name.rsplit('/').next().unwrap_or(name) {
@@ -79,24 +86,29 @@ pub fn status(agent: Agent, title: Option<&str>, tail: &str) -> Status {
     let title = title.unwrap_or_default();
     let tail = tail.to_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| tail.contains(needle));
-    let spinner = title.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c) && c != '\u{2800}');
+    let spinner = title.chars().any(is_spinner);
     let (blocked, working) = match agent {
         Agent::Claude => (
             has(&["do you want to proceed?", "waiting for permission", "do you want to allow"]) || (tail.contains("esc to cancel") && tail.contains("enter to")),
-            title.starts_with(|c| ('\u{2800}'..='\u{28FF}').contains(&c) || ('\u{25D0}'..='\u{25D3}').contains(&c)) || has(&["esc to interrupt"]),
+            title.starts_with(|c| is_spinner(c) || ('\u{25D0}'..='\u{25D3}').contains(&c)) || has(&["esc to interrupt"]),
         ),
         Agent::Codex => (
             title.contains("Action Required") || has(&["allow command?", "press enter to confirm or esc to cancel", "[y/n]"]),
             spinner || has(&["to interrupt)"]),
         ),
         Agent::OpenCode => (has(&["△ permission required"]), has(&["esc to interrupt", "esc interrupt", "■■■■", "⬝⬝⬝⬝"])),
-        _ => (has(&["do you want to", "[y/n]", "allow once", "waiting for user confirmation"]), spinner || has(&["esc to cancel", "esc to interrupt"])),
+        Agent::Gemini | Agent::Cursor | Agent::Copilot | Agent::Amp => (has(&["do you want to", "[y/n]", "allow once", "waiting for user confirmation"]), spinner || has(&["esc to cancel", "esc to interrupt"])),
     };
     match (blocked, working) {
         (true, _) => Status::Blocked,
         (_, true) => Status::Working,
         _ => Status::Idle,
     }
+}
+
+/// A braille spinner frame, as agents put in their title while working; the blank cell U+2800 is not one.
+fn is_spinner(c: char) -> bool {
+    ('\u{2801}'..='\u{28FF}').contains(&c)
 }
 
 /// The session's name from the title the agent set, without its status glyph (`⠂ `, `✳ `);
@@ -111,9 +123,9 @@ pub fn session_title(agent: Agent, title: &str) -> Option<String> {
 }
 
 /// The status to show: an agent that stops working while its tab is in the background is Done until the tab is seen.
-pub fn next(prev: Option<Status>, now: Status, active: bool) -> Status {
+pub fn next(prev: Option<Status>, now: Status, seen: bool) -> Status {
     match (prev, now) {
-        (Some(Status::Working | Status::Done), Status::Idle) if !active => Status::Done,
+        (Some(Status::Working | Status::Done), Status::Idle) if !seen => Status::Done,
         _ => now,
     }
 }
@@ -133,6 +145,16 @@ mod tests {
     }
 
     #[test]
+    fn every_agent_logo_is_bundled() {
+        use gpui::AssetSource;
+        for agent in [Agent::Claude, Agent::Codex, Agent::OpenCode, Agent::Gemini, Agent::Cursor, Agent::Copilot, Agent::Amp] {
+            if let Some(path) = agent.icon() {
+                assert!(crate::Assets.load(path).ok().flatten().is_some(), "{agent:?}'s logo {path} is missing from Assets::load in lib.rs");
+            }
+        }
+    }
+
+    #[test]
     fn claude_states() {
         assert_eq!(status(Agent::Claude, Some("⠂ Fix the build"), ""), Status::Working);
         assert_eq!(status(Agent::Claude, Some("✳ Claude Code"), "> \n? for shortcuts"), Status::Idle);
@@ -145,6 +167,7 @@ mod tests {
     fn codex_and_opencode_states() {
         assert_eq!(status(Agent::Codex, Some("Action Required"), ""), Status::Blocked);
         assert_eq!(status(Agent::Codex, Some("⠹ codex"), ""), Status::Working);
+        assert_eq!(status(Agent::Claude, Some("\u{2800} Fix the build"), ""), Status::Idle);
         assert_eq!(status(Agent::Codex, None, "• Working (5s • esc to interrupt)"), Status::Working);
         assert_eq!(status(Agent::Codex, Some("codex"), "› Ask Codex to do anything"), Status::Idle);
         assert_eq!(status(Agent::OpenCode, None, "△ Permission required\n  Bash ls"), Status::Blocked);

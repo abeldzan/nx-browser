@@ -11,7 +11,7 @@ use browser_core::Settings;
 use gpui::{App, AppContext, Entity, Global};
 use std::collections::HashMap;
 use std::path::PathBuf;
-pub use agent::{Agent, Status};
+pub use agent::{AgentState, Status};
 pub use view::TerminalView;
 
 pub const TERMINAL_URL: &str = "nxbrowser://terminal";
@@ -125,8 +125,8 @@ pub fn get(tab_id: &str, cx: &App) -> Option<Entity<TerminalView>> {
 }
 
 /// The coding agent running in the tab's terminal and its status.
-pub fn agent(tab_id: &str, cx: &App) -> Option<(Agent, Status)> {
-    get(tab_id, cx)?.read(cx).agent
+pub fn agent(tab_id: &str, cx: &App) -> Option<AgentState> {
+    get(tab_id, cx)?.read(cx).agent()
 }
 
 /// Ends shells whose tab is gone or now shows a web page (the PTY is killed when the view drops).

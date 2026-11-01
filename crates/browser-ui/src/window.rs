@@ -679,7 +679,8 @@ impl BrowserWindow {
             let Some(view) = terminal::get(&tab.id, cx) else {
                 continue;
             };
-            let (url, agent_changed) = view.update(cx, |view, _| (view.open_url.take(), view.refresh_agent(active.as_deref() == Some(tab.id.as_str()))));
+            let seen = active.as_deref() == Some(tab.id.as_str());
+            let (url, agent_changed) = view.update(cx, |view, _| (view.open_url.take(), view.refresh_agent(seen)));
             changed |= agent_changed;
             if let Some(url) = url {
                 links.push((tab.id.clone(), url));
@@ -6234,32 +6235,22 @@ pub(crate) fn site_host(url: &str) -> String {
 /// The site's icon once cached, otherwise a coloured initial; a terminal running a coding agent shows the agent.
 fn favicon(tab: &browser_core::Tab, round: bool, cx: &gpui::App) -> gpui::AnyElement {
     match terminal::agent(&tab.id, cx).filter(|_| is_terminal(&tab.url)) {
-        Some((agent, status)) => agent_icon(&tab.id, agent, status, 16., cx),
+        Some(state) => agent_icon(&tab.id, state, 16., cx),
         None => site_icon(&tab.url, 16., round),
     }
 }
 
 /// The agent's logo with a status dot in the corner, coloured as herdr does; it pulses while the agent works or waits.
-fn agent_icon(tab_id: &str, agent: terminal::Agent, status: terminal::Status, size: f32, cx: &gpui::App) -> gpui::AnyElement {
+fn agent_icon(tab_id: &str, state: terminal::AgentState, size: f32, cx: &gpui::App) -> gpui::AnyElement {
     use gpui::{pulsating_between, Animation, AnimationExt};
     use terminal::Status;
-    let fg = paint(cx).fg;
-    let tint = agent.color().map_or(fg, |color| gpui::rgb(color).into());
+    let agent = state.agent;
+    let tint = agent.color().map_or(paint(cx).fg, |color| gpui::rgb(color).into());
     let logo = match agent.icon() {
         Some(path) => gpui::svg().path(path).size(px(size)).text_color(tint).into_any_element(),
-        None => div()
-            .size(px(size))
-            .rounded(px((size / 4.).max(4.)))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(tint)
-            .text_color(gpui::rgb(0xFFFFFF))
-            .text_size(px((size * 0.55).max(10.)))
-            .child(agent.name().chars().next().unwrap_or('A').to_string())
-            .into_any_element(),
+        None => letter_tile(agent.name().chars().take(1).collect(), tint, size, (size / 4.).max(4.)),
     };
-    let (color, pulse) = match status {
+    let (color, pulse) = match state.status {
         Status::Working => (gpui::rgb(0xF5A524).into(), Some(1200)),
         Status::Blocked => (cx.theme().danger(), Some(600)),
         Status::Done => (gpui::rgb(0x2DD4BF).into(), None),
@@ -6283,25 +6274,28 @@ pub(crate) fn site_icon(url: &str, size: f32, round: bool) -> gpui::AnyElement {
     let (glyph, host) = site_glyph(url);
     let radius = if round { size / 2. } else { (size / 4.).max(4.) };
     let path = favicon_path(&host);
-    let tile = move || {
-        div()
-            .size(px(size))
-            .flex_none()
-            .rounded(px(radius))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(site_color(&host))
-            .text_color(gpui::rgb(0xFFFFFF))
-            .text_size(px((size * 0.55).max(10.)))
-            .child(glyph.clone())
-            .into_any_element()
-    };
+    let tile = move || letter_tile(glyph.clone(), site_color(&host), size, radius);
     if is_web(url) && path.exists() {
         img(path).size(px(size)).flex_none().rounded(px(radius)).with_fallback(tile).into_any_element()
     } else {
         tile()
     }
+}
+
+/// A white initial on a coloured square: the icon for a site without a favicon, or an agent without a logo.
+fn letter_tile(glyph: String, color: gpui::Hsla, size: f32, radius: f32) -> gpui::AnyElement {
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded(px(radius))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(color)
+        .text_color(gpui::rgb(0xFFFFFF))
+        .text_size(px((size * 0.55).max(10.)))
+        .child(glyph)
+        .into_any_element()
 }
 
 pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {

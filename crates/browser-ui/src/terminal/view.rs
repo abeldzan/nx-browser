@@ -1,6 +1,6 @@
 //! A terminal tab's screen: PTY in, alacritty grid + kitty images out (ported from kubenx's workloads.rs).
 
-use super::agent::{self, Agent, Status};
+use super::agent::{self, Agent, AgentState};
 use super::emu::Emulator;
 use super::input::{key_bytes, mouse_bytes, reports_mouse, MouseAction};
 use super::kitty::{Delete, Graphics, Piece, Show, Splitter};
@@ -80,7 +80,7 @@ pub struct TerminalView {
     /// The foreground process group when the title was set (`None`: the shell), so a title dies with its program.
     title_owner: Option<libc::pid_t>,
     /// The coding agent in the foreground and its status, refreshed by the window each tick.
-    pub agent: Option<(Agent, Status)>,
+    agent: Option<AgentState>,
     font: SharedString,
     font_size: f32,
     line_height: f32,
@@ -172,23 +172,29 @@ impl TerminalView {
     /// or running program, else the folder.
     pub fn title(&self) -> String {
         let front = self.pty.as_ref().and_then(Pty::foreground_group);
-        let set = self.osc_title.as_deref().filter(|_| self.title_owner == front);
-        if let Some((agent, _)) = self.agent {
-            return set.and_then(|title| agent::session_title(agent, title)).unwrap_or_else(|| agent.name().into());
+        let program_title = self.osc_title.as_deref().filter(|_| self.title_owner == front);
+        if let Some(AgentState { agent, .. }) = self.agent {
+            return program_title.and_then(|title| agent::session_title(agent, title)).unwrap_or_else(|| agent.name().into());
         }
         let program = || self.pty.as_ref().and_then(Pty::foreground);
-        set.map(str::to_string).or_else(program).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+        program_title.map(str::to_string).or_else(program).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+    }
+
+    /// The coding agent in the foreground and its status, as of the last `refresh_agent`.
+    pub fn agent(&self) -> Option<AgentState> {
+        self.agent
     }
 
     /// Re-reads which agent is in the foreground and what it is doing; true if that changed.
-    pub fn refresh_agent(&mut self, active: bool) -> bool {
+    #[must_use]
+    pub fn refresh_agent(&mut self, seen: bool) -> bool {
         let names = self.pty.as_ref().map(Pty::foreground_names).unwrap_or_default();
-        let agent = names.iter().find_map(|name| Agent::from_process(name)).map(|agent| {
+        let state = names.iter().find_map(|name| Agent::from_process(name)).map(|agent| {
             let now = agent::status(agent, self.osc_title.as_deref(), &self.emu.screen_tail(15));
-            let prev = self.agent.filter(|(was, _)| *was == agent).map(|(_, status)| status);
-            (agent, agent::next(prev, now, active))
+            let prev = self.agent.filter(|state| state.agent == agent).map(|state| state.status);
+            AgentState { agent, status: agent::next(prev, now, seen) }
         });
-        std::mem::replace(&mut self.agent, agent) != agent
+        std::mem::replace(&mut self.agent, state) != state
     }
 
     pub fn cwd(&self) -> Option<PathBuf> {
