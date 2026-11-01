@@ -89,16 +89,39 @@ impl Pty {
 
     /// The program in the foreground, when it is not the shell itself (`vim`, `htop`).
     pub fn foreground(&self) -> Option<String> {
-        let group = self.master.process_group_leader().filter(|pid| *pid > 0)?;
-        if self.child.as_ref().and_then(|child| child.process_id()).is_some_and(|shell| shell as libc::pid_t == group) {
-            return None;
-        }
-        let mut buf = [0u8; 64];
-        // SAFETY: the buffer is valid for `buf.len()` bytes for the whole call.
-        let len = unsafe { libc::proc_name(group, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
-        Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+        proc_name(self.foreground_group()?)
     }
+
+    /// Names of every process in the foreground job, leader first: an npm-installed agent is a `node`
+    /// launcher leading the group, with the real `codex`/`opencode` binary beside it.
+    // shortcut: an agent that only ever runs as `node` (Claude installed via npm) is not named here; read argv via KERN_PROCARGS2 as herdr does if that matters.
+    pub fn foreground_names(&self) -> Vec<String> {
+        /// `PROC_PGRP_ONLY` from <sys/proc_info.h>; libc doesn't export it.
+        const PROC_PGRP_ONLY: u32 = 2;
+        let Some(group) = self.foreground_group() else {
+            return Vec::new();
+        };
+        let mut pids = [0 as libc::pid_t; 64];
+        // SAFETY: the buffer is valid for its size in bytes for the whole call.
+        let bytes = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group as u32, pids.as_mut_ptr().cast(), std::mem::size_of_val(&pids) as libc::c_int) };
+        let count = (usize::try_from(bytes).unwrap_or(0) / std::mem::size_of::<libc::pid_t>()).min(pids.len());
+        std::iter::once(group).chain(pids[..count].iter().copied().filter(|pid| *pid > 0 && *pid != group)).filter_map(proc_name).collect()
+    }
+
+    /// The foreground process group, when it is not the shell itself.
+    fn foreground_group(&self) -> Option<libc::pid_t> {
+        let group = self.master.process_group_leader().filter(|pid| *pid > 0)?;
+        let shell = self.child.as_ref().and_then(|child| child.process_id());
+        (!shell.is_some_and(|shell| shell as libc::pid_t == group)).then_some(group)
+    }
+}
+
+fn proc_name(pid: libc::pid_t) -> Option<String> {
+    let mut buf = [0u8; 64];
+    // SAFETY: the buffer is valid for `buf.len()` bytes for the whole call.
+    let len = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let len = usize::try_from(len).ok().filter(|len| *len > 0)?;
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
 impl Drop for Pty {

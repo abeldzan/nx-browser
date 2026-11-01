@@ -674,11 +674,14 @@ impl BrowserWindow {
         let mut changed = false;
         let mut exited = Vec::new();
         let mut links = Vec::new();
+        let active = self.active_tab_id();
         for tab in tabs {
             let Some(view) = terminal::get(&tab.id, cx) else {
                 continue;
             };
-            if let Some(url) = view.update(cx, |view, _| view.open_url.take()) {
+            let (url, agent_changed) = view.update(cx, |view, _| (view.open_url.take(), view.refresh_agent(active.as_deref() == Some(tab.id.as_str()))));
+            changed |= agent_changed;
+            if let Some(url) = url {
                 links.push((tab.id.clone(), url));
             }
             let view = view.read(cx);
@@ -3827,7 +3830,7 @@ impl BrowserWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().group_hover(hover_group.clone(), |style| style.opacity(0.)).child(favicon(tab, false)))
+                            .child(div().group_hover(hover_group.clone(), |style| style.opacity(0.)).child(favicon(tab, false, cx)))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("ctab-close-{close_id}")))
@@ -4368,7 +4371,7 @@ impl BrowserWindow {
                         })
                     })
                     .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.space_chips.push((chip_id, bounds))), |_, _, _, _| {}).absolute().size_full())
-                    .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
+                    .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }, cx))
                     .map(|chip| match self.space_rename.as_deref() == Some(session.id.as_str()) {
                         true => chip.child(input(&self.space_input, cx).w(px(96.)).text_size(paint.text(12.)).text_color(paint.fg)),
                         false => chip.child(session.name.clone()),
@@ -4564,7 +4567,7 @@ impl BrowserWindow {
                     .when(current, |item| item.bg(ink.opacity(0.16)))
                     .when(!current, |item| item.hover(|style| style.bg(ink.opacity(0.08))))
                     .when(minimized, |item| item.opacity(0.45))
-                    .child(favicon_stack(members, island))
+                    .child(favicon_stack(members, island, cx))
                     .when(members.len() > 1, |item| {
                         item.child(
                             div()
@@ -4979,7 +4982,7 @@ impl BrowserWindow {
                     v_stack()
                         .size_full()
                         .child(div().h(px(title)).flex_none().bg(paint.surface).border_b_1().border_color(paint.border))
-                        .child(div().flex_1().flex().items_center().justify_center().child(favicon_stack(&members, paint.secondary))),
+                        .child(div().flex_1().flex().items_center().justify_center().child(favicon_stack(&members, paint.secondary, cx))),
                 ),
         )
     }
@@ -5248,7 +5251,7 @@ impl BrowserWindow {
                 .text_size(paint.text(12.))
                 .text_color(paint.fg)
                 .child(measure_overlay(8.0, cx))
-                .child(favicon(tab, false))
+                .child(favicon(tab, false, cx))
                 .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
         )
     }
@@ -5990,7 +5993,7 @@ fn stack_w(count: usize) -> f32 {
 }
 
 /// Up to three round favicons overlapping left to right, ringed in `ring` so each reads against the next.
-fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
+fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla, cx: &gpui::App) -> gpui::Div {
     let mut row = div().relative().flex_none().w(px(stack_w(tabs.len()))).h(px(20.));
     for (index, tab) in tabs.iter().take(3).enumerate() {
         row = row.child(
@@ -6006,7 +6009,7 @@ fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(favicon(tab, true)),
+                .child(favicon(tab, true, cx)),
         );
     }
     row
@@ -6228,9 +6231,52 @@ pub(crate) fn site_host(url: &str) -> String {
     site_glyph(url).1
 }
 
-/// The site's icon once cached, otherwise a coloured initial.
-fn favicon(tab: &browser_core::Tab, round: bool) -> gpui::AnyElement {
-    site_icon(&tab.url, 16., round)
+/// The site's icon once cached, otherwise a coloured initial; a terminal running a coding agent shows the agent.
+fn favicon(tab: &browser_core::Tab, round: bool, cx: &gpui::App) -> gpui::AnyElement {
+    match terminal::agent(&tab.id, cx).filter(|_| is_terminal(&tab.url)) {
+        Some((agent, status)) => agent_icon(&tab.id, agent, status, 16., cx),
+        None => site_icon(&tab.url, 16., round),
+    }
+}
+
+/// The agent's logo with a status dot in the corner, coloured as herdr does; it pulses while the agent works or waits.
+fn agent_icon(tab_id: &str, agent: terminal::Agent, status: terminal::Status, size: f32, cx: &gpui::App) -> gpui::AnyElement {
+    use gpui::{pulsating_between, Animation, AnimationExt};
+    use terminal::Status;
+    let fg = paint(cx).fg;
+    let tint = agent.color().map_or(fg, |color| gpui::rgb(color).into());
+    let logo = match agent.icon() {
+        Some(path) => gpui::svg().path(path).size(px(size)).text_color(tint).into_any_element(),
+        None => div()
+            .size(px(size))
+            .rounded(px((size / 4.).max(4.)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(tint)
+            .text_color(gpui::rgb(0xFFFFFF))
+            .text_size(px((size * 0.55).max(10.)))
+            .child(agent.name().chars().next().unwrap_or('A').to_string())
+            .into_any_element(),
+    };
+    let (color, pulse) = match status {
+        Status::Working => (gpui::rgb(0xF5A524).into(), Some(1200)),
+        Status::Blocked => (cx.theme().danger(), Some(600)),
+        Status::Done => (gpui::rgb(0x2DD4BF).into(), None),
+        Status::Idle => (gpui::rgb(0x22C55E).into(), None),
+    };
+    let dot = div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(7.)).rounded_full().border_1().border_color(gpui::black().opacity(0.45)).bg(color);
+    let dot = match pulse {
+        Some(ms) => dot
+            .with_animation(
+                SharedString::from(format!("agent-dot-{tab_id}-{ms}")),
+                Animation::new(Duration::from_millis(ms)).repeat().with_easing(pulsating_between(0.35, 1.)),
+                |dot, delta| dot.opacity(delta),
+            )
+            .into_any_element(),
+        None => dot.into_any_element(),
+    };
+    div().relative().size(px(size)).flex_none().child(logo).child(dot).into_any_element()
 }
 
 pub(crate) fn site_icon(url: &str, size: f32, round: bool) -> gpui::AnyElement {

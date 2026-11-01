@@ -1,5 +1,6 @@
 //! A terminal tab's screen: PTY in, alacritty grid + kitty images out (ported from kubenx's workloads.rs).
 
+use super::agent::{self, Agent, Status};
 use super::emu::Emulator;
 use super::input::{key_bytes, mouse_bytes, reports_mouse, MouseAction};
 use super::kitty::{Delete, Graphics, Piece, Show, Splitter};
@@ -76,6 +77,8 @@ pub struct TerminalView {
     /// Last grid size applied from the pane, so an unchanged frame does not resize.
     measured: Rc<Cell<(u16, u16)>>,
     osc_title: Option<String>,
+    /// The coding agent in the foreground and its status, refreshed by the window each tick.
+    pub agent: Option<(Agent, Status)>,
     font: SharedString,
     font_size: f32,
     line_height: f32,
@@ -107,6 +110,7 @@ impl TerminalView {
             })),
             measured: Rc::new(Cell::new((rows, cols))),
             osc_title: None,
+            agent: None,
             font: SharedString::default(),
             font_size: 0.,
             line_height: 0.,
@@ -161,10 +165,24 @@ impl TerminalView {
         self.emu.set_options(settings.terminal_scrollback.clamp(100, 1_000_000), cursor);
     }
 
-    /// What the tab should say: the running program, else a title the shell set, else the folder.
+    /// What the tab should say: the agent, else the running program, else a title the shell set, else the folder.
     pub fn title(&self) -> String {
+        if let Some((agent, _)) = self.agent {
+            return agent.name().into();
+        }
         let program = self.pty.as_ref().and_then(Pty::foreground);
         program.or_else(|| self.osc_title.clone()).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+    }
+
+    /// Re-reads which agent is in the foreground and what it is doing; true if that changed.
+    pub fn refresh_agent(&mut self, active: bool) -> bool {
+        let names = self.pty.as_ref().map(Pty::foreground_names).unwrap_or_default();
+        let agent = names.iter().find_map(|name| Agent::from_process(name)).map(|agent| {
+            let now = agent::status(agent, self.osc_title.as_deref(), &self.emu.screen_tail(15));
+            let prev = self.agent.filter(|(was, _)| *was == agent).map(|(_, status)| status);
+            (agent, agent::next(prev, now, active))
+        });
+        std::mem::replace(&mut self.agent, agent) != agent
     }
 
     pub fn cwd(&self) -> Option<PathBuf> {

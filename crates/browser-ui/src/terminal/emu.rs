@@ -213,6 +213,20 @@ impl Emulator {
         }
         rows.join("\n")
     }
+
+    /// The last `count` non-empty rows of the live screen, whatever is scrolled into view.
+    pub fn screen_tail(&self, count: usize) -> String {
+        use alacritty_terminal::index::Line;
+        let last = self.term.columns() - 1;
+        let mut rows: Vec<String> = (0..self.term.screen_lines() as i32)
+            .rev()
+            .map(|row| self.term.bounds_to_string(Point::new(Line(row), Column(0)), Point::new(Line(row), Column(last))).trim_end().to_string())
+            .filter(|row| !row.is_empty())
+            .take(count)
+            .collect();
+        rows.reverse();
+        rows.join("\n")
+    }
 }
 
 fn config(scrollback: usize, cursor: CursorShape) -> Config {
@@ -308,6 +322,15 @@ mod tests {
         let mut emu = Emulator::new(5, 20, 10);
         let feed = emu.feed(b"\x1b]52;c;aGVsbG8=\x07");
         assert!(feed.reply.is_empty());
+    }
+
+    #[test]
+    fn screen_tail_skips_blank_rows_and_ignores_scrolling() {
+        let mut emu = Emulator::new(5, 16, 100);
+        emu.feed(b"one\r\n\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert_eq!(emu.screen_tail(3), "three\nfour\nfive");
+        emu.scroll_by(3);
+        assert_eq!(emu.screen_tail(2), "four\nfive");
     }
 
     #[test]
