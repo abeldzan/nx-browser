@@ -135,13 +135,19 @@ pub(crate) const MIC_ICON: &str = "icons/app/mic.svg";
 
 impl gpui::AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        if path == PUZZLE_ICON {
-            return Ok(Some(include_bytes!("../assets/puzzle.svg").as_slice().into()));
-        }
-        if path == MIC_ICON {
-            return Ok(Some(include_bytes!("../assets/mic.svg").as_slice().into()));
-        }
-        gpuikit::assets().load(path)
+        let bytes: &'static [u8] = match path {
+            PUZZLE_ICON => include_bytes!("../assets/puzzle.svg"),
+            MIC_ICON => include_bytes!("../assets/mic.svg"),
+            // Agent logos for terminal tabs (simple-icons, CC0); paths from `terminal::Agent::icon`.
+            "icons/agents/claude.svg" => include_bytes!("../assets/agents/claude.svg"),
+            "icons/agents/openai.svg" => include_bytes!("../assets/agents/openai.svg"),
+            "icons/agents/opencode.svg" => include_bytes!("../assets/agents/opencode.svg"),
+            "icons/agents/gemini.svg" => include_bytes!("../assets/agents/gemini.svg"),
+            "icons/agents/cursor.svg" => include_bytes!("../assets/agents/cursor.svg"),
+            "icons/agents/copilot.svg" => include_bytes!("../assets/agents/copilot.svg"),
+            _ => return gpuikit::assets().load(path),
+        };
+        Ok(Some(bytes.into()))
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<gpui::SharedString>> {

@@ -9,7 +9,7 @@ use browser_core::{
     app_support_dir, downloads_dir, fetch_suggestions, normalize_url, snapshot, spawn_favicon, unique_path, Effect,
     Model, TabState,
 };
-use browser_engine::{Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
+use browser_engine::{DialogKind, Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
 use gpui::{
@@ -159,6 +159,12 @@ pub struct BrowserWindow {
     space_input: Entity<InputState>,
     /// Camera/microphone request the page is waiting on: (request, origin, kind).
     permission: Option<(u64, String, String)>,
+    /// Page dialogs waiting on the user, oldest first; only the first one shows.
+    dialogs: Vec<PageDialog>,
+    dialog_input: Entity<InputState>,
+    /// Holds the keys while an alert or confirm shows, so Enter and Escape answer it.
+    dialog_focus: FocusHandle,
+    focus_dialog: bool,
     pub(crate) passwords: PasswordState,
     /// Downloads WebKit is writing, by engine id: (download id in the model, file path).
     web_downloads: HashMap<u64, (String, String)>,
@@ -310,6 +316,7 @@ impl BrowserWindow {
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
+        let dialog_input = cx.new(InputState::new_singleline);
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -348,6 +355,11 @@ impl BrowserWindow {
                 }
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
+            }),
+            cx.subscribe(&dialog_input, |this, _, event, _| {
+                if let InputStateEvent::Focus = event {
+                    this.engine.focus_chrome();
+                }
             }),
             cx.subscribe(&space_input, |this, input, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
@@ -511,6 +523,10 @@ impl BrowserWindow {
             space_rename: None,
             space_input,
             permission: None,
+            dialogs: Vec::new(),
+            dialog_input,
+            dialog_focus: cx.focus_handle(),
+            focus_dialog: false,
             web_downloads: HashMap::new(),
             attached: false,
             playing: HashSet::new(),
@@ -658,11 +674,15 @@ impl BrowserWindow {
         let mut changed = false;
         let mut exited = Vec::new();
         let mut links = Vec::new();
+        let active = self.active_tab_id();
         for tab in tabs {
             let Some(view) = terminal::get(&tab.id, cx) else {
                 continue;
             };
-            if let Some(url) = view.update(cx, |view, _| view.open_url.take()) {
+            let seen = active.as_deref() == Some(tab.id.as_str());
+            let (url, agent_changed) = view.update(cx, |view, _| (view.open_url.take(), view.refresh_agent(seen)));
+            changed |= agent_changed;
+            if let Some(url) = url {
                 links.push((tab.id.clone(), url));
             }
             let view = view.read(cx);
@@ -833,7 +853,13 @@ impl BrowserWindow {
                     }
                 }
             }
-            EngineEvent::Alert { message } => self.status = message.into(),
+            EngineEvent::Dialog { tab_id, origin, kind, message, default, request } => {
+                self.dialogs.push(PageDialog { tab_id, origin, kind, message, default, request });
+                if self.dialogs.len() == 1 {
+                    self.raise_dialog(cx);
+                }
+                cx.notify();
+            }
             EngineEvent::Eval { tab_id, token, value } if token == "find-count" => {
                 if tab_id == self.find_tab {
                     self.find_count = value.parse().ok();
@@ -1292,9 +1318,7 @@ impl BrowserWindow {
         if entry.panel.is_none() {
             entry.panel = Some(id.to_string());
             if let Some(bounds) = self.stage_bounds {
-                let (sw, sh) = (f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32);
-                let w = 380f32.min(sw - 20.0);
-                entry.frame = Some(Frame { x: sw - w - 10.0, y: 10.0, w, h: sh - 20.0 });
+                entry.frame = Some(panel_frame(f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32));
             }
         }
         self.focus_window(&tab_id, cx);
@@ -1377,6 +1401,13 @@ impl BrowserWindow {
             cx.notify();
             return;
         }
+        // A closed page can't wait on its dialogs; answer them so WebKit lets go of their handlers.
+        let front = self.dialogs.first().map(|dialog| dialog.request);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dialogs).into_iter().partition(|dialog| ids.contains(&dialog.tab_id));
+        self.dialogs = kept;
+        for dialog in gone {
+            self.engine.answer_dialog(dialog.request, false, "");
+        }
         self.openers.retain(|child, _| !ids.contains(child));
         self.playing.retain(|id| !ids.contains(id));
         self.finished_url.retain(|id, _| !ids.contains(id));
@@ -1389,6 +1420,9 @@ impl BrowserWindow {
         self.refresh_url(cx);
         if let Some(survivor) = survivor {
             self.focus_window(&survivor, cx);
+        }
+        if !self.dialogs.is_empty() && self.dialogs.first().map(|dialog| dialog.request) != front {
+            self.raise_dialog(cx);
         }
         cx.notify();
     }
@@ -2044,6 +2078,18 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&find.focus_handle(cx), cx));
     }
 
+    fn request_dialog_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.focus_dialog) {
+            return;
+        }
+        let Some(dialog) = self.dialogs.first() else {
+            return;
+        };
+        let handle = if dialog.kind == DialogKind::Prompt { self.dialog_input.focus_handle(cx) } else { self.dialog_focus.clone() };
+        self.engine.focus_chrome();
+        window.defer(cx, move |window, cx| window.focus(&handle, cx));
+    }
+
     fn request_history_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.focus_history) {
             return;
@@ -2195,6 +2241,7 @@ impl Render for BrowserWindow {
         self.request_palette_focus(window, cx);
         self.request_history_focus(window, cx);
         self.request_find_focus(window, cx);
+        self.request_dialog_focus(window, cx);
         self.request_terminal_focus(window, cx);
         self.build_font_picker(window, cx);
         let _subscriptions = &self.subscriptions;
@@ -2331,6 +2378,7 @@ impl Render for BrowserWindow {
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
             .child(self.permission_prompt(cx))
+            .child(self.dialog_card(cx))
             .child(self.save_password_prompt(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
@@ -2611,6 +2659,10 @@ impl BrowserWindow {
                 continue;
             };
             let mut chrome = saved.chrome;
+            // A panel is always its own window; a tab saved inside one (an older bug) comes back as a window of its own.
+            if chrome.panel.is_some() && chrome.window.is_some() {
+                chrome = TabChrome::default();
+            }
             let (ow, oh) = saved.stage;
             if chrome.snap.is_some() {
                 chrome.frame = chrome.frame.map(|frame| rescale_snapped(frame, ow, oh, sw, sh));
@@ -2664,6 +2716,10 @@ impl BrowserWindow {
             if free && entry.snap == Some(Snap::Tiled) {
                 // Free space: tiled windows (switched over, or carried in from a tiled space) float where they are.
                 entry.snap = None;
+            }
+            if entry.panel.is_some() && entry.frame.is_none() {
+                // A panel pushed off a shrunk stage would otherwise stay in the dock but never show.
+                entry.frame = Some(panel_frame(sw, sh));
             }
             if entry.frame.is_some() || entry.panel.is_some() || entry.snap.is_some() {
                 continue;
@@ -3775,7 +3831,7 @@ impl BrowserWindow {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(div().group_hover(hover_group.clone(), |style| style.opacity(0.)).child(favicon(tab, false)))
+                            .child(div().group_hover(hover_group.clone(), |style| style.opacity(0.)).child(favicon(tab, false, cx)))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("ctab-close-{close_id}")))
@@ -4316,7 +4372,7 @@ impl BrowserWindow {
                         })
                     })
                     .child(canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.space_chips.push((chip_id, bounds))), |_, _, _, _| {}).absolute().size_full())
-                    .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }))
+                    .child(favicon_stack(&members, if active { paint.secondary } else { paint.surface }, cx))
                     .map(|chip| match self.space_rename.as_deref() == Some(session.id.as_str()) {
                         true => chip.child(input(&self.space_input, cx).w(px(96.)).text_size(paint.text(12.)).text_color(paint.fg)),
                         false => chip.child(session.name.clone()),
@@ -4512,7 +4568,7 @@ impl BrowserWindow {
                     .when(current, |item| item.bg(ink.opacity(0.16)))
                     .when(!current, |item| item.hover(|style| style.bg(ink.opacity(0.08))))
                     .when(minimized, |item| item.opacity(0.45))
-                    .child(favicon_stack(members, island))
+                    .child(favicon_stack(members, island, cx))
                     .when(members.len() > 1, |item| {
                         item.child(
                             div()
@@ -4772,6 +4828,15 @@ impl BrowserWindow {
     /// Opens a new tab inside the window holding `id`, sharing its frame. `None` opens the new-tab page
     /// with the address field focused.
     pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
+        if self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()) {
+            // A side panel holds only its extension page: the new tab gets a regular window.
+            let Ok(new) = self.with_model(|model| model.create_tab(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string))) else {
+                return;
+            };
+            self.focus_window(&new, cx);
+            self.focus_address = url.is_none();
+            return;
+        }
         let group = self.group_id(id);
         let mut chrome = self.chrome.get(id).cloned().unwrap_or_default();
         chrome.window = Some(group);
@@ -4918,7 +4983,7 @@ impl BrowserWindow {
                     v_stack()
                         .size_full()
                         .child(div().h(px(title)).flex_none().bg(paint.surface).border_b_1().border_color(paint.border))
-                        .child(div().flex_1().flex().items_center().justify_center().child(favicon_stack(&members, paint.secondary))),
+                        .child(div().flex_1().flex().items_center().justify_center().child(favicon_stack(&members, paint.secondary, cx))),
                 ),
         )
     }
@@ -5187,7 +5252,7 @@ impl BrowserWindow {
                 .text_size(paint.text(12.))
                 .text_color(paint.fg)
                 .child(measure_overlay(8.0, cx))
-                .child(favicon(tab, false))
+                .child(favicon(tab, false, cx))
                 .child(div().min_w(px(0.)).truncate().child(tab_label(&tab.title, &tab.url))),
         )
     }
@@ -5391,6 +5456,87 @@ impl BrowserWindow {
         )
     }
 
+    /// Brings the first waiting dialog's page to the front, with the prompt's preset text and the keys.
+    fn raise_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.dialogs.first() else {
+            return;
+        };
+        let (tab_id, default) = (dialog.tab_id.clone(), dialog.default.clone());
+        self.dialog_input.update(cx, |input, cx| input.set_content_silent(default, cx));
+        self.focus_window(&tab_id, cx);
+        self.focus_dialog = true;
+    }
+
+    /// Answers dialog `request` if it is the one showing: a key and a click can both land on the same one.
+    fn answer_dialog(&mut self, request: u64, ok: bool, cx: &mut Context<Self>) {
+        if self.dialogs.first().map(|dialog| dialog.request) != Some(request) {
+            return;
+        }
+        self.dialogs.remove(0);
+        let text = self.dialog_input.read(cx).content().to_string();
+        self.engine.answer_dialog(request, ok, &text);
+        if self.dialogs.is_empty() {
+            self.focus_active_content();
+        } else {
+            self.raise_dialog(cx);
+        }
+        cx.notify();
+    }
+
+    /// The page dialog in front, floating at the top of the window while the page waits.
+    fn dialog_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(dialog) = self.dialogs.first() else {
+            return div();
+        };
+        let paint = paint(cx);
+        let request = dialog.request;
+        let host = dialog.origin.split("://").nth(1).filter(|host| !host.is_empty()).unwrap_or("This page");
+        // Browsers stopped showing a page's own beforeunload text, since pages used it to scare people into staying.
+        let (title, message, cancel, ok) = match dialog.kind {
+            DialogKind::Leave => ("Leave this page?".to_string(), "Changes you made may not be saved.".to_string(), Some("Stay"), "Leave"),
+            DialogKind::Alert => (format!("{host} says"), dialog.message.clone(), None, "OK"),
+            DialogKind::Confirm | DialogKind::Prompt => (format!("{host} says"), dialog.message.clone(), Some("Cancel"), "OK"),
+            DialogKind::OpenApp => (format!("Open \u{201c}{}\u{201d}?", dialog.message), format!("{host} wants to open this app."), Some("Cancel"), "Open"),
+        };
+        let answer = move |ok: bool| move |this: &mut Self, cx: &mut Context<Self>| this.answer_dialog(request, ok, cx);
+        div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
+            v_stack()
+                .relative()
+                .w(px(400.))
+                .p(px(14.))
+                .gap(px(10.))
+                .rounded(px(10.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(paint.text(13.))
+                .occlude()
+                .track_focus(&self.dialog_focus)
+                // The prompt's input binds Enter and Escape to its own actions, which run before key-down listeners.
+                .capture_action(cx.listener(move |this, _: &bindings::Enter, _, cx| this.answer_dialog(request, true, cx)))
+                .capture_action(cx.listener(move |this, _: &bindings::Escape, _, cx| this.answer_dialog(request, false, cx)))
+                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
+                    "enter" => this.answer_dialog(request, true, cx),
+                    "escape" => this.answer_dialog(request, false, cx),
+                    _ => {}
+                }))
+                .child(measure_overlay(10., cx))
+                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
+                .when(!message.is_empty(), |card| card.child(div().id("dialog-message").max_h(px(320.)).overflow_y_scroll().child(message)))
+                .when(dialog.kind == DialogKind::Prompt, |card| {
+                    card.child(text_field(&self.dialog_input, cx).full_width(true))
+                })
+                .child(
+                    h_stack()
+                        .gap(px(8.))
+                        .justify_end()
+                        .children(cancel.map(|label| action_button("dialog-cancel", label, Kind::Secondary, true, cx, answer(false))))
+                        .child(action_button("dialog-ok", ok, Kind::Primary, true, cx, answer(true))),
+                ),
+        )
+    }
+
     fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
         div()
             .mt(px(4.))
@@ -5399,6 +5545,16 @@ impl BrowserWindow {
             .child(label)
     }
 
+}
+
+/// A page's alert, confirm, prompt or leave-page question, waiting on `answer_dialog`.
+struct PageDialog {
+    tab_id: String,
+    origin: String,
+    kind: DialogKind,
+    message: String,
+    default: String,
+    request: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -5838,7 +5994,7 @@ fn stack_w(count: usize) -> f32 {
 }
 
 /// Up to three round favicons overlapping left to right, ringed in `ring` so each reads against the next.
-fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
+fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla, cx: &gpui::App) -> gpui::Div {
     let mut row = div().relative().flex_none().w(px(stack_w(tabs.len()))).h(px(20.));
     for (index, tab) in tabs.iter().take(3).enumerate() {
         row = row.child(
@@ -5854,7 +6010,7 @@ fn favicon_stack(tabs: &[&browser_core::Tab], ring: gpui::Hsla) -> gpui::Div {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(favicon(tab, true)),
+                .child(favicon(tab, true, cx)),
         );
     }
     row
@@ -6025,6 +6181,12 @@ fn subtract(a: &LogicalRect, b: &LogicalRect) -> Vec<LogicalRect> {
     .collect()
 }
 
+/// A side panel's place: a narrow column down the stage's right edge.
+fn panel_frame(sw: f32, sh: f32) -> Frame {
+    let w = 380f32.min(sw - 20.0);
+    Frame { x: sw - w - 10.0, y: 10.0, w, h: sh - 20.0 }
+}
+
 fn mostly_off(frame: Frame, sw: f32, sh: f32) -> bool {
     let visible_w = (frame.x + frame.w).min(sw) - frame.x.max(0.0);
     let visible_h = (frame.y + frame.h).min(sh) - frame.y.max(0.0);
@@ -6070,34 +6232,70 @@ pub(crate) fn site_host(url: &str) -> String {
     site_glyph(url).1
 }
 
-/// The site's icon once cached, otherwise a coloured initial.
-fn favicon(tab: &browser_core::Tab, round: bool) -> gpui::AnyElement {
-    site_icon(&tab.url, 16., round)
+/// The site's icon once cached, otherwise a coloured initial; a terminal running a coding agent shows the agent.
+fn favicon(tab: &browser_core::Tab, round: bool, cx: &gpui::App) -> gpui::AnyElement {
+    match terminal::agent(&tab.id, cx).filter(|_| is_terminal(&tab.url)) {
+        Some(state) => agent_icon(&tab.id, state, 16., cx),
+        None => site_icon(&tab.url, 16., round),
+    }
+}
+
+/// The agent's logo with a status dot in the corner, coloured as herdr does; it pulses while the agent works or waits.
+fn agent_icon(tab_id: &str, state: terminal::AgentState, size: f32, cx: &gpui::App) -> gpui::AnyElement {
+    use gpui::{pulsating_between, Animation, AnimationExt};
+    use terminal::Status;
+    let agent = state.agent;
+    let tint = agent.color().map_or(paint(cx).fg, |color| gpui::rgb(color).into());
+    let logo = match agent.icon() {
+        Some(path) => gpui::svg().path(path).size(px(size)).text_color(tint).into_any_element(),
+        None => letter_tile(agent.name().chars().take(1).collect(), tint, size, (size / 4.).max(4.)),
+    };
+    let (color, pulse) = match state.status {
+        Status::Working => (gpui::rgb(0xF5A524).into(), Some(1200)),
+        Status::Blocked => (cx.theme().danger(), Some(600)),
+        Status::Done => (gpui::rgb(0x2DD4BF).into(), None),
+        Status::Idle => (gpui::rgb(0x22C55E).into(), None),
+    };
+    let dot = div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(7.)).rounded_full().border_1().border_color(gpui::black().opacity(0.45)).bg(color);
+    let dot = match pulse {
+        Some(ms) => dot
+            .with_animation(
+                SharedString::from(format!("agent-dot-{tab_id}-{ms}")),
+                Animation::new(Duration::from_millis(ms)).repeat().with_easing(pulsating_between(0.35, 1.)),
+                |dot, delta| dot.opacity(delta),
+            )
+            .into_any_element(),
+        None => dot.into_any_element(),
+    };
+    div().relative().size(px(size)).flex_none().child(logo).child(dot).into_any_element()
 }
 
 pub(crate) fn site_icon(url: &str, size: f32, round: bool) -> gpui::AnyElement {
     let (glyph, host) = site_glyph(url);
     let radius = if round { size / 2. } else { (size / 4.).max(4.) };
     let path = favicon_path(&host);
-    let tile = move || {
-        div()
-            .size(px(size))
-            .flex_none()
-            .rounded(px(radius))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(site_color(&host))
-            .text_color(gpui::rgb(0xFFFFFF))
-            .text_size(px((size * 0.55).max(10.)))
-            .child(glyph.clone())
-            .into_any_element()
-    };
+    let tile = move || letter_tile(glyph.clone(), site_color(&host), size, radius);
     if is_web(url) && path.exists() {
         img(path).size(px(size)).flex_none().rounded(px(radius)).with_fallback(tile).into_any_element()
     } else {
         tile()
     }
+}
+
+/// A white initial on a coloured square: the icon for a site without a favicon, or an agent without a logo.
+fn letter_tile(glyph: String, color: gpui::Hsla, size: f32, radius: f32) -> gpui::AnyElement {
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded(px(radius))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(color)
+        .text_color(gpui::rgb(0xFFFFFF))
+        .text_size(px((size * 0.55).max(10.)))
+        .child(glyph)
+        .into_any_element()
 }
 
 pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {

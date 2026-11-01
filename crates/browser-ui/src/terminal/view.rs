@@ -1,5 +1,6 @@
 //! A terminal tab's screen: PTY in, alacritty grid + kitty images out (ported from kubenx's workloads.rs).
 
+use super::agent::{self, Agent, AgentState};
 use super::emu::Emulator;
 use super::input::{key_bytes, mouse_bytes, reports_mouse, MouseAction};
 use super::kitty::{Delete, Graphics, Piece, Show, Splitter};
@@ -76,6 +77,10 @@ pub struct TerminalView {
     /// Last grid size applied from the pane, so an unchanged frame does not resize.
     measured: Rc<Cell<(u16, u16)>>,
     osc_title: Option<String>,
+    /// The foreground process group when the title was set (`None`: the shell), so a title dies with its program.
+    title_owner: Option<libc::pid_t>,
+    /// The coding agent in the foreground and its status, refreshed by the window each tick.
+    agent: Option<AgentState>,
     font: SharedString,
     font_size: f32,
     line_height: f32,
@@ -107,6 +112,8 @@ impl TerminalView {
             })),
             measured: Rc::new(Cell::new((rows, cols))),
             osc_title: None,
+            title_owner: None,
+            agent: None,
             font: SharedString::default(),
             font_size: 0.,
             line_height: 0.,
@@ -161,10 +168,33 @@ impl TerminalView {
         self.emu.set_options(settings.terminal_scrollback.clamp(100, 1_000_000), cursor);
     }
 
-    /// What the tab should say: the running program, else a title the shell set, else the folder.
+    /// What the tab should say: the title the program in front set (an agent's session name), else the agent
+    /// or running program, else the folder.
     pub fn title(&self) -> String {
-        let program = self.pty.as_ref().and_then(Pty::foreground);
-        program.or_else(|| self.osc_title.clone()).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+        let front = self.pty.as_ref().and_then(Pty::foreground_group);
+        let program_title = self.osc_title.as_deref().filter(|_| self.title_owner == front);
+        if let Some(AgentState { agent, .. }) = self.agent {
+            return program_title.and_then(|title| agent::session_title(agent, title)).unwrap_or_else(|| agent.name().into());
+        }
+        let program = || self.pty.as_ref().and_then(Pty::foreground);
+        program_title.map(str::to_string).or_else(program).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+    }
+
+    /// The coding agent in the foreground and its status, as of the last `refresh_agent`.
+    pub fn agent(&self) -> Option<AgentState> {
+        self.agent
+    }
+
+    /// Re-reads which agent is in the foreground and what it is doing; true if that changed.
+    #[must_use]
+    pub fn refresh_agent(&mut self, seen: bool) -> bool {
+        let names = self.pty.as_ref().map(Pty::foreground_names).unwrap_or_default();
+        let state = names.iter().find_map(|name| Agent::from_process(name)).map(|agent| {
+            let now = agent::status(agent, self.osc_title.as_deref(), &self.emu.screen_tail(15));
+            let prev = self.agent.filter(|state| state.agent == agent).map(|state| state.status);
+            AgentState { agent, status: agent::next(prev, now, seen) }
+        });
+        std::mem::replace(&mut self.agent, state) != state
     }
 
     pub fn cwd(&self) -> Option<PathBuf> {
@@ -192,6 +222,7 @@ impl TerminalView {
                     let feed = self.emu.feed(&text);
                     if let Some(title) = feed.title {
                         self.osc_title = title.as_deref().and_then(clean_title);
+                        self.title_owner = self.pty.as_ref().and_then(Pty::foreground_group);
                     }
                     self.send(&feed.reply);
                 }

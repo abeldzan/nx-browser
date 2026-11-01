@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use block2::RcBlock;
-use browser_engine::{EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine, SHORTCUTS};
+use browser_engine::{DialogKind, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine, SHORTCUTS};
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
@@ -53,6 +53,8 @@ thread_local! {
     /// Password-script messages waiting for the UI, by `EngineEvent::Passwords::request`.
     /// shortcut: a tab closed before the UI answers leaves its entry here; evict on close if that ever matters.
     static PASSWORD_ASKS: RefCell<HashMap<u64, ScriptReply>> = RefCell::new(HashMap::new());
+    /// Page dialogs waiting for the user, by `EngineEvent::Dialog::request`.
+    static DIALOGS: RefCell<HashMap<u64, DialogReply>> = RefCell::new(HashMap::new());
     static PRIVATE_STORES: RefCell<HashMap<String, Retained<WKWebsiteDataStore>>> = RefCell::new(HashMap::new());
     /// Downloads WebKit is running, by `EngineEvent::Download::download`.
     static DOWNLOADS: RefCell<HashMap<u64, Download>> = RefCell::new(HashMap::new());
@@ -263,6 +265,11 @@ define_class!(
                 }
                 return;
             }
+            if let Some((url, app)) = navigation_action.request().URL().and_then(|url| external_app(&url, MainThreadMarker::from(self)).map(|app| (url, app))) {
+                decision_handler.call((WKNavigationActionPolicy::Cancel,));
+                self.open_external(&url, &app, navigation_action.sourceFrame());
+                return;
+            }
             // ⌥-click (WebKit's default would download the link) previews it instead, as Zen's Glance.
             let peek = navigation_action.navigationType() == WKNavigationType::LinkActivated
                 && navigation_action.modifierFlags().contains(NSEventModifierFlags::Option);
@@ -460,13 +467,33 @@ define_class!(
             &self,
             _web_view: &WKWebView,
             message: &NSString,
-            _frame: &objc2_web_kit::WKFrameInfo,
+            frame: &objc2_web_kit::WKFrameInfo,
             completion_handler: &block2::DynBlock<dyn Fn()>,
         ) {
-            let _ = self.ivars().events.borrow().send(EngineEvent::Alert {
-                message: ns_string(message),
-            });
-            completion_handler.call(());
+            self.ask(Some(frame), DialogKind::Alert, message, None, DialogReply::Done(completion_handler.copy()));
+        }
+
+        #[unsafe(method(webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+        unsafe fn webView_runJavaScriptConfirmPanelWithMessage_initiatedByFrame_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            message: &NSString,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(Bool)>,
+        ) {
+            self.ask(Some(frame), DialogKind::Confirm, message, None, DialogReply::Bool(completion_handler.copy()));
+        }
+
+        #[unsafe(method(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:))]
+        unsafe fn webView_runJavaScriptTextInputPanelWithPrompt_defaultText_initiatedByFrame_completionHandler(
+            &self,
+            _web_view: &WKWebView,
+            prompt: &NSString,
+            default_text: Option<&NSString>,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(*mut NSString)>,
+        ) {
+            self.ask(Some(frame), DialogKind::Prompt, prompt, default_text, DialogReply::Text(completion_handler.copy()));
         }
 
         // `<input type=file>`: without this WebKit on macOS shows no picker at all.
@@ -527,6 +554,18 @@ define_class!(
     }
 
     impl NxWebDelegate {
+        /// `beforeunload` (WKUIDelegatePrivate, as Safari uses): without it WebKit leaves without asking.
+        #[unsafe(method(_webView:runBeforeUnloadConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+        unsafe fn run_before_unload(
+            &self,
+            _web_view: &WKWebView,
+            message: &NSString,
+            frame: &objc2_web_kit::WKFrameInfo,
+            completion_handler: &block2::DynBlock<dyn Fn(Bool)>,
+        ) {
+            self.ask(Some(frame), DialogKind::Leave, message, None, DialogReply::Bool(completion_handler.copy()));
+        }
+
         /// KVO on the view's `URL` and `title`: in-page navigations (pushState, as on YouTube) never
         /// reach the navigation delegate, so the address bar would lag behind them.
         #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
@@ -612,6 +651,31 @@ impl NxWebDelegate {
         unsafe { msg_send![super(this), init] }
     }
 
+    /// Holds a page dialog's handler until the UI answers; WebKit keeps the page waiting meanwhile.
+    fn ask(&self, frame: Option<&objc2_web_kit::WKFrameInfo>, kind: DialogKind, message: &NSString, default: Option<&NSString>, reply: DialogReply) {
+        let origin = frame.map(|frame| unsafe {
+            let origin = frame.securityOrigin();
+            format!("{}://{}", ns_string(&origin.protocol()), ns_string(&origin.host()))
+        });
+        let request = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
+        DIALOGS.with_borrow_mut(|dialogs| dialogs.insert(request, reply));
+        let _ = self.ivars().events.borrow().send(EngineEvent::Dialog {
+            tab_id: self.ivars().tab_id.clone(),
+            origin: origin.unwrap_or_default(),
+            kind,
+            message: ns_string(message),
+            default: default.map(ns_string).unwrap_or_default(),
+            request,
+        });
+    }
+
+    /// Asks before handing a link to `app`, as Safari does.
+    fn open_external(&self, url: &NSURL, app: &NSURL, frame: Option<Retained<objc2_web_kit::WKFrameInfo>>) {
+        let name = app.lastPathComponent().map(|name| ns_string(&name)).unwrap_or_default();
+        let name = NSString::from_str(name.trim_end_matches(".app"));
+        self.ask(frame.as_deref(), DialogKind::OpenApp, &name, None, DialogReply::Open(url.retain()));
+    }
+
     fn track_download(&self, download: &WKDownload) {
         let id = NEXT_ASK.fetch_add(1, Ordering::Relaxed);
         DOWNLOAD_DELEGATE.with(|delegate| unsafe { download.setDelegate(Some(ProtocolObject::from_ref(&**delegate))) });
@@ -622,6 +686,13 @@ impl NxWebDelegate {
     fn open_popup(&self, web_view: &WKWebView, configuration: &WKWebViewConfiguration, navigation_action: &WKNavigationAction) -> Option<Retained<WKWebView>> {
         if unsafe { navigation_action.targetFrame() }.is_some() {
             return None;
+        }
+        if let Some(url) = unsafe { navigation_action.request() }.URL() {
+            if let Some(app) = external_app(&url, MainThreadMarker::from(self)) {
+                // No tab for it: it would stay empty while the app takes the link.
+                self.open_external(&url, &app, unsafe { navigation_action.sourceFrame() });
+                return None;
+            }
         }
         let url = unsafe { navigation_action.request() }.URL().and_then(|url| url.absoluteString()).map(|url| ns_string(&url))?;
         let from_extension = unsafe { web_view.URL() }.and_then(|url| url.absoluteString()).is_some_and(|url| ns_string(&url).starts_with(crate::EXTENSION_SCHEME));
@@ -1063,6 +1134,22 @@ impl MacEngine {
     pub fn answer_permission(&mut self, request: u64, allow: bool) {
         if let Some(handler) = ASKS.with_borrow_mut(|asks| asks.remove(&request)) {
             handler.call((if allow { WKPermissionDecision::Grant } else { WKPermissionDecision::Deny },));
+        }
+    }
+
+    /// Answers a page dialog: OK (with prompt's text) or cancel; an unknown or already answered one is ignored.
+    pub fn answer_dialog(&mut self, request: u64, ok: bool, text: &str) {
+        match DIALOGS.with_borrow_mut(|dialogs| dialogs.remove(&request)) {
+            Some(DialogReply::Done(reply)) => reply.call(()),
+            Some(DialogReply::Bool(reply)) => reply.call((Bool::new(ok),)),
+            Some(DialogReply::Text(reply)) => {
+                let text = ok.then(|| NSString::from_str(text));
+                reply.call((text.as_ref().map_or(std::ptr::null_mut(), |text| Retained::as_ptr(text).cast_mut()),));
+            }
+            Some(DialogReply::Open(url)) if ok => {
+                NSWorkspace::sharedWorkspace().openURL(&url);
+            }
+            Some(DialogReply::Open(_)) | None => {}
         }
     }
 
@@ -1875,6 +1962,24 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
 
 type PermissionReply = RcBlock<dyn Fn(WKPermissionDecision)>;
 type ScriptReply = RcBlock<dyn Fn(*mut AnyObject, *mut NSString)>;
+enum DialogReply {
+    Done(RcBlock<dyn Fn()>),
+    Bool(RcBlock<dyn Fn(Bool)>),
+    Text(RcBlock<dyn Fn(*mut NSString)>),
+    /// Not WebKit's: the link to hand to its app once the user agrees.
+    Open(Retained<NSURL>),
+}
+
+/// The app macOS opens `url` with, when it's a link WebKit can't load (`slack:`, `mailto:`) and not one of ours.
+/// None when no app takes it either: WebKit then shows that it can't open the page.
+fn external_app(url: &NSURL, mtm: MainThreadMarker) -> Option<Retained<NSURL>> {
+    let scheme = url.scheme()?;
+    if unsafe { WKWebView::handlesURLScheme(&scheme, mtm) } || SCHEME.starts_with(&format!("{}:", ns_string(&scheme))) {
+        return None;
+    }
+    let own = NSBundle::mainBundle().bundleURL();
+    NSWorkspace::sharedWorkspace().URLForApplicationToOpenURL(url).filter(|app| *app != own)
+}
 /// Pages and the URL each will load, per data store.
 type HeldLoads = Rc<RefCell<HashMap<String, Vec<(Retained<WKWebView>, String)>>>>;
 

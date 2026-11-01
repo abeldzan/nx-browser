@@ -61,8 +61,16 @@ pub enum EngineEvent {
         /// The tab whose page asked for it; the new tab joins that tab's window.
         from: Option<String>,
     },
-    Alert {
+    /// A page's alert, confirm, prompt or leave-page question; the page waits for `answer_dialog(request, ..)`.
+    Dialog {
+        tab_id: String,
+        /// The asking frame's origin, from WebKit.
+        origin: String,
+        kind: DialogKind,
         message: String,
+        /// Prompt's preset text.
+        default: String,
+        request: u64,
     },
     Eval {
         tab_id: String,
@@ -148,6 +156,17 @@ impl Default for EngineSettings {
 }
 
 /// What a screenshot captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogKind {
+    Alert,
+    Confirm,
+    Prompt,
+    /// `beforeunload`: stay on the page or leave it.
+    Leave,
+    /// A link only another app can open (`zoommtg:`, `mailto:`); the message is that app's name.
+    OpenApp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenshotArea {
     /// The whole document, scrolling through it.

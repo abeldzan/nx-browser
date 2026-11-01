@@ -1,5 +1,6 @@
 //! Terminal tabs: a tab whose URL is `nxbrowser://terminal` shows a shell instead of a web page.
 
+mod agent;
 mod emu;
 mod input;
 mod kitty;
@@ -10,6 +11,7 @@ use browser_core::Settings;
 use gpui::{App, AppContext, Entity, Global};
 use std::collections::HashMap;
 use std::path::PathBuf;
+pub use agent::{AgentState, Status};
 pub use view::TerminalView;
 
 pub const TERMINAL_URL: &str = "nxbrowser://terminal";
@@ -120,6 +122,11 @@ pub fn terminal_for(tab_id: &str, url: &str, cx: &mut App) -> Entity<TerminalVie
 
 pub fn get(tab_id: &str, cx: &App) -> Option<Entity<TerminalView>> {
     cx.try_global::<Terminals>().and_then(|terminals| terminals.0.get(tab_id).cloned())
+}
+
+/// The coding agent running in the tab's terminal and its status.
+pub fn agent(tab_id: &str, cx: &App) -> Option<AgentState> {
+    get(tab_id, cx)?.read(cx).agent()
 }
 
 /// Ends shells whose tab is gone or now shows a web page (the PTY is killed when the view drops).
