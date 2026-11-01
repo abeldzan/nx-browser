@@ -99,6 +99,17 @@ pub fn status(agent: Agent, title: Option<&str>, tail: &str) -> Status {
     }
 }
 
+/// The session's name from the title the agent set, without its status glyph (`⠂ `, `✳ `);
+/// `None` when the title only names the agent or a state.
+pub fn session_title(agent: Agent, title: &str) -> Option<String> {
+    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
+    let generic = title.is_empty()
+        || title.eq_ignore_ascii_case(agent.name())
+        || Agent::from_process(&title.to_lowercase()) == Some(agent)
+        || title.contains("Action Required");
+    (!generic).then(|| title.to_string())
+}
+
 /// The status to show: an agent that stops working while its tab is in the background is Done until the tab is seen.
 pub fn next(prev: Option<Status>, now: Status, active: bool) -> Status {
     match (prev, now) {
@@ -139,6 +150,17 @@ mod tests {
         assert_eq!(status(Agent::OpenCode, None, "△ Permission required\n  Bash ls"), Status::Blocked);
         assert_eq!(status(Agent::OpenCode, None, "■■■■⬝⬝⬝⬝  esc interrupt"), Status::Working);
         assert_eq!(status(Agent::OpenCode, None, "ctrl+p commands"), Status::Idle);
+    }
+
+    #[test]
+    fn session_titles_drop_status_glyphs_and_generic_names() {
+        assert_eq!(session_title(Agent::Claude, "⠂ Fix the build").as_deref(), Some("Fix the build"));
+        assert_eq!(session_title(Agent::Claude, "✳ Fix the build").as_deref(), Some("Fix the build"));
+        assert_eq!(session_title(Agent::Claude, "✳ Claude Code"), None);
+        assert_eq!(session_title(Agent::Codex, "⠹ codex"), None);
+        assert_eq!(session_title(Agent::Codex, "Action Required"), None);
+        assert_eq!(session_title(Agent::OpenCode, "OpenCode"), None);
+        assert_eq!(session_title(Agent::OpenCode, "◐ ").as_deref(), None);
     }
 
     #[test]

@@ -77,6 +77,8 @@ pub struct TerminalView {
     /// Last grid size applied from the pane, so an unchanged frame does not resize.
     measured: Rc<Cell<(u16, u16)>>,
     osc_title: Option<String>,
+    /// The foreground process group when the title was set (`None`: the shell), so a title dies with its program.
+    title_owner: Option<libc::pid_t>,
     /// The coding agent in the foreground and its status, refreshed by the window each tick.
     pub agent: Option<(Agent, Status)>,
     font: SharedString,
@@ -110,6 +112,7 @@ impl TerminalView {
             })),
             measured: Rc::new(Cell::new((rows, cols))),
             osc_title: None,
+            title_owner: None,
             agent: None,
             font: SharedString::default(),
             font_size: 0.,
@@ -165,13 +168,16 @@ impl TerminalView {
         self.emu.set_options(settings.terminal_scrollback.clamp(100, 1_000_000), cursor);
     }
 
-    /// What the tab should say: the agent, else the running program, else a title the shell set, else the folder.
+    /// What the tab should say: the title the program in front set (an agent's session name), else the agent
+    /// or running program, else the folder.
     pub fn title(&self) -> String {
+        let front = self.pty.as_ref().and_then(Pty::foreground_group);
+        let set = self.osc_title.as_deref().filter(|_| self.title_owner == front);
         if let Some((agent, _)) = self.agent {
-            return agent.name().into();
+            return set.and_then(|title| agent::session_title(agent, title)).unwrap_or_else(|| agent.name().into());
         }
-        let program = self.pty.as_ref().and_then(Pty::foreground);
-        program.or_else(|| self.osc_title.clone()).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
+        let program = || self.pty.as_ref().and_then(Pty::foreground);
+        set.map(str::to_string).or_else(program).unwrap_or_else(|| self.cwd().map_or_else(|| "Terminal".into(), |dir| short_path(&dir)))
     }
 
     /// Re-reads which agent is in the foreground and what it is doing; true if that changed.
@@ -210,6 +216,7 @@ impl TerminalView {
                     let feed = self.emu.feed(&text);
                     if let Some(title) = feed.title {
                         self.osc_title = title.as_deref().and_then(clean_title);
+                        self.title_owner = self.pty.as_ref().and_then(Pty::foreground_group);
                     }
                     self.send(&feed.reply);
                 }

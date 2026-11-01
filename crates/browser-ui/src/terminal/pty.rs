@@ -109,7 +109,7 @@ impl Pty {
     }
 
     /// The foreground process group, when it is not the shell itself.
-    fn foreground_group(&self) -> Option<libc::pid_t> {
+    pub fn foreground_group(&self) -> Option<libc::pid_t> {
         let group = self.master.process_group_leader().filter(|pid| *pid > 0)?;
         let shell = self.child.as_ref().and_then(|child| child.process_id());
         (!shell.is_some_and(|shell| shell as libc::pid_t == group)).then_some(group)
