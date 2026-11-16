@@ -948,14 +948,12 @@ impl MacEngine {
     }
 
     pub fn is_muted(&self, tab_id: &str) -> bool {
-        MUTED.with_borrow(|muted| muted.contains(tab_id))
+        tab_muted(tab_id)
     }
 
     pub fn set_muted(&mut self, tab_id: &str, mute: bool) {
-        MUTED.with_borrow_mut(|muted| if mute { muted.insert(tab_id.to_string()) } else { muted.remove(tab_id) });
-        if let Some(live) = self.tabs.get(tab_id) {
-            apply_muted(&live.view, mute);
-        }
+        mute_tab(tab_id, self.tabs.get(tab_id).map(|live| &*live.view), mute);
+        self.extensions.handle().changed(tab_id);
     }
 
     /// Load progress in 0..=1 while the tab's page is loading.
@@ -1362,6 +1360,8 @@ impl WebEngine for MacEngine {
                     ns_string!("nxPasswords"),
                 );
                 add_key_script(&view.configuration().userContentController(), mtm);
+                // Extensions that load later add theirs to open pages themselves (`Extensions::load`).
+                add_connectable_script(&view, &self.extensions.connectable_patterns(), mtm);
             }
         }
         observe(&view, &delegate);
@@ -1659,7 +1659,18 @@ impl MacEngine {
     }
 }
 
-/// KVO on `URL` and `title`, so in-page navigations reach the address bar.
+pub(crate) fn tab_muted(tab_id: &str) -> bool {
+    MUTED.with_borrow(|muted| muted.contains(tab_id))
+}
+
+/// Remembers the choice for when the tab's page loads again; `view` is its live page, if any.
+pub(crate) fn mute_tab(tab_id: &str, view: Option<&WKWebView>, mute: bool) {
+    MUTED.with_borrow_mut(|muted| if mute { muted.insert(tab_id.to_string()) } else { muted.remove(tab_id) });
+    if let Some(view) = view {
+        apply_muted(view, mute);
+    }
+}
+
 /// Private `_setPageMuted:`; 1 is `_WKMediaAudioMuted`.
 fn apply_muted(view: &WKWebView, mute: bool) {
     if view.respondsToSelector(sel!(_setPageMuted:)) {
@@ -1667,6 +1678,7 @@ fn apply_muted(view: &WKWebView, mute: bool) {
     }
 }
 
+/// KVO on `URL` and `title`, so in-page navigations reach the address bar.
 fn observe(view: &WKWebView, delegate: &NxWebDelegate) {
     for key in OBSERVED_KEYS {
         unsafe { NSObject::addObserver_forKeyPath_options_context(view, delegate, &NSString::from_str(key), NSKeyValueObservingOptions::New, std::ptr::null_mut()) };
@@ -2288,6 +2300,28 @@ const KEY_FALLBACK_JS: &str = r#"addEventListener('keydown', (e) => {
 
 fn key_world(mtm: MainThreadMarker) -> Retained<WKContentWorld> {
     unsafe { WKContentWorld::worldWithName(ns_string!("nxbrowser-keys"), mtm) }
+}
+
+/// `chrome.runtime` on pages that `patterns` let message an extension, from the page's next load on and in the
+/// page showing now; see `connectable.js`.
+pub(crate) fn add_connectable_script(view: &WKWebView, patterns: &[String], mtm: MainThreadMarker) {
+    if patterns.is_empty() {
+        return;
+    }
+    let source = include_str!("connectable.js").replace("__PATTERNS__", &serde_json::to_string(patterns).unwrap_or_else(|_| "[]".into()));
+    let script = unsafe {
+        WKUserScript::initWithSource_injectionTime_forMainFrameOnly_inContentWorld(
+            WKUserScript::alloc(mtm),
+            &NSString::from_str(&source),
+            WKUserScriptInjectionTime::AtDocumentStart,
+            false,
+            &WKContentWorld::pageWorld(mtm),
+        )
+    };
+    unsafe {
+        view.configuration().userContentController().addUserScript(&script);
+        view.evaluateJavaScript_completionHandler(&NSString::from_str(&source), None);
+    }
 }
 
 fn add_key_script(controller: &WKUserContentController, mtm: MainThreadMarker) {

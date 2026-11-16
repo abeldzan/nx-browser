@@ -72,13 +72,19 @@ const CONSTANTS: [(&str, &str); 3] = [
 ];
 
 /// APIs WebKit gets wrong whose objects can't be patched, with the polyfill global that wraps each.
-const GUARDED: [(&str, &str); 6] = [
+const GUARDED: [(&str, &str); 12] = [
     ("chrome.permissions.", "nxPermissions"),
     ("browser.permissions.", "nxPermissions"),
     ("chrome.scripting.", "nxScripting"),
     ("browser.scripting.", "nxScripting"),
     ("chrome.storage.", "nxStorage"),
     ("browser.storage.", "nxStorage"),
+    ("chrome.runtime.", "nxRuntime"),
+    ("browser.runtime.", "nxRuntime"),
+    ("chrome.tabs.", "nxTabs"),
+    ("browser.tabs.", "nxTabs"),
+    ("chrome.declarativeNetRequest.", "nxDeclarativeNetRequest"),
+    ("browser.declarativeNetRequest.", "nxDeclarativeNetRequest"),
 ];
 
 /// Points calls on the `GUARDED` APIs at the polyfill's wrappers, falling back to the real object where
@@ -115,6 +121,10 @@ fn patch_pages(dir: &Path) -> anyhow::Result<()> {
             if entry.file_name() != "_metadata" {
                 patch_pages(&path)?;
             }
+            continue;
+        }
+        // The polyfill defines the wrappers, so its own calls go to WebKit's objects.
+        if entry.file_name() == POLYFILL_FILE {
             continue;
         }
         if path.extension().is_some_and(|ext| ext == "js") {
@@ -156,6 +166,7 @@ mod tests {
         std::fs::write(dir.join("src/inject.js"), "run({world:chrome.scripting.ExecutionWorld.MAIN})").unwrap();
         std::fs::write(dir.join("src/senders.js"), "u.startsWith(`chrome-extension://${id}/`)").unwrap();
         std::fs::write(dir.join("src/perms.js"), "chrome.permissions.contains(p);window.chrome.permissions.remove(p);chrome.scripting.registerContentScripts(s);chrome.storage.local.setAccessLevel(a)").unwrap();
+        std::fs::write(dir.join("src/extras.js"), "chrome.runtime.onSuspend.addListener(f);browser.tabs.group(g);chrome.declarativeNetRequest.HeaderOperation.SET").unwrap();
         patch_missing_apis(&dir).unwrap();
         patch_missing_apis(&dir).unwrap();
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
@@ -169,8 +180,11 @@ mod tests {
             std::fs::read_to_string(dir.join("src/perms.js")).unwrap(),
             "(globalThis.nxPermissions||chrome.permissions).contains(p);window.chrome.permissions.remove(p);(globalThis.nxScripting||chrome.scripting).registerContentScripts(s);(globalThis.nxStorage||chrome.storage).local.setAccessLevel(a)"
         );
-        let polyfill = std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap();
-        assert!(!polyfill.contains("nxPermissions||") && !polyfill.contains("nxStorage||"), "the polyfill itself is left alone");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/extras.js")).unwrap(),
+            "(globalThis.nxRuntime||chrome.runtime).onSuspend.addListener(f);(globalThis.nxTabs||browser.tabs).group(g);(globalThis.nxDeclarativeNetRequest||chrome.declarativeNetRequest).HeaderOperation.SET"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join(POLYFILL_FILE)).unwrap(), POLYFILL, "the polyfill itself is left alone");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -1263,7 +1263,10 @@ impl BrowserWindow {
             None => {
                 let (store, tab) = (self.active_store(), self.active_tab_id());
                 let anchor = [f64::from(at) - 13., 0., 26., f64::from(self.titlebar_h())];
-                self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor);
+                if !self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor) {
+                    self.status = format!("Open a website to use {}", meta.name).into();
+                    cx.notify();
+                }
             }
         }
     }
