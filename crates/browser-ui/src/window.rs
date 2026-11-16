@@ -703,7 +703,7 @@ impl BrowserWindow {
         }
         for (id, url) in links {
             changed = true;
-            self.new_tab_in(&id, Some(&url), cx);
+            self.open_from(&id, &url, cx);
         }
         if !exited.is_empty() {
             changed = true;
@@ -840,12 +840,7 @@ impl BrowserWindow {
                 let from = from.filter(|id| !self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()));
                 match (panel, from) {
                     (Some(id), _) => self.open_extension_panel(&id, &url, cx),
-                    (None, Some(from)) => {
-                        self.new_tab_in(&from, Some(&url), cx);
-                        if let Some(child) = self.model.lock().active_tab().map(|tab| tab.id.clone()) {
-                            self.openers.insert(child, from);
-                        }
-                    }
+                    (None, Some(from)) => self.open_from(&from, &url, cx),
                     (None, None) => {
                         if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
                             self.focus_window(&id, cx);
@@ -4882,6 +4877,21 @@ impl BrowserWindow {
         self.chrome.insert(new.clone(), chrome);
         self.focus_window(&new, cx);
         self.focus_address = url.is_none();
+    }
+
+    /// A link opened from tab `from`'s page: the new tab lands right after `from` and the tabs it
+    /// opened before, so several links keep their order.
+    fn open_from(&mut self, from: &str, url: &str, cx: &mut Context<Self>) {
+        self.new_tab_in(from, Some(url), cx);
+        let Some(child) = self.active_tab_id().filter(|child| child != from) else {
+            return;
+        };
+        let rest = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).filter(|id| *id != child).collect::<Vec<_>>();
+        if let Some(at) = rest.iter().position(|id| id == from) {
+            let siblings = rest[at + 1..].iter().take_while(|id| self.openers.get(*id).is_some_and(|opener| opener == from)).count();
+            self.with_model(|model| { let _ = model.move_tab(&child, at + 1 + siblings); });
+        }
+        self.openers.insert(child, from.to_string());
     }
 
     /// Links opened from other apps: ask which profile takes them, or use the active one.
