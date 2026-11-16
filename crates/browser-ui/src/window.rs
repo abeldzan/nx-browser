@@ -18,7 +18,7 @@ use gpui::{
     Subscription, Task, Window,
 };
 use crate::extensions::extension_icon;
-use crate::settings::measure_overlay;
+use crate::settings::{logical, measure_overlay};
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
@@ -2126,6 +2126,10 @@ impl BrowserWindow {
             return;
         }
         self.focus_address = false;
+        // A terminal's address is where its shell is, not something to type over.
+        if self.model.lock().active_tab().is_some_and(|tab| is_terminal(&tab.url)) {
+            return;
+        }
         self.address_editing = true;
         self.suggestions.clear();
         self.suggestion = None;
@@ -2944,6 +2948,24 @@ impl BrowserWindow {
         });
     }
 
+    /// A tab released past the window's edge leaves the app for an OS window of its own, as a whole window does.
+    fn listen_tab_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.tab_drag.as_ref().map(|(tab, _)| tab.id.clone()) else {
+            return;
+        };
+        let entity = cx.entity();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture || event.button != MouseButton::Left || !torn_off(window, event.position) {
+                return;
+            }
+            let at = window.bounds().origin + event.position;
+            entity.update(cx, |view, cx| {
+                view.reorder = None;
+                view.detach_tabs(&[id.clone()], at, cx);
+            });
+        });
+    }
+
     fn listen_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.gesture.is_none() {
             return;
@@ -3435,6 +3457,7 @@ impl BrowserWindow {
                                 view.listen_gesture(window, cx);
                             }
                             view.listen_space_drag(window, cx);
+                            view.listen_tab_drag(window, cx);
                         });
                     },
                 )
@@ -3820,6 +3843,10 @@ impl BrowserWindow {
                         }
                     })
                     .when(self.picked(&tab.id, cx), |pill| pill.opacity(0.))
+                    .tooltip({
+                        let (text, watch) = (SharedString::from(full_title(tab)), cx.entity());
+                        move |_, cx| cx.new(|_| TabTip(text.clone(), watch.clone())).into()
+                    })
                     .child(self.measure_slot(&tab.id, cx))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.click_tab(&id, cx)))
                     // The close button takes the favicon's place on hover, as in Safari.
@@ -4780,6 +4807,11 @@ impl BrowserWindow {
     fn detach_window(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let ids = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
+        self.detach_tabs(&ids, at, cx);
+    }
+
+    /// Moves `ids` into a new space and opens that space in an OS window at `at` (screen point).
+    fn detach_tabs(&mut self, ids: &[String], at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let Ok(space) = self.with_model(|model| model.create_empty_session()) else {
             return;
         };
@@ -6329,6 +6361,43 @@ struct TabDragPreview;
 impl Render for TabDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
+    }
+}
+
+/// A tab's untruncated title on hover, cut out of the pages it overlaps.
+struct TabTip(SharedString, gpui::Entity<BrowserWindow>);
+
+impl Render for TabTip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let paint = paint(cx);
+        let watch = self.1.clone();
+        div().pl(px(8.)).pt(px(10.)).child(
+            div()
+                .relative()
+                .max_w(px(420.))
+                .py(px(4.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(paint.text(12.))
+                .text_color(paint.fg)
+                .child(
+                    canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), 6.0))), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+                .child(self.0.clone()),
+        )
+    }
+}
+
+fn full_title(tab: &browser_core::Tab) -> String {
+    match tab.title.as_str() {
+        "" | "New Tab" => tab_label(&tab.title, &tab.url),
+        title => title.to_string(),
     }
 }
 
