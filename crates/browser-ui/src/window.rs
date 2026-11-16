@@ -18,7 +18,7 @@ use gpui::{
     Subscription, Task, Window,
 };
 use crate::extensions::extension_icon;
-use crate::settings::measure_overlay;
+use crate::settings::{logical, measure_overlay};
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
@@ -703,7 +703,7 @@ impl BrowserWindow {
         }
         for (id, url) in links {
             changed = true;
-            self.new_tab_in(&id, Some(&url), cx);
+            self.open_from(&id, &url, cx);
         }
         if !exited.is_empty() {
             changed = true;
@@ -840,12 +840,7 @@ impl BrowserWindow {
                 let from = from.filter(|id| !self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()));
                 match (panel, from) {
                     (Some(id), _) => self.open_extension_panel(&id, &url, cx),
-                    (None, Some(from)) => {
-                        self.new_tab_in(&from, Some(&url), cx);
-                        if let Some(child) = self.model.lock().active_tab().map(|tab| tab.id.clone()) {
-                            self.openers.insert(child, from);
-                        }
-                    }
+                    (None, Some(from)) => self.open_from(&from, &url, cx),
                     (None, None) => {
                         if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
                             self.focus_window(&id, cx);
@@ -1263,7 +1258,10 @@ impl BrowserWindow {
             None => {
                 let (store, tab) = (self.active_store(), self.active_tab_id());
                 let anchor = [f64::from(at) - 13., 0., 26., f64::from(self.titlebar_h())];
-                self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor);
+                if !self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor) {
+                    self.status = format!("Open a website to use {}", meta.name).into();
+                    cx.notify();
+                }
             }
         }
     }
@@ -2126,6 +2124,10 @@ impl BrowserWindow {
             return;
         }
         self.focus_address = false;
+        // A terminal's address is where its shell is, not something to type over.
+        if self.model.lock().active_tab().is_some_and(|tab| is_terminal(&tab.url)) {
+            return;
+        }
         self.address_editing = true;
         self.suggestions.clear();
         self.suggestion = None;
@@ -2944,6 +2946,24 @@ impl BrowserWindow {
         });
     }
 
+    /// A tab released past the window's edge leaves the app for an OS window of its own, as a whole window does.
+    fn listen_tab_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.tab_drag.as_ref().map(|(tab, _)| tab.id.clone()) else {
+            return;
+        };
+        let entity = cx.entity();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture || event.button != MouseButton::Left || !torn_off(window, event.position) {
+                return;
+            }
+            let at = window.bounds().origin + event.position;
+            entity.update(cx, |view, cx| {
+                view.reorder = None;
+                view.detach_tabs(&[id.clone()], at, cx);
+            });
+        });
+    }
+
     fn listen_gesture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.gesture.is_none() {
             return;
@@ -3435,6 +3455,7 @@ impl BrowserWindow {
                                 view.listen_gesture(window, cx);
                             }
                             view.listen_space_drag(window, cx);
+                            view.listen_tab_drag(window, cx);
                         });
                     },
                 )
@@ -3820,6 +3841,10 @@ impl BrowserWindow {
                         }
                     })
                     .when(self.picked(&tab.id, cx), |pill| pill.opacity(0.))
+                    .tooltip({
+                        let (text, watch) = (SharedString::from(full_title(tab)), cx.entity());
+                        move |_, cx| cx.new(|_| TabTip(text.clone(), watch.clone())).into()
+                    })
                     .child(self.measure_slot(&tab.id, cx))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.click_tab(&id, cx)))
                     // The close button takes the favicon's place on hover, as in Safari.
@@ -4780,6 +4805,11 @@ impl BrowserWindow {
     fn detach_window(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let group = self.group_id(id);
         let ids = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
+        self.detach_tabs(&ids, at, cx);
+    }
+
+    /// Moves `ids` into a new space and opens that space in an OS window at `at` (screen point).
+    fn detach_tabs(&mut self, ids: &[String], at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let Ok(space) = self.with_model(|model| model.create_empty_session()) else {
             return;
         };
@@ -4847,6 +4877,21 @@ impl BrowserWindow {
         self.chrome.insert(new.clone(), chrome);
         self.focus_window(&new, cx);
         self.focus_address = url.is_none();
+    }
+
+    /// A link opened from tab `from`'s page: the new tab lands right after `from` and the tabs it
+    /// opened before, so several links keep their order.
+    fn open_from(&mut self, from: &str, url: &str, cx: &mut Context<Self>) {
+        self.new_tab_in(from, Some(url), cx);
+        let Some(child) = self.active_tab_id().filter(|child| child != from) else {
+            return;
+        };
+        let rest = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).filter(|id| *id != child).collect::<Vec<_>>();
+        if let Some(at) = rest.iter().position(|id| id == from) {
+            let siblings = rest[at + 1..].iter().take_while(|id| self.openers.get(*id).is_some_and(|opener| opener == from)).count();
+            self.with_model(|model| { let _ = model.move_tab(&child, at + 1 + siblings); });
+        }
+        self.openers.insert(child, from.to_string());
     }
 
     /// Links opened from other apps: ask which profile takes them, or use the active one.
@@ -6329,6 +6374,43 @@ struct TabDragPreview;
 impl Render for TabDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
+    }
+}
+
+/// A tab's untruncated title on hover, cut out of the pages it overlaps.
+struct TabTip(SharedString, gpui::Entity<BrowserWindow>);
+
+impl Render for TabTip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let paint = paint(cx);
+        let watch = self.1.clone();
+        div().pl(px(8.)).pt(px(10.)).child(
+            div()
+                .relative()
+                .max_w(px(420.))
+                .py(px(4.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .bg(paint.surface)
+                .border_1()
+                .border_color(paint.border)
+                .shadow_md()
+                .text_size(paint.text(12.))
+                .text_color(paint.fg)
+                .child(
+                    canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), 6.0))), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+                .child(self.0.clone()),
+        )
+    }
+}
+
+fn full_title(tab: &browser_core::Tab) -> String {
+    match tab.title.as_str() {
+        "" | "New Tab" => tab_label(&tab.title, &tab.url),
+        title => title.to_string(),
     }
 }
 

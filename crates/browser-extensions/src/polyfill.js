@@ -54,6 +54,18 @@
     }
   };
   const names = new Proxy({}, { get: (_, key) => (typeof key === "string" ? key : undefined) });
+  // WebKit's namespace objects take no new properties, so members it lacks come from a wrapper that
+  // `patch_pages` points the extension's calls at; everything WebKit has passes through.
+  // `overrides` replace members WebKit has but gets wrong.
+  const extend = (target, extras, overrides = {}) =>
+    new Proxy(target, {
+      get: (t, key) => {
+        if (Object.prototype.hasOwnProperty.call(overrides, key)) return overrides[key];
+        const value = t[key];
+        if (value === undefined && Object.prototype.hasOwnProperty.call(extras, key)) return extras[key];
+        return typeof value === "function" ? value.bind(t) : value;
+      },
+    });
 
   let nextNotification = 1;
   define(chrome, "notifications", {
@@ -197,10 +209,200 @@
     TAB_GROUP_ID_NONE: -1,
     Color: names,
   });
-  if (chrome.tabs) {
-    define(chrome.tabs, "group", unsupported("chrome.tabs.group"));
-    define(chrome.tabs, "ungroup", method(() => undefined));
+  // `patch_pages` turns the extension's `chrome-extension://` into WebKit's scheme so it recognizes its own pages,
+  // but servers know an extension by its Chrome URL: an OAuth `redirect_uri` that says `webkit-extension://` is
+  // refused ("not supported by client", Claude's sign-in). So what leaves for the web says `chrome-extension://` again.
+  const id = chrome.runtime && chrome.runtime.id;
+  const outward = (text) => {
+    if (!id || typeof text !== "string") return text;
+    const [ours, chromes] = [`webkit-extension://${id}`, `chrome-extension://${id}`];
+    return text.split(ours).join(chromes).split(encodeURIComponent(ours)).join(encodeURIComponent(chromes));
+  };
+  const isWeb = (url) => /^https?:/i.test(String(url));
+  const outwardUrl = (props) => (props && typeof props === "object" && isWeb(props.url) ? { ...props, url: outward(props.url) } : props);
+  if (typeof g.fetch === "function") {
+    const fetch = g.fetch.bind(g);
+    g.fetch = (input, init) => {
+      if (typeof input !== "string" && !(input instanceof URL)) return fetch(input, init);
+      if (!isWeb(input)) return fetch(input, init);
+      const body = init && init.body;
+      if (typeof body === "string") init = { ...init, body: outward(body) };
+      else if (body instanceof URLSearchParams) init = { ...init, body: new URLSearchParams(outward(body.toString())) };
+      return fetch(outward(String(input)), init);
+    };
   }
+
+  const tabs = chrome["tabs"];
+  if (tabs) {
+    const overrides = {
+      create: (props, ...rest) => tabs.create(outwardUrl(props), ...rest),
+      update: (...args) => tabs.update(...args.map(outwardUrl)),
+    };
+    g.nxTabs = extend(tabs, {
+      group: unsupported("chrome.tabs.group"),
+      ungroup: method(() => undefined),
+      // Pages here are suspended by the browser on its own; a discard request leaves the tab as it is.
+      discard: method((tabId) => (tabId === undefined ? undefined : tabs.get(tabId))),
+      // One selected tab at a time: highlighting activates the first tab named.
+      highlight: method(async (info) => {
+        const index = [].concat(info.tabs)[0];
+        const list = await tabs.query(info.windowId === undefined ? { currentWindow: true } : { windowId: info.windowId });
+        const tab = list.find((candidate) => candidate.index === index);
+        if (!tab) throw new Error(`No tab at index: ${index}.`);
+        await tabs.update(tab.id, { active: true });
+        return chrome.windows ? chrome.windows.get(tab.windowId, { populate: true }) : undefined;
+      }),
+      getZoomSettings: method(() => ({ mode: "automatic", scope: "per-origin", defaultZoomFactor: 1 })),
+      setZoomSettings: method(() => undefined),
+      onZoomChange: event(),
+      ZoomSettingsMode: names,
+      ZoomSettingsScope: names,
+    }, overrides);
+  }
+
+  // Runtime members WebKit lacks; extensions add listeners to these unguarded at startup.
+  const runtime = chrome["runtime"];
+  if (runtime) {
+    // Chrome's message senders carry `origin`, which WebKit's leave out; Claude's sign-in trusts a message from
+    // claude.ai only by it.
+    const withOrigin = (sender) => {
+      if (!sender || sender.origin !== undefined || !sender.url) return sender;
+      try {
+        const url = new URL(sender.url);
+        return { ...sender, origin: `${url.protocol}//${url.host}` };
+      } catch (_) {
+        return sender;
+      }
+    };
+    const messages = (target) => {
+      const wrapped = new WeakMap();
+      const wrap = (fn) => {
+        if (typeof fn !== "function") return fn;
+        if (!wrapped.has(fn)) wrapped.set(fn, (message, sender, sendResponse) => fn(message, withOrigin(sender), sendResponse));
+        return wrapped.get(fn);
+      };
+      return {
+        addListener: (fn) => target.addListener(wrap(fn)),
+        removeListener: (fn) => target.removeListener(wrapped.get(fn) || fn),
+        hasListener: (fn) => target.hasListener(wrapped.get(fn) || fn),
+        hasListeners: () => (typeof target.hasListeners === "function" ? target.hasListeners() : false),
+      };
+    };
+    const runtimeOverrides = {};
+    for (const name of ["onMessage", "onMessageExternal"]) {
+      if (runtime[name]) runtimeOverrides[name] = messages(runtime[name]);
+    }
+    g.nxRuntime = extend(runtime, {
+      onSuspend: event(),
+      onSuspendCanceled: event(),
+      onUpdateAvailable: event(),
+      onRestartRequired: event(),
+      onUserScriptMessage: event(),
+      getContexts: method(() => []),
+      requestUpdateCheck: method(() => ({ status: "no_update" })),
+      restart: method(() => undefined),
+      restartAfterDelay: method(() => undefined),
+      ContextType: names,
+      OnRestartRequiredReason: names,
+      RequestUpdateCheckStatus: names,
+    }, runtimeOverrides);
+  }
+
+  // Rule enums WebKit lacks, with Chrome's values (not their names), which WebKit's rules accept.
+  // WebKit also rejects a whole rule update over one header it doesn't know (Claude's `anthropic-client-platform`),
+  // where Chrome modifies any header; such headers are dropped and the update retried, so the other rules apply.
+  const declarativeNetRequest = chrome["declarativeNetRequest"];
+  if (declarativeNetRequest) {
+    const withoutHeader = (options, name) => {
+      const keep = (headers) => headers && headers.filter((entry) => String(entry.header).toLowerCase() !== name);
+      const addRules = (options.addRules || [])
+        .map((rule) => {
+          const action = rule.action || {};
+          if (action.type !== "modifyHeaders") return rule;
+          return { ...rule, action: { ...action, requestHeaders: keep(action.requestHeaders), responseHeaders: keep(action.responseHeaders) } };
+        })
+        .filter((rule) => rule.action.type !== "modifyHeaders" || (rule.action.requestHeaders || []).length + (rule.action.responseHeaders || []).length > 0);
+      return { ...options, addRules };
+    };
+    const tolerant = (name) =>
+      method(async (options) => {
+        for (;;) {
+          try {
+            return await declarativeNetRequest[name](options);
+          } catch (error) {
+            const header = /header `([^`]+)` is not recognized/.exec(String(error && error.message));
+            if (!header || !options || !options.addRules) throw error;
+            const next = withoutHeader(options, header[1].toLowerCase());
+            if (JSON.stringify(next) === JSON.stringify(options)) throw error;
+            options = next;
+          }
+        }
+      });
+    g.nxDeclarativeNetRequest = extend(declarativeNetRequest, {
+      RuleActionType: { BLOCK: "block", REDIRECT: "redirect", ALLOW: "allow", UPGRADE_SCHEME: "upgradeScheme", MODIFY_HEADERS: "modifyHeaders", ALLOW_ALL_REQUESTS: "allowAllRequests" },
+      HeaderOperation: { APPEND: "append", SET: "set", REMOVE: "remove" },
+      DomainType: { FIRST_PARTY: "firstParty", THIRD_PARTY: "thirdParty" },
+      ResourceType: Object.fromEntries(
+        ["main_frame", "sub_frame", "stylesheet", "script", "image", "font", "object", "xmlhttprequest", "ping", "csp_report", "media", "websocket", "webtransport", "webbundle", "other"].map((type) => [type.toUpperCase(), type])
+      ),
+      RequestMethod: { CONNECT: "connect", DELETE: "delete", GET: "get", HEAD: "head", OPTIONS: "options", PATCH: "patch", POST: "post", PUT: "put", OTHER: "other" },
+    }, { updateSessionRules: tolerant("updateSessionRules"), updateDynamicRules: tolerant("updateDynamicRules") });
+  }
+
+  const selfInfo = () => {
+    const optionsPage = manifest.options_page || (manifest.options_ui && manifest.options_ui.page);
+    const icons = Object.entries(manifest.icons || {}).map(([size, path]) => ({ size: Number(size), url: chrome.runtime.getURL(path) }));
+    return {
+      id: chrome.runtime.id,
+      name: manifest.name || "",
+      shortName: manifest.short_name || manifest.name || "",
+      description: manifest.description || "",
+      version: manifest.version || "",
+      versionName: manifest.version_name,
+      mayDisable: true,
+      enabled: true,
+      installType: "normal",
+      type: "extension",
+      offlineEnabled: !!manifest.offline_enabled,
+      optionsUrl: optionsPage ? chrome.runtime.getURL(optionsPage) : "",
+      homepageUrl: manifest.homepage_url,
+      permissions: (manifest.permissions || []).filter((permission) => !permission.includes("://")),
+      hostPermissions: manifest.host_permissions || (manifest.permissions || []).filter((permission) => permission.includes("://")),
+      icons,
+    };
+  };
+  define(chrome, "management", {
+    getSelf: method(selfInfo),
+    // Other extensions stay hidden, as in Chrome without the `management` permission.
+    getAll: method(() => [selfInfo()]),
+    get: method((id) => {
+      if (id !== chrome.runtime.id) throw new Error(`Failed to find extension with id ${id}.`);
+      return selfInfo();
+    }),
+    getPermissionWarningsById: method(() => []),
+    getPermissionWarningsByManifest: method(() => []),
+    setEnabled: unsupported("chrome.management.setEnabled"),
+    uninstall: unsupported("chrome.management.uninstall"),
+    uninstallSelf: unsupported("chrome.management.uninstallSelf"),
+    launchApp: unsupported("chrome.management.launchApp"),
+    onInstalled: event(),
+    onUninstalled: event(),
+    onEnabled: event(),
+    onDisabled: event(),
+    ExtensionInstallType: names,
+    ExtensionType: names,
+    ExtensionDisabledReason: names,
+    LaunchType: names,
+  });
+
+  // shortcut: always "active", so lock-on-idle and lock-on-screen-lock never fire; wire to the engine if a password manager needs it.
+  define(chrome, "idle", {
+    queryState: method(() => "active"),
+    setDetectionInterval: method(() => undefined),
+    getAutoLockDelay: method(() => 0),
+    onStateChanged: event(),
+    IdleState: names,
+  });
 
   // Phantom reads the redirect URL when its background loads; without it the background (and so the popup) never starts.
   define(chrome, "identity", {
@@ -216,7 +418,6 @@
   // WebKit throws on permissions it doesn't know ("'privacy' is not a valid permission") where Chrome
   // answers, which crashes Bitwarden's popup. Those can't be granted here, so the answer is "no".
   // `patch_pages` points the extension's permissions calls here; WebKit's object can't be patched.
-  // (Written without a dot after `permissions`, so that rewrite leaves this file alone.)
   const permissions = chrome["permissions"];
   if (permissions) {
     const guarded = (name) => (...args) => {
@@ -255,9 +456,16 @@
       }
       return areas.get(target);
     };
+    // No policies are set here, which Chrome reports as an empty managed area; WebKit has no such area.
+    const managed = {
+      get: method(() => ({})),
+      getBytesInUse: method(() => 0),
+      onChanged: event(),
+    };
     g.nxStorage = new Proxy(storage, {
       get: (target, key) => {
         const value = target[key];
+        if (key === "managed" && value === undefined) return managed;
         return value && typeof value === "object" && typeof value.get === "function" && typeof value.set === "function" ? area(value) : bound(target, key);
       },
     });

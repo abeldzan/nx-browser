@@ -1351,7 +1351,7 @@ fn font_field(picker: Option<gpui::Entity<gpuikit::elements::combobox::ComboboxS
     )
 }
 
-fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
+pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
     LogicalRect {
         x: f64::from(bounds.origin.x),
         y: f64::from(bounds.origin.y),

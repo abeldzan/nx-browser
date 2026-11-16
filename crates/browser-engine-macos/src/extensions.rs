@@ -18,7 +18,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSApplication, NSEvent, NSImage, NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSViewController};
-use objc2_foundation::{NSArray, NSDate, NSError, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSet, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults, NSNotification, NSNotificationCenter};
+use objc2_foundation::{NSArray, NSDate, NSError, NSLocale, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSet, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults, NSNotification, NSNotificationCenter};
 use objc2_web_kit::{
     WKWebExtension, WKWebExtensionAction, WKWebExtensionContext, WKWebExtensionContextPermissionStatus,
     WKWebExtensionController, WKWebExtensionControllerConfiguration, WKWebExtensionControllerDelegate,
@@ -31,6 +31,22 @@ use objc2_web_kit::{
 pub const SCHEME: &str = "webkit-extension://";
 
 type TabReply = RcBlock<dyn Fn(*mut ProtocolObject<dyn WKWebExtensionTab>, *mut NSError)>;
+type WindowReply = RcBlock<dyn Fn(*mut ProtocolObject<dyn WKWebExtensionWindow>, *mut NSError)>;
+
+/// The extension call a page the UI opens for it answers: `tabs.create`, `windows.create`, or
+/// nothing (a window's later pages).
+enum Reply {
+    Tab(TabReply),
+    Window(WindowReply),
+    Nothing,
+}
+
+struct Pending {
+    url: String,
+    reply: Reply,
+    /// The window from `windows.create` the page joins; None for the browser window.
+    window: Option<Retained<NxExtWindow>>,
+}
 
 enum Prompt {
     Permissions(RcBlock<dyn Fn(NonNull<NSSet<WKWebExtensionPermission>>, *mut NSDate)>, Retained<NSSet<WKWebExtensionPermission>>),
@@ -42,6 +58,8 @@ struct Profile {
     controller: Retained<WKWebExtensionController>,
     _delegate: Retained<NxExtDelegate>,
     window: Retained<NxExtWindow>,
+    /// Windows extensions opened with `windows.create`, while they have pages.
+    opened_windows: Vec<Retained<NxExtWindow>>,
     contexts: HashMap<String, Retained<WKWebExtensionContext>>,
     /// Hidden `KEEPALIVE_PAGE` per extension, which holds its background loaded.
     keepalive: HashMap<String, Retained<WKWebView>>,
@@ -62,8 +80,8 @@ struct State {
     /// Pending prompts with the profile and extension they are for.
     prompts: HashMap<u64, (String, String, Prompt)>,
     next_prompt: u64,
-    /// `tabs.create` replies waiting for the UI to open a tab at that URL.
-    pending_tabs: Vec<(String, TabReply)>,
+    /// `tabs.create` and `windows.create` replies waiting for the UI to open a tab at that URL.
+    pending_tabs: Vec<Pending>,
     /// Where the last clicked action button sits, in window points from the top left: x, y, width, height.
     anchor: [f64; 4],
     /// UI delegate of the open popup's page; WebKit holds delegates weakly.
@@ -126,7 +144,7 @@ impl Extensions {
         };
         let weak = Rc::downgrade(&self.0);
         let delegate = NxExtDelegate::new(mtm, Ivars { shared: weak.clone(), store: store_id.to_string() });
-        let window = NxExtWindow::new(mtm, Ivars { shared: weak, store: store_id.to_string() });
+        let window = NxExtWindow::new(mtm, WindowIvars { shared: weak, store: store_id.to_string(), opened: None });
         unsafe {
             controller.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             controller.didOpenWindow(ProtocolObject::from_ref(&*window));
@@ -134,7 +152,7 @@ impl Extensions {
         }
         self.0.borrow_mut().profiles.insert(
             store_id.to_string(),
-            Profile { controller: controller.clone(), _delegate: delegate, window, contexts: HashMap::new(), keepalive: HashMap::new() },
+            Profile { controller: controller.clone(), _delegate: delegate, window, opened_windows: Vec::new(), contexts: HashMap::new(), keepalive: HashMap::new() },
         );
         let ids = self.0.borrow().parsed.keys().cloned().collect::<Vec<_>>();
         for id in ids {
@@ -169,10 +187,16 @@ impl Extensions {
                 return;
             }
             if let Some(extension) = unsafe { Retained::retain(extension) } {
+                let patterns = connectable_patterns(&extension);
                 shared.borrow_mut().parsed.insert(id.clone(), extension);
                 let stores = shared.borrow().profiles.keys().cloned().collect::<Vec<_>>();
                 for store in stores {
                     load_context(&shared, &store, &id);
+                }
+                // Pages made before it loaded (restored tabs at launch) get its `chrome.runtime` too.
+                let views = shared.borrow().tabs.iter().filter_map(|tab| tab.view()).collect::<Vec<_>>();
+                for view in views {
+                    crate::webkit::add_connectable_script(&view, &patterns, mtm);
                 }
             } else if !error.is_null() {
                 let message = error_text(unsafe { &*error });
@@ -255,6 +279,12 @@ impl Extensions {
         unsafe { store.fetchDataRecordsOfTypes_completionHandler(&WKWebsiteDataStore::allWebsiteDataTypes(mtm), &block) };
     }
 
+    /// Match patterns of web pages that may message a loaded extension (manifest `externally_connectable.matches`).
+    pub fn connectable_patterns(&self) -> Vec<String> {
+        let extensions = self.0.borrow().parsed.values().cloned().collect::<Vec<_>>();
+        extensions.iter().flat_map(|extension| connectable_patterns(extension)).collect()
+    }
+
     pub fn is_loaded(&self, id: &str) -> bool {
         self.0.borrow().parsed.contains_key(id)
     }
@@ -266,12 +296,17 @@ impl Extensions {
     }
 
     /// Clicks the toolbar button at `anchor`: WebKit fires `action.onClicked`, or the popup opens below the button.
-    pub fn perform_action(&self, id: &str, store_id: &str, tab_id: Option<&str>, anchor: [f64; 4]) {
+    /// False when there was nothing to click on: `onClicked` needs a page, and built-in pages aren't tabs to
+    /// extensions (WebKit would pass no tab, where Chrome always passes one; Claude's handler throws on that).
+    pub fn perform_action(&self, id: &str, store_id: &str, tab_id: Option<&str>, anchor: [f64; 4]) -> bool {
         let Some(context) = self.context(id, store_id) else {
-            return;
+            return true;
         };
-        self.0.borrow_mut().anchor = anchor;
         let tab = tab_id.and_then(|tab_id| self.tab(tab_id)).map(ProtocolObject::from_retained);
+        if tab.is_none() && unsafe { context.actionForTab(None) }.is_none_or(|action| !unsafe { action.presentsPopup() }) {
+            return false;
+        }
+        self.0.borrow_mut().anchor = anchor;
         unsafe { context.performActionForTab(tab.as_deref()) };
         // WebKit loads the popup but may never call `presentPopupForAction` (Bitwarden's never comes), so show it now.
         if let Some(action) = unsafe { context.actionForTab(tab.as_deref()) }.filter(|action| unsafe { action.presentsPopup() }) {
@@ -279,6 +314,7 @@ impl Extensions {
                 self.0.borrow_mut().early_popup = Some(action);
             }
         }
+        true
     }
 
     pub fn badge(&self, id: &str, store_id: &str, tab_id: Option<&str>) -> String {
@@ -338,41 +374,41 @@ impl Extensions {
         }
         // Side panels aren't tabs in Chrome: Kluff only trusts its panel's messages when `sender.tab` is unset.
         if self.is_side_panel(url, store_id) {
-            let reply = {
+            let pending = {
                 let mut state = self.0.borrow_mut();
-                let index = state.pending_tabs.iter().position(|(pending, _)| pending == url);
-                index.map(|index| state.pending_tabs.remove(index).1)
+                let index = state.pending_tabs.iter().position(|pending| pending.url == url);
+                index.map(|index| state.pending_tabs.remove(index))
             };
-            if let Some(reply) = reply {
-                reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
+            if let Some(pending) = pending {
+                answer(pending, None);
             }
             return;
         }
+        let (pending, controller) = {
+            let mut state = self.0.borrow_mut();
+            // The UI may rewrite the URL (https-only, a trailing slash), so fall back to the oldest request.
+            // shortcut: a tab the user opens while a `tabs.create` or `windows.create` is pending answers it (and joins that window); tag requests if that bites.
+            let index = state.pending_tabs.iter().position(|pending| pending.url == url).or((!state.pending_tabs.is_empty()).then_some(0));
+            let pending = index.map(|index| state.pending_tabs.remove(index));
+            (pending, state.profiles.get(store_id).map(|profile| profile.controller.clone()))
+        };
         let tab = NxExtTab::new(
             mtm,
             TabIvars {
                 shared: Rc::downgrade(&self.0),
                 store: store_id.to_string(),
                 tab_id: tab_id.to_string(),
+                window: pending.as_ref().and_then(|pending| pending.window.clone()),
                 view: RefCell::new(Some(view.retain())),
                 parked: RefCell::new((None, None)),
             },
         );
-        let (reply, controller) = {
-            let mut state = self.0.borrow_mut();
-            state.tabs.push(tab.clone());
-            // The UI may rewrite the URL (https-only, a trailing slash), so fall back to the oldest request.
-            // shortcut: a tab the user opens while a `tabs.create` is pending answers it; tag requests if that bites.
-            let index = state.pending_tabs.iter().position(|(pending, _)| pending == url).or((!state.pending_tabs.is_empty()).then_some(0));
-            let reply = index.map(|index| state.pending_tabs.remove(index).1);
-            (reply, state.profiles.get(store_id).map(|profile| profile.controller.clone()))
-        };
+        self.0.borrow_mut().tabs.push(tab.clone());
         if let Some(controller) = controller {
             unsafe { controller.didOpenTab(ProtocolObject::from_ref(&*tab)) };
         }
-        if let Some(reply) = reply {
-            let tab: &ProtocolObject<dyn WKWebExtensionTab> = ProtocolObject::from_ref(&*tab);
-            reply.call((tab as *const _ as *mut _, std::ptr::null_mut()));
+        if let Some(pending) = pending {
+            answer(pending, Some(&tab));
         }
     }
 
@@ -385,18 +421,35 @@ impl Extensions {
         }
     }
 
+    /// A tab closed; an extension's window closes with its last page, as in Chrome (`windows.onRemoved`).
     pub fn closed(&self, tab_id: &str) {
-        let (tab, controller) = {
+        let (tab, controller, emptied) = {
             let mut state = self.0.borrow_mut();
             if state.active.as_deref() == Some(tab_id) {
                 state.active = None;
             }
-            let tab = state.tabs.iter().position(|tab| tab.ivars().tab_id == tab_id).map(|index| state.tabs.remove(index));
-            let controller = tab.as_ref().and_then(|tab| state.profiles.get(&tab.ivars().store)).map(|profile| profile.controller.clone());
-            (tab, controller)
+            let Some(tab) = state.tabs.iter().position(|tab| tab.ivars().tab_id == tab_id).map(|index| state.tabs.remove(index)) else {
+                return;
+            };
+            let emptied = tab.ivars().window.clone().filter(|window| {
+                let window = Some(&**window);
+                !state.tabs.iter().any(|other| same_window(other.ivars().window.as_deref(), window))
+                    && !state.pending_tabs.iter().any(|pending| same_window(pending.window.as_deref(), window))
+            });
+            let controller = state.profiles.get_mut(&tab.ivars().store).map(|profile| {
+                if let Some(window) = &emptied {
+                    profile.opened_windows.retain(|opened| !std::ptr::eq(&**opened, &**window));
+                }
+                profile.controller.clone()
+            });
+            (tab, controller, emptied)
         };
-        if let (Some(tab), Some(controller)) = (tab, controller) {
-            unsafe { controller.didCloseTab_windowIsClosing(ProtocolObject::from_ref(&*tab), false) };
+        let Some(controller) = controller else {
+            return;
+        };
+        unsafe { controller.didCloseTab_windowIsClosing(ProtocolObject::from_ref(&*tab), emptied.is_some()) };
+        if let Some(window) = emptied {
+            unsafe { controller.didCloseWindow(ProtocolObject::from_ref(&*window)) };
         }
     }
 
@@ -468,7 +521,10 @@ impl TabNotifier {
             })
         };
         if let Some((tab, controller)) = found {
-            let changed = WKWebExtensionTabChangedProperties::URL | WKWebExtensionTabChangedProperties::Title | WKWebExtensionTabChangedProperties::Loading;
+            let changed = WKWebExtensionTabChangedProperties::URL
+                | WKWebExtensionTabChangedProperties::Title
+                | WKWebExtensionTabChangedProperties::Loading
+                | WKWebExtensionTabChangedProperties::Muted;
             unsafe { controller.didChangeTabProperties_forTab(changed, ProtocolObject::from_ref(&*tab)) };
         }
     }
@@ -550,6 +606,16 @@ fn load_context(shared: &Rc<RefCell<State>>, store_id: &str, id: &str) {
             profile.keepalive.insert(id.to_string(), view);
         }
     }
+}
+
+/// Pages that may message the extension: its manifest's `externally_connectable.matches`.
+fn connectable_patterns(extension: &WKWebExtension) -> Vec<String> {
+    let manifest = unsafe { extension.manifest() };
+    let value: Option<Retained<AnyObject>> = unsafe { msg_send![&*manifest, valueForKeyPath: &*NSString::from_str("externally_connectable.matches")] };
+    let Some(list) = value.and_then(|value| value.downcast::<NSArray>().ok()) else {
+        return Vec::new();
+    };
+    list.iter().filter_map(|pattern| pattern.downcast::<NSString>().ok()).map(|pattern| pattern.to_string()).collect()
 }
 
 /// Written next to the polyfill by `browser_extensions::patch_missing_apis`.
@@ -684,12 +750,52 @@ fn window_of(shared: &Weak<RefCell<State>>, store: &str) -> Option<Retained<Prot
     Some(ProtocolObject::from_retained(window))
 }
 
-fn store_tabs(shared: &Weak<RefCell<State>>, store: &str) -> Vec<Retained<NxExtTab>> {
+/// The tabs in an extension's `window`, or in the browser window for None, in the order they opened.
+fn window_tabs(shared: &Weak<RefCell<State>>, store: &str, window: Option<&NxExtWindow>) -> Vec<Retained<NxExtTab>> {
     let Some(shared) = shared.upgrade() else {
         return Vec::new();
     };
     let state = shared.borrow();
-    state.tabs.iter().filter(|tab| tab.ivars().store == store).cloned().collect()
+    state.tabs.iter().filter(|tab| tab.ivars().store == store && same_window(tab.ivars().window.as_deref(), window)).cloned().collect()
+}
+
+fn same_window(a: Option<&NxExtWindow>, b: Option<&NxExtWindow>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => std::ptr::eq(a, b),
+        (a, b) => a.is_none() && b.is_none(),
+    }
+}
+
+/// Answers the extension call a page was opened for; `tab` is None for a page extensions don't see as a tab.
+fn answer(pending: Pending, tab: Option<&NxExtTab>) {
+    match pending.reply {
+        Reply::Tab(reply) => {
+            let tab = tab.map_or(std::ptr::null_mut(), |tab| ProtocolObject::<dyn WKWebExtensionTab>::from_ref(tab) as *const _ as *mut _);
+            reply.call((tab, std::ptr::null_mut()));
+        }
+        Reply::Window(reply) => {
+            let window = pending.window.as_deref().map_or(std::ptr::null_mut(), |window| ProtocolObject::<dyn WKWebExtensionWindow>::from_ref(window) as *const _ as *mut _);
+            reply.call((window, std::ptr::null_mut()));
+        }
+        Reply::Nothing => {}
+    }
+}
+
+/// The browser window's frame and its screen's, in screen points; extensions place their popups by them.
+fn browser_frame() -> (NSRect, NSRect) {
+    let window = MainThreadMarker::new().and_then(|mtm| {
+        let app = NSApplication::sharedApplication(mtm);
+        app.keyWindow().or_else(|| app.mainWindow()).or_else(|| app.windows().firstObject())
+    });
+    let Some(window) = window else {
+        return (NSRect::ZERO, NSRect::ZERO);
+    };
+    (window.frame(), window.screen().map_or(NSRect::ZERO, |screen| screen.frame()))
+}
+
+fn fail(reply: &DynBlock<dyn Fn(*mut NSError)>) {
+    let error = NSError::new(1, &NSString::from_str("NxBrowser"));
+    reply.call((Retained::as_ptr(&error) as *mut _,));
 }
 
 fn context_id(context: &WKWebExtensionContext) -> String {
@@ -712,12 +818,21 @@ pub struct Ivars {
     store: String,
 }
 
+pub struct WindowIvars {
+    shared: Weak<RefCell<State>>,
+    store: String,
+    /// The type `windows.create` asked for; None for the browser window.
+    opened: Option<WKWebExtensionWindowType>,
+}
+
 type Parked = (Option<Retained<NSURL>>, Option<Retained<NSString>>);
 
 pub struct TabIvars {
     shared: Weak<RefCell<State>>,
     store: String,
     tab_id: String,
+    /// The `windows.create` window the tab opened in; None for the browser window.
+    window: Option<Retained<NxExtWindow>>,
     /// None while the tab is suspended.
     view: RefCell<Option<Retained<WKWebView>>>,
     /// URL and title from before the tab was suspended.
@@ -740,12 +855,16 @@ define_class!(
     unsafe impl WKWebExtensionTab for NxExtTab {
         #[unsafe(method_id(windowForWebExtensionContext:))]
         unsafe fn window_for(&self, _context: &WKWebExtensionContext) -> Option<Retained<ProtocolObject<dyn WKWebExtensionWindow>>> {
-            window_of(&self.ivars().shared, &self.ivars().store)
+            match &self.ivars().window {
+                Some(window) => Some(ProtocolObject::from_retained(window.clone())),
+                None => window_of(&self.ivars().shared, &self.ivars().store),
+            }
         }
 
         #[unsafe(method(indexInWindowForWebExtensionContext:))]
         unsafe fn index_in_window(&self, _context: &WKWebExtensionContext) -> usize {
-            store_tabs(&self.ivars().shared, &self.ivars().store).iter().position(|tab| tab.ivars().tab_id == self.ivars().tab_id).unwrap_or(0)
+            let tabs = window_tabs(&self.ivars().shared, &self.ivars().store, self.ivars().window.as_deref());
+            tabs.iter().position(|tab| tab.ivars().tab_id == self.ivars().tab_id).unwrap_or(0)
         }
 
         #[unsafe(method_id(webViewForWebExtensionContext:))]
@@ -777,6 +896,20 @@ define_class!(
         #[unsafe(method(isSelectedForWebExtensionContext:))]
         unsafe fn selected(&self, _context: &WKWebExtensionContext) -> bool {
             self.ivars().shared.upgrade().is_some_and(|state| state.borrow().active.as_deref() == Some(self.ivars().tab_id.as_str()))
+        }
+
+        #[unsafe(method(isMutedForWebExtensionContext:))]
+        unsafe fn muted(&self, _context: &WKWebExtensionContext) -> bool {
+            crate::webkit::tab_muted(&self.ivars().tab_id)
+        }
+
+        #[unsafe(method(setMuted:forWebExtensionContext:completionHandler:))]
+        unsafe fn set_muted(&self, muted: bool, context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            crate::webkit::mute_tab(&self.ivars().tab_id, self.view().as_deref(), muted);
+            TabNotifier(self.ivars().shared.clone()).changed(&self.ivars().tab_id);
+            // Redraws the tab strip's speaker.
+            send(&self.ivars().shared, EngineEvent::ExtensionChanged { id: context_id(context) });
+            done(reply);
         }
 
         #[unsafe(method(zoomFactorForWebExtensionContext:))]
@@ -840,6 +973,48 @@ define_class!(
             }
         }
 
+        // `tabs.detectLanguage`: the page's declared language, as Chrome falls back to when it can't tell from the text.
+        #[unsafe(method(detectWebpageLocaleForWebExtensionContext:completionHandler:))]
+        unsafe fn detect_locale(&self, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSLocale, *mut NSError)>) {
+            let Some(view) = self.view() else {
+                return reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
+            };
+            let reply = reply.copy();
+            let block = RcBlock::new(move |value: *mut AnyObject, _error: *mut NSError| {
+                let lang = unsafe { value.as_ref() }.and_then(|value| value.downcast_ref::<NSString>()).map(|lang| lang.to_string());
+                let locale = lang.filter(|lang| !lang.trim().is_empty()).map(|lang| NSLocale::localeWithLocaleIdentifier(&NSString::from_str(lang.trim())));
+                reply.call((locale.as_ref().map_or(std::ptr::null_mut(), |locale| Retained::as_ptr(locale) as *mut _), std::ptr::null_mut()));
+            });
+            unsafe { view.evaluateJavaScript_completionHandler(&NSString::from_str("document.documentElement.lang"), Some(&block)) };
+        }
+
+        #[unsafe(method(duplicateUsingConfiguration:forWebExtensionContext:completionHandler:))]
+        unsafe fn duplicate(
+            &self,
+            _configuration: &WKWebExtensionTabConfiguration,
+            _context: &WKWebExtensionContext,
+            reply: &DynBlock<dyn Fn(*mut ProtocolObject<dyn WKWebExtensionTab>, *mut NSError)>,
+        ) {
+            let url = url_string(match self.view() {
+                Some(view) => unsafe { view.URL() },
+                None => self.ivars().parked.borrow().0.clone(),
+            });
+            let (Some(url), Some(shared)) = (url, self.ivars().shared.upgrade()) else {
+                return reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
+            };
+            shared.borrow_mut().pending_tabs.push(Pending { url: url.clone(), reply: Reply::Tab(reply.copy()), window: self.ivars().window.clone() });
+            let _ = shared.borrow().events.send(EngineEvent::OpenInNewTab { url, from: Some(self.ivars().tab_id.clone()) });
+        }
+
+        // `tabs.update({ highlighted })`: one tab is selected at a time, so selecting one activates it.
+        #[unsafe(method(setSelected:forWebExtensionContext:completionHandler:))]
+        unsafe fn set_selected(&self, selected: bool, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            if selected {
+                send(&self.ivars().shared, EngineEvent::ActivateTab { tab_id: self.ivars().tab_id.clone() });
+            }
+            done(reply);
+        }
+
         #[unsafe(method(activateForWebExtensionContext:completionHandler:))]
         unsafe fn activate(&self, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
             send(&self.ivars().shared, EngineEvent::ActivateTab { tab_id: self.ivars().tab_id.clone() });
@@ -875,7 +1050,7 @@ define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
     #[name = "NxExtWindow"]
-    #[ivars = Ivars]
+    #[ivars = WindowIvars]
     pub struct NxExtWindow;
 
     unsafe impl NSObjectProtocol for NxExtWindow {}
@@ -883,21 +1058,55 @@ define_class!(
     unsafe impl WKWebExtensionWindow for NxExtWindow {
         #[unsafe(method_id(tabsForWebExtensionContext:))]
         unsafe fn tabs(&self, _context: &WKWebExtensionContext) -> Retained<NSArray<ProtocolObject<dyn WKWebExtensionTab>>> {
-            let tabs = store_tabs(&self.ivars().shared, &self.ivars().store).into_iter().map(ProtocolObject::from_retained).collect::<Vec<_>>();
+            let tabs = self.own_tabs().into_iter().map(ProtocolObject::from_retained).collect::<Vec<_>>();
             NSArray::from_retained_slice(&tabs)
         }
 
         #[unsafe(method_id(activeTabForWebExtensionContext:))]
         unsafe fn active_tab(&self, _context: &WKWebExtensionContext) -> Option<Retained<ProtocolObject<dyn WKWebExtensionTab>>> {
             let active = self.ivars().shared.upgrade().and_then(|state| state.borrow().active.clone());
-            let tabs = store_tabs(&self.ivars().shared, &self.ivars().store);
+            let tabs = self.own_tabs();
             let tab = tabs.iter().find(|tab| Some(&tab.ivars().tab_id) == active.as_ref()).or(tabs.first());
             tab.map(|tab| ProtocolObject::from_retained(tab.clone()))
         }
 
         #[unsafe(method(windowTypeForWebExtensionContext:))]
         unsafe fn window_type(&self, _context: &WKWebExtensionContext) -> WKWebExtensionWindowType {
-            WKWebExtensionWindowType::Normal
+            self.ivars().opened.unwrap_or(WKWebExtensionWindowType::Normal)
+        }
+
+        // Pages of every window live in the browser window, so extension windows report its place on screen.
+        #[unsafe(method(frameForWebExtensionContext:))]
+        unsafe fn frame(&self, _context: &WKWebExtensionContext) -> NSRect {
+            browser_frame().0
+        }
+
+        #[unsafe(method(screenFrameForWebExtensionContext:))]
+        unsafe fn screen_frame(&self, _context: &WKWebExtensionContext) -> NSRect {
+            browser_frame().1
+        }
+
+        // The browser lays out its windows itself; moving, resizing and minimizing requests are accepted and left alone.
+        #[unsafe(method(setFrame:forWebExtensionContext:completionHandler:))]
+        unsafe fn set_frame(&self, _frame: NSRect, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            done(reply);
+        }
+
+        #[unsafe(method(setWindowState:forWebExtensionContext:completionHandler:))]
+        unsafe fn set_window_state(&self, _state: WKWebExtensionWindowState, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            done(reply);
+        }
+
+        // `windows.remove`: closes the pages of a window an extension opened; never the browser window.
+        #[unsafe(method(closeForWebExtensionContext:completionHandler:))]
+        unsafe fn close(&self, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            if self.ivars().opened.is_none() {
+                return fail(reply);
+            }
+            for tab in self.own_tabs() {
+                send(&self.ivars().shared, EngineEvent::CloseTab { tab_id: tab.ivars().tab_id.clone() });
+            }
+            done(reply);
         }
 
         #[unsafe(method(windowStateForWebExtensionContext:))]
@@ -912,15 +1121,22 @@ define_class!(
 
         #[unsafe(method(focusForWebExtensionContext:completionHandler:))]
         unsafe fn focus(&self, _context: &WKWebExtensionContext, reply: &DynBlock<dyn Fn(*mut NSError)>) {
+            if let Some(tab) = self.ivars().opened.and_then(|_| self.own_tabs().into_iter().next()) {
+                send(&self.ivars().shared, EngineEvent::ActivateTab { tab_id: tab.ivars().tab_id.clone() });
+            }
             done(reply);
         }
     }
 );
 
 impl NxExtWindow {
-    fn new(mtm: MainThreadMarker, ivars: Ivars) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, ivars: WindowIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn own_tabs(&self) -> Vec<Retained<NxExtTab>> {
+        window_tabs(&self.ivars().shared, &self.ivars().store, self.ivars().opened.map(|_| self))
     }
 }
 
@@ -936,13 +1152,23 @@ define_class!(
     unsafe impl WKWebExtensionControllerDelegate for NxExtDelegate {
         #[unsafe(method_id(webExtensionController:openWindowsForExtensionContext:))]
         unsafe fn open_windows(&self, _controller: &WKWebExtensionController, _context: &WKWebExtensionContext) -> Retained<NSArray<ProtocolObject<dyn WKWebExtensionWindow>>> {
-            let window = window_of(&self.ivars().shared, &self.ivars().store);
-            NSArray::from_retained_slice(&window.into_iter().collect::<Vec<_>>())
+            let opened = self.ivars().shared.upgrade().and_then(|state| Some(state.borrow().profiles.get(&self.ivars().store)?.opened_windows.clone())).unwrap_or_default();
+            let windows = window_of(&self.ivars().shared, &self.ivars().store).into_iter().chain(opened.into_iter().map(ProtocolObject::from_retained));
+            NSArray::from_retained_slice(&windows.collect::<Vec<_>>())
         }
 
+        // The window of the active tab: an extension's own window while one of its pages is showing.
         #[unsafe(method_id(webExtensionController:focusedWindowForExtensionContext:))]
         unsafe fn focused_window(&self, _controller: &WKWebExtensionController, _context: &WKWebExtensionContext) -> Option<Retained<ProtocolObject<dyn WKWebExtensionWindow>>> {
-            window_of(&self.ivars().shared, &self.ivars().store)
+            let opened = self.ivars().shared.upgrade().and_then(|state| {
+                let state = state.borrow();
+                let active = state.active.as_ref()?;
+                state.tabs.iter().find(|tab| &tab.ivars().tab_id == active)?.ivars().window.clone()
+            });
+            match opened {
+                Some(window) => Some(ProtocolObject::from_retained(window)),
+                None => window_of(&self.ivars().shared, &self.ivars().store),
+            }
         }
 
         #[unsafe(method(webExtensionController:openNewTabUsingConfiguration:forExtensionContext:completionHandler:))]
@@ -961,7 +1187,7 @@ define_class!(
             if url.starts_with("nxbrowser://") {
                 reply.call((std::ptr::null_mut(), std::ptr::null_mut()));
             } else {
-                shared.borrow_mut().pending_tabs.push((url.clone(), reply.copy()));
+                shared.borrow_mut().pending_tabs.push(Pending { url: url.clone(), reply: Reply::Tab(reply.copy()), window: None });
             }
             let _ = shared.borrow().events.send(EngineEvent::OpenInNewTab { url, from: None });
         }
@@ -969,19 +1195,36 @@ define_class!(
         #[unsafe(method(webExtensionController:openNewWindowUsingConfiguration:forExtensionContext:completionHandler:))]
         unsafe fn open_new_window(
             &self,
-            _controller: &WKWebExtensionController,
+            controller: &WKWebExtensionController,
             configuration: &WKWebExtensionWindowConfiguration,
             _context: &WKWebExtensionContext,
             reply: &DynBlock<dyn Fn(*mut ProtocolObject<dyn WKWebExtensionWindow>, *mut NSError)>,
         ) {
-            // Every page here is its own floating window already; open the URLs as pages of the one browser window.
-            for url in unsafe { configuration.tabURLs() }.iter() {
-                if let Some(url) = url.absoluteString() {
-                    send(&self.ivars().shared, EngineEvent::OpenInNewTab { url: url.to_string(), from: None });
-                }
+            // Every page here is its own floating window already; the URLs open as pages of the one browser window,
+            // grouped as a window of their own for the extension, which closes with its last page (wallets' approval windows).
+            let urls = unsafe { configuration.tabURLs() }.iter().filter_map(|url| url.absoluteString()).map(|url| url.to_string()).collect::<Vec<_>>();
+            let Some(shared) = self.ivars().shared.upgrade() else {
+                return;
+            };
+            if urls.is_empty() {
+                let window = window_of(&self.ivars().shared, &self.ivars().store);
+                return reply.call((window.map_or(std::ptr::null_mut(), |window| Retained::as_ptr(&window) as *mut _), std::ptr::null_mut()));
             }
-            let window = window_of(&self.ivars().shared, &self.ivars().store);
-            reply.call((window.map_or(std::ptr::null_mut(), |window| Retained::as_ptr(&window) as *mut _), std::ptr::null_mut()));
+            let window = NxExtWindow::new(
+                MainThreadMarker::from(self),
+                WindowIvars { shared: self.ivars().shared.clone(), store: self.ivars().store.clone(), opened: Some(unsafe { configuration.windowType() }) },
+            );
+            if let Some(profile) = shared.borrow_mut().profiles.get_mut(&self.ivars().store) {
+                profile.opened_windows.push(window.clone());
+            }
+            unsafe { controller.didOpenWindow(ProtocolObject::from_ref(&*window)) };
+            // The first page answers, so `windows.create` resolves with its tab in it.
+            let mut reply = Some(Reply::Window(reply.copy()));
+            for url in urls {
+                let pending = Pending { url: url.clone(), reply: reply.take().unwrap_or(Reply::Nothing), window: Some(window.clone()) };
+                shared.borrow_mut().pending_tabs.push(pending);
+                let _ = shared.borrow().events.send(EngineEvent::OpenInNewTab { url, from: None });
+            }
         }
 
         #[unsafe(method(webExtensionController:openOptionsPageForExtensionContext:completionHandler:))]
@@ -1054,8 +1297,7 @@ define_class!(
             if !dismissed && present_popup(&shared, action, context) {
                 done(reply);
             } else {
-                let error = NSError::new(1, &NSString::from_str("NxBrowser"));
-                reply.call((Retained::as_ptr(&error) as *mut _,));
+                fail(reply);
             }
         }
     }
