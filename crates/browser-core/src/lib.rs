@@ -27,7 +27,11 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Where profiles, settings and history live; `NXBROWSER_DATA_DIR` overrides it, so dev runs keep off the installed app's.
 pub fn app_support_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("NXBROWSER_DATA_DIR") {
+        return dir.into();
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     std::path::PathBuf::from(home).join("Library/Application Support/nxbrowser")
 }
