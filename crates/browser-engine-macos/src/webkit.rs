@@ -764,6 +764,10 @@ pub struct MacEngine {
     bounds: LogicalRect,
     stacked: Vec<String>,
     placed_holes: Option<(Vec<Hole>, Vec<Notch>, NSSize)>,
+    /// Native new tab pages by tab id: placed, stacked and faded like pages, but no WebKit inside.
+    homes: HashMap<String, Retained<NSView>>,
+    /// Where each home was last placed (content coordinates), for one made after its first placement.
+    home_frames: HashMap<String, Option<NSRect>>,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     settings: EngineSettings,
     https_only: Arc<AtomicBool>,
@@ -810,6 +814,8 @@ impl MacEngine {
             bounds: LogicalRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
             stacked: Vec::new(),
             placed_holes: None,
+            homes: HashMap::new(),
+            home_frames: HashMap::new(),
             permissions,
             settings: EngineSettings::default(),
             https_only: Arc::new(AtomicBool::new(false)),
@@ -930,6 +936,10 @@ impl MacEngine {
 
     /// Makes the tab's page first responder, so keys and page shortcuts reach it without a click.
     pub fn focus_page(&mut self, tab_id: &str) {
+        // A blank tab's hidden page would take the keys from its new tab page.
+        if self.homes.contains_key(tab_id) {
+            return crate::popover::focus_embed(tab_id);
+        }
         let Some(live) = self.tabs.get(tab_id) else {
             return;
         };
@@ -1110,6 +1120,14 @@ impl MacEngine {
         if let Some(live) = self.tabs.get(tab_id).filter(|live| live.view.alphaValue() != alpha) {
             live.view.setAlphaValue(alpha);
         }
+        if let Some(home) = self.homes.get(tab_id).filter(|home| home.alphaValue() != alpha) {
+            home.setAlphaValue(alpha);
+        }
+    }
+
+    /// Whether tab `tab_id` has a new tab page here (rather than a page or nothing).
+    pub fn has_home(&self, tab_id: &str) -> bool {
+        self.homes.contains_key(tab_id)
     }
 
     /// Opens WebKit's native Web Inspector for the tab (private `_inspector`; needs developer extras on).
@@ -1405,9 +1423,72 @@ impl MacEngine {
         }
         self.stacked = ids.to_vec();
         for id in ids {
-            if let Some(live) = self.tabs.get(id) {
+            if let Some(home) = self.homes.get(id) {
+                self.insert_below_chrome(home);
+            } else if let Some(live) = self.tabs.get(id) {
                 self.insert_below_chrome(&live.view);
             }
+        }
+    }
+
+    /// Shows `content` as tab `tab_id`'s new tab page, laid out `width` wide on `background` (sRGB with alpha);
+    /// it goes where `place_tab` puts the tab, like a page.
+    pub fn set_home(&mut self, tab_id: &str, width: f64, background: [f64; 4], content: &crate::Node) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let container = match self.homes.get(tab_id) {
+            Some(container) => container.clone(),
+            None => {
+                let container = NSView::new(mtm);
+                container.setWantsLayer(true);
+                round_bottom_corners(&container);
+                container.setHidden(true);
+                self.homes.insert(tab_id.to_string(), container.clone());
+                if let Some(Some(frame)) = self.home_frames.get(tab_id).copied() {
+                    self.show_home(&container, frame);
+                }
+                container
+            }
+        };
+        if let Some(layer) = container.layer() {
+            let [r, g, b, a] = background;
+            layer.setBackgroundColor(Some(&CGColor::new_srgb(r, g, b, a)));
+        }
+        crate::popover::embed(self.window_no, tab_id, &container, width, content);
+    }
+
+    /// Drops the new tab pages of tabs not in `keep` (navigated away, closed, or in another space).
+    pub fn keep_homes(&mut self, keep: &[String]) {
+        let gone = self.homes.keys().filter(|id| !keep.contains(id)).cloned().collect::<Vec<_>>();
+        for id in gone {
+            if let Some(container) = self.homes.remove(&id) {
+                container.removeFromSuperview();
+            }
+            self.home_frames.remove(&id);
+            crate::popover::unembed(&id);
+        }
+    }
+
+    /// Puts the caret in tab `tab_id`'s new tab page search field.
+    pub fn focus_home(&self, tab_id: &str) {
+        crate::popover::focus_embed(tab_id);
+    }
+
+    /// Where native text field `field` sits in the window (top-left origin), for a list to hang from it.
+    pub fn field_frame(&self, field: u32) -> Option<LogicalRect> {
+        crate::popover::field_frame(field)
+    }
+
+    fn show_home(&self, container: &NSView, frame: NSRect) {
+        if container.frame() != frame {
+            container.setFrame(frame);
+        }
+        if container.isHidden() {
+            container.setHidden(false);
+        }
+        if unsafe { container.superview() }.is_none() {
+            self.insert_below_chrome(container);
         }
     }
 
@@ -1552,6 +1633,25 @@ impl WebEngine for MacEngine {
     }
 
     fn place_tab(&mut self, tab_id: &str, bounds: Option<LogicalRect>) {
+        if self.homes.contains_key(tab_id) || !self.tabs.contains_key(tab_id) {
+            // A blank tab may still have a page behind its new tab page.
+            if let Some(live) = self.tabs.get(tab_id).filter(|live| !live.view.isHidden()) {
+                live.view.setHidden(true);
+            }
+            let height = self.content.as_ref().map_or(0., |content| content.bounds().size.height);
+            let frame = bounds.map(|bounds| {
+                NSRect::new(NSPoint::new(bounds.x, height - bounds.y - bounds.height.max(1.0)), NSSize::new(bounds.width.max(1.0), bounds.height.max(1.0)))
+            });
+            self.home_frames.insert(tab_id.to_string(), frame);
+            if let Some(container) = self.homes.get(tab_id).cloned() {
+                match frame {
+                    Some(frame) => self.show_home(&container, frame),
+                    None if !container.isHidden() => container.setHidden(true),
+                    None => {}
+                }
+            }
+            return;
+        }
         let Some(live) = self.tabs.get(tab_id).filter(|live| !in_fullscreen(&live.view)) else {
             return;
         };
@@ -2190,6 +2290,11 @@ pub(crate) fn send_event(window_no: isize, event: EngineEvent) {
             wake();
         }
     });
+}
+
+/// Whether `window_no` is a browser window (not a panel, sheet or settings window of ours).
+pub(crate) fn is_browser_window(window_no: isize) -> bool {
+    WINDOWS.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|windows| windows.get(&window_no).is_some_and(|state| state.events.is_some()))
 }
 
 /// Per browser window, by `windowNumber`.

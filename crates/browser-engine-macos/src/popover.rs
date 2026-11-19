@@ -57,6 +57,12 @@ pub enum Node {
     Popup { items: Vec<String>, selected: usize, first: u32 },
     /// `value` beside up/down arrows: down runs `down`, up runs `down + 1`.
     Stepper { value: String, down: u32 },
+    /// `child`, with `corner` over its top-right corner (taking no room of its own).
+    Overlay { child: Box<Node>, corner: Box<Node> },
+    /// `child` at its natural size, centred across the width it is given.
+    Center(Box<Node>),
+    /// `children` left to right, wrapping onto new rows `gap` apart; rows centred when `center`.
+    Flow { gap: f64, center: bool, children: Vec<Node> },
     /// `child` exactly `width` wide; text inside wraps at that width.
     Width(f64, Box<Node>),
     /// A window's layout: a `sidebar_width` sidebar on the system sidebar material, then `content` scrolling,
@@ -145,6 +151,8 @@ enum Host {
     /// The sheet, and the window it hangs from.
     Sheet(Retained<NSPanel>, Retained<NSWindow>),
     Window(Retained<NSWindow>),
+    /// A view the caller places in its own window (the new tab page), holding the content.
+    Embedded(Retained<NSView>),
     /// A floating glass panel, the window it is a child of, and the glass holding the content.
     Panel(Retained<NxPanel>, Retained<NSWindow>, Retained<NSGlassEffectView>),
 }
@@ -157,6 +165,7 @@ impl Host {
             Host::Sheet(panel, _) => panel.contentView(),
             Host::Window(window) => window.contentView(),
             Host::Panel(_, _, glass) => glass.contentView(),
+            Host::Embedded(container) => container.subviews().firstObject(),
         }
     }
 }
@@ -182,6 +191,10 @@ thread_local! {
     static LIST: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static TOAST: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static FIND: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    /// Embedded surfaces by key (the new tab pages, by tab id).
+    static EMBEDS: RefCell<HashMap<String, Surface>> = RefCell::new(HashMap::new());
+    /// Search fields, by field id: their arrows, Return, Tab and Esc go to the app as `EngineEvent::PopoverKey`.
+    static KEY_FIELDS: RefCell<std::collections::HashSet<u32>> = RefCell::new(std::collections::HashSet::new());
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -224,6 +237,7 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
                 window.setContentView(Some(&view));
                 window.setContentSize(size);
             }
+            Host::Embedded(_) => {}
             Host::Panel(panel, _, glass) => {
                 // Grows and shrinks downward: its top edge stays put under the title bar.
                 let frame = panel.frame();
@@ -641,29 +655,103 @@ pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
     })
 }
 
+/// Fills `container` with `content` laid out `width` wide, for browser window `window_no`; rebuilt only when the
+/// content or width changes. The caller places `container`.
+pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64, content: &Node) {
+    let mtm = MainThreadMarker::new().expect("embedded views live on the main thread");
+    // Out of the map while rebuilding: moving a focused field ends its editing, which calls back into this module.
+    let Some(mut surface) = EMBEDS.with_borrow_mut(|embeds| match embeds.get(key) {
+        Some(surface) if surface.content == *content && surface.width == width => None,
+        _ => Some(embeds.remove(key).unwrap_or(Surface {
+            host: Host::Embedded(container.retain()),
+            window_no,
+            key: 0,
+            width,
+            content: Node::Spacer,
+            submits: HashMap::new(),
+            fields: HashMap::new(),
+        })),
+    }) else {
+        return;
+    };
+    let editing = surface.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
+    let (view, _) = root(mtm, content, width, &mut surface.submits, &mut surface.fields);
+    for old in container.subviews().iter() {
+        old.removeFromSuperview();
+    }
+    container.addSubview(&view);
+    view.setTranslatesAutoresizingMaskIntoConstraints(false);
+    // `root` fixed its width; the caller sizes the container to match.
+    view.leadingAnchor().constraintEqualToAnchor(&container.leadingAnchor()).setActive(true);
+    view.topAnchor().constraintEqualToAnchor(&container.topAnchor()).setActive(true);
+    surface.width = width;
+    surface.content = content.clone();
+    if let Some(field) = editing.and_then(|id| surface.fields.get(&id)) {
+        focus(field);
+    }
+    EMBEDS.with_borrow_mut(|embeds| embeds.insert(key.to_string(), surface));
+}
+
+pub(crate) fn unembed(key: &str) {
+    EMBEDS.with_borrow_mut(|embeds| embeds.remove(key));
+}
+
+/// Puts the caret in the first text field of embedded surface `key`.
+pub(crate) fn focus_embed(key: &str) {
+    EMBEDS.with_borrow(|embeds| {
+        // Not again while being typed in: the click that started the edit also refocuses the tab.
+        if let Some(field) = embeds.get(key).and_then(|surface| surface.fields.values().next()).filter(|field| field.currentEditor().is_none()) {
+            focus(field);
+        }
+    });
+}
+
+/// Where text field `field` of an embedded surface sits while it is being edited, in its window's coordinates
+/// (top-left origin).
+pub(crate) fn field_frame(field: u32) -> Option<LogicalRect> {
+    EMBEDS.with_borrow(|embeds| {
+        let input = embeds.values().filter_map(|surface| surface.fields.get(&field)).find(|input| input.currentEditor().is_some())?;
+        let content = input.window()?.contentView()?;
+        let rect = input.convertRect_toView(input.bounds(), Some(&content));
+        let top = if content.isFlipped() { rect.origin.y } else { content.bounds().size.height - rect.origin.y - rect.size.height };
+        Some(LogicalRect { x: rect.origin.x, y: top, width: rect.size.width, height: rect.size.height })
+    })
+}
+
 /// Replaces the text in field `field` of the open popover, sheet, window or panel, caret at the end.
 pub(crate) fn set_field(field: u32, text: &str) {
+    let put = |input: &NSTextField| {
+        input.setStringValue(&NSString::from_str(text));
+        if let Some(editor) = input.currentEditor() {
+            editor.setSelectedRange(NSRange::new(input.stringValue().length(), 0));
+        }
+    };
     for slot in [&PANEL, &FIND, &WINDOW, &SHEET, &POPOVER] {
-        slot.with_borrow(|surface| {
-            if let Some(input) = surface.as_ref().and_then(|surface| surface.fields.get(&field)) {
-                input.setStringValue(&NSString::from_str(text));
-                if let Some(editor) = input.currentEditor() {
-                    editor.setSelectedRange(NSRange::new(input.stringValue().length(), 0));
-                }
-            }
-        });
+        slot.with_borrow(|surface| surface.as_ref().and_then(|surface| surface.fields.get(&field)).map(|input| put(input)));
     }
+    EMBEDS.with_borrow(|embeds| embeds.values().filter_map(|surface| surface.fields.get(&field)).for_each(|input| put(input)));
 }
 
 /// Field `field`'s Return action, in whichever surface has it.
 fn submit_action(field: u32) -> Option<u32> {
-    [&PANEL, &FIND, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+    [&PANEL, &FIND, &LIST, &WINDOW, &SHEET, &POPOVER]
+        .into_iter()
+        .find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+        .or_else(|| EMBEDS.with(|embeds| embeds.try_borrow().ok()?.values().find_map(|surface| surface.submits.get(&field).copied())))
 }
 
 /// `read` of the surface in `slot`, skipping one being rebuilt: moving its focused field ends editing, which calls
 /// back in here while `refresh` holds the slot.
 fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read: impl FnOnce(&Surface) -> Option<T>) -> Option<T> {
     slot.with(|cell| cell.try_borrow().ok().and_then(|surface| surface.as_ref().and_then(read)))
+}
+
+/// Sends `event` to the browser window `view` is in, when it is embedded in one; else as `send` does.
+fn send_for(view: &NSView, event: EngineEvent) {
+    match view.window().map(|window| window.windowNumber()).filter(|&no| crate::webkit::is_browser_window(no)) {
+        Some(window_no) => crate::webkit::send_event(window_no, event),
+        None => send(event),
+    }
 }
 
 fn send(event: EngineEvent) {
@@ -727,10 +815,10 @@ define_class!(
         /// Other fields keep theirs.
         #[unsafe(method(control:textView:doCommandBySelector:))]
         fn do_command(&self, control: &NSControl, text_view: &NSTextView, command: Sel) -> Bool {
-            let mine = |surface: &Surface| surface.fields.iter().find(|(_, field)| std::ptr::eq(Retained::as_ptr(field).cast::<NSControl>(), control)).map(|(id, _)| *id);
-            let Some(field) = peek(&PANEL, mine).or_else(|| peek(&FIND, mine)) else {
+            let field = control.tag() as u32;
+            if !KEY_FIELDS.with_borrow(|fields| fields.contains(&field)) {
                 return Bool::NO;
-            };
+            }
             // The key event's own modifiers: the keyboard's live state misses replayed and posted keys.
             let event = NSApplication::sharedApplication(self.mtm()).currentEvent();
             let flags = event.as_ref().map(|event| event.modifierFlags()).unwrap_or(NSEventModifierFlags::empty());
@@ -751,7 +839,7 @@ define_class!(
                 "deleteBackward:" if length == 0 => "backspace",
                 _ => return Bool::NO,
             };
-            send(EngineEvent::PopoverKey { field, key: key.into() });
+            send_for(control, EngineEvent::PopoverKey { field, key: key.into() });
             Bool::YES
         }
     }
@@ -763,14 +851,14 @@ define_class!(
         fn act(&self, sender: &NSView) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             if let Ok(action) = u32::try_from(tag) {
-                send(EngineEvent::PopoverAction(action));
+                send_for(sender, EngineEvent::PopoverAction(action));
             }
         }
 
         #[unsafe(method(picked:))]
         fn picked(&self, sender: &NSPopUpButton) {
             if let Some(action) = sender.selectedItem().and_then(|item| u32::try_from(item.tag()).ok()) {
-                send(EngineEvent::PopoverAction(action));
+                send_for(sender, EngineEvent::PopoverAction(action));
             }
         }
 
@@ -780,7 +868,7 @@ define_class!(
             let up = sender.integerValue() > 1;
             sender.setIntegerValue(1);
             if let Ok(down) = u32::try_from(sender.tag()) {
-                send(EngineEvent::PopoverAction(down + u32::from(up)));
+                send_for(sender, EngineEvent::PopoverAction(down + u32::from(up)));
             }
         }
 
@@ -788,9 +876,9 @@ define_class!(
         fn submit(&self, sender: &NSTextField) {
             let field = sender.tag() as u32;
             // A combo box pick changes the text without a text-change notification.
-            send(EngineEvent::PopoverText { field, text: sender.stringValue().to_string() });
+            send_for(sender, EngineEvent::PopoverText { field, text: sender.stringValue().to_string() });
             if let Some(action) = submit_action(field) {
-                send(EngineEvent::PopoverAction(action));
+                send_for(sender, EngineEvent::PopoverAction(action));
             }
         }
 
@@ -800,7 +888,7 @@ define_class!(
                 return;
             };
             let text = field.stringValue().to_string();
-            send(EngineEvent::PopoverText { field: field.tag() as u32, text });
+            send_for(&field, EngineEvent::PopoverText { field: field.tag() as u32, text });
         }
     }
 );
@@ -853,7 +941,7 @@ define_class!(
         fn mouse_up(&self, _event: &NSEvent) {
             if self.ivars().press.take().is_some() {
                 if let Some(action) = self.ivars().click.get() {
-                    send(EngineEvent::PopoverAction(action));
+                    send_for(self, EngineEvent::PopoverAction(action));
                 }
             }
         }
@@ -1132,10 +1220,65 @@ impl Build<'_> {
                     input
                 });
                 input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+                KEY_FIELDS.with_borrow_mut(|fields| fields.insert(*field));
                 self.fields.insert(*field, input.clone());
                 self.first.get_or_insert_with(|| input.clone());
                 input.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
                 Retained::into_super(Retained::into_super(input))
+            }
+            Node::Overlay { child, corner } => {
+                let holder = NSView::new(mtm);
+                pin(&holder, &self.node(child), 0.);
+                let corner = self.node(corner);
+                holder.addSubview(&corner);
+                corner.setTranslatesAutoresizingMaskIntoConstraints(false);
+                corner.topAnchor().constraintEqualToAnchor(&holder.topAnchor()).setActive(true);
+                corner.trailingAnchor().constraintEqualToAnchor(&holder.trailingAnchor()).setActive(true);
+                holder.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
+                holder
+            }
+            Node::Center(child) => {
+                let holder = NSView::new(mtm);
+                let view = self.node(child);
+                holder.addSubview(&view);
+                view.centerXAnchor().constraintEqualToAnchor(&holder.centerXAnchor()).setActive(true);
+                view.topAnchor().constraintEqualToAnchor(&holder.topAnchor()).setActive(true);
+                view.bottomAnchor().constraintEqualToAnchor(&holder.bottomAnchor()).setActive(true);
+                view.widthAnchor().constraintLessThanOrEqualToAnchor(&holder.widthAnchor()).setActive(true);
+                holder.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
+                holder
+            }
+            Node::Flow { gap, center, children } => {
+                // Rows filled greedily by each child's natural width, within the width available here.
+                let views = children.iter().map(|child| self.node(child)).collect::<Vec<_>>();
+                let mut rows: Vec<Vec<Retained<NSView>>> = Vec::new();
+                let mut used = f64::INFINITY;
+                for view in views {
+                    let width = view.fittingSize().width;
+                    if used + gap + width > self.width {
+                        rows.push(Vec::new());
+                        used = -gap;
+                    }
+                    used += gap + width;
+                    if let Some(row) = rows.last_mut() {
+                        row.push(view);
+                    }
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&row), mtm);
+                        stack.setSpacing(*gap);
+                        stack.setAlignment(NSLayoutAttribute::Top);
+                        Retained::into_super(stack)
+                    })
+                    .collect::<Vec<_>>();
+                let column = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&rows), mtm);
+                column.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+                column.setSpacing(*gap);
+                column.setAlignment(if *center { NSLayoutAttribute::CenterX } else { NSLayoutAttribute::Leading });
+                column.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
+                Retained::into_super(column)
             }
             Node::Combo { field, value, items, submit } => {
                 let input = self.kept.remove(field).unwrap_or_else(|| {
@@ -1285,9 +1428,12 @@ impl Build<'_> {
                 card.setBorderWidth(0.);
                 card.setCornerRadius(8.);
                 card.setFillColor(&color(*tint).colorWithAlphaComponent(0.12));
-                // Pinned to the box itself: as its content view the child sized nothing, and the card collapsed.
-                pin(&card, &self.node(child), 0.);
-                Retained::into_super(card)
+                // The box sits behind the child, not around it: as its content view the child sized nothing and the
+                // card collapsed, and pinned inside the box it never got clicks (a box hit-tests only its content view).
+                let holder = NSView::new(mtm);
+                pin(&holder, &card, 0.);
+                pin(&holder, &self.node(child), 0.);
+                holder
             }
             Node::Scroll { max, child } => self.scroll(child, *max, false),
         };

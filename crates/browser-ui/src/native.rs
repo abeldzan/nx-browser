@@ -28,6 +28,7 @@ pub(crate) const UI_FONT: u32 = 16;
 pub(crate) const TERM_FONT: u32 = 17;
 pub(crate) const PALETTE_QUERY: u32 = 18;
 pub(crate) const FIND_QUERY: u32 = 19;
+pub(crate) const HOME_QUERY: u32 = 20;
 
 /// Action ids from here up belong to the open native window (settings).
 pub(crate) const WINDOW_BASE: u32 = 2 << 20;
@@ -37,6 +38,8 @@ pub(crate) const PANEL_BASE: u32 = 3 << 20;
 pub(crate) const LIST_BASE: u32 = 4 << 20;
 /// And from here up, to the find bar.
 pub(crate) const FIND_BASE: u32 = 5 << 20;
+/// And from here up, to the new tab pages.
+pub(crate) const HOME_BASE: u32 = 6 << 20;
 
 /// Collects a popover's or sheet's handlers while its content is built; a control carries the id `act` returns.
 #[derive(Default)]
@@ -64,6 +67,10 @@ impl Pop {
 
     pub(crate) fn find() -> Self {
         Self { actions: Vec::new(), base: FIND_BASE }
+    }
+
+    pub(crate) fn home() -> Self {
+        Self { actions: Vec::new(), base: HOME_BASE }
     }
 
     pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {

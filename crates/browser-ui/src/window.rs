@@ -87,6 +87,9 @@ pub struct BrowserWindow {
     panel_actions: Vec<crate::settings::MenuAction>,
     /// The address suggestions' handlers, from `native::LIST_BASE` up.
     list_actions: Vec<crate::settings::MenuAction>,
+    pub(crate) home_actions: Vec<crate::settings::MenuAction>,
+    /// Each blank tab's page area (width, height) when last placed, for laying out its new tab page.
+    pub(crate) page_sizes: HashMap<String, (f64, f64)>,
     /// The find bar's handlers, from `native::FIND_BASE` up.
     find_actions: Vec<crate::settings::MenuAction>,
     /// The settings window's handlers, from `native::WINDOW_BASE` up.
@@ -112,8 +115,6 @@ pub struct BrowserWindow {
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
     address_editing: bool,
-    /// The edit was started from the new-tab page's big field, so the input is drawn there instead of the title bar.
-    address_in_page: bool,
     /// A page was clicked while the address was being edited; end the edit on the next render.
     blur_address: bool,
     find_open: bool,
@@ -206,8 +207,8 @@ pub struct BrowserWindow {
     /// New windows growing in.
     opened: HashMap<String, Instant>,
     /// Address bar matches (url or search query, title, is a search) and the one picked with the arrow keys.
-    suggestions: Vec<(String, String, bool)>,
-    suggestion: Option<usize>,
+    pub(crate) suggestions: Vec<(String, String, bool)>,
+    pub(crate) suggestion: Option<usize>,
     /// In-flight search-engine completion fetch; replacing it cancels the stale one.
     suggest_task: Option<Task<()>>,
     address_bounds: Option<gpui::Bounds<Pixels>>,
@@ -357,6 +358,8 @@ impl BrowserWindow {
             window_actions: Vec::new(),
             panel_actions: Vec::new(),
             list_actions: Vec::new(),
+            home_actions: Vec::new(),
+            page_sizes: HashMap::new(),
             find_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
@@ -368,7 +371,6 @@ impl BrowserWindow {
             download_progress: HashMap::new(),
             address_focused: false,
             focus_address: false,
-            address_in_page: false,
             address_editing: false,
             blur_address: false,
             find_open: false,
@@ -747,8 +749,9 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
-                use crate::native::{FIND_BASE, LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
+                use crate::native::{FIND_BASE, HOME_BASE, LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
                 let (slot, base) = match action {
+                    HOME_BASE.. => (&mut self.home_actions, HOME_BASE),
                     FIND_BASE.. => (&mut self.find_actions, FIND_BASE),
                     LIST_BASE.. => (&mut self.list_actions, LIST_BASE),
                     PANEL_BASE.. => (&mut self.panel_actions, PANEL_BASE),
@@ -763,6 +766,7 @@ impl BrowserWindow {
                     cx.notify();
                 }
                 let slot = match action {
+                    HOME_BASE.. => &mut self.home_actions,
                     FIND_BASE.. => &mut self.find_actions,
                     LIST_BASE.. => &mut self.list_actions,
                     PANEL_BASE.. => &mut self.panel_actions,
@@ -782,6 +786,7 @@ impl BrowserWindow {
             }
             EngineEvent::RecordedKey(keys) => self.record_key(&keys, cx),
             EngineEvent::PopoverKey { field, key } if field == crate::native::FIND_QUERY => self.find_key(&key, cx),
+            EngineEvent::PopoverKey { field, key } if field == crate::native::HOME_QUERY => self.home_key(&key, cx),
             EngineEvent::PopoverKey { key, .. } => self.palette_key(&key, cx),
             EngineEvent::PanelClosed => {
                 if self.palette_open {
@@ -792,6 +797,10 @@ impl BrowserWindow {
             }
             EngineEvent::PopoverText { field, text } => {
                 self.popover_texts.insert(field, text);
+                if field == crate::native::HOME_QUERY {
+                    self.suggestion = None;
+                    self.update_suggestions(self.typed(field), cx);
+                }
                 if field == crate::native::PALETTE_QUERY {
                     self.palette_index = 0;
                     self.absorb_bang(cx);
@@ -1431,7 +1440,7 @@ impl BrowserWindow {
     }
 
     /// Chrome-style: history and bookmark matches first, then the search engine's completions once they arrive.
-    fn update_suggestions(&mut self, typed: String, cx: &mut Context<Self>) {
+    pub(crate) fn update_suggestions(&mut self, typed: String, cx: &mut Context<Self>) {
         let (history, template) = {
             let model = self.model.lock();
             (model.suggest(&typed, 4).unwrap_or_default(), model.settings.suggest_template())
@@ -1489,7 +1498,7 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn commit_navigation(&mut self, raw: &str, cx: &mut Context<Self>) {
+    pub(crate) fn commit_navigation(&mut self, raw: &str, cx: &mut Context<Self>) {
         let (url, tab_id) = {
             let model = self.model.lock();
             (normalize_url(raw, model.settings.search_template(), model.settings.https_only), model.active_tab().map(|tab| tab.id.clone()))
@@ -1504,7 +1513,6 @@ impl BrowserWindow {
         }
         self.address_focused = false;
         self.address_editing = false;
-        self.address_in_page = false;
         self.suggestions.clear();
         self.suggestion = None;
         self.suggest_task = None;
@@ -1989,7 +1997,6 @@ impl BrowserWindow {
         window.blur();
         self.address_focused = false;
         self.address_editing = false;
-        self.address_in_page = false;
         self.refresh_url(cx);
         cx.notify();
     }
@@ -2072,7 +2079,6 @@ impl BrowserWindow {
         } else {
             // Focus moved to another field mid-edit.
             self.address_editing = false;
-            self.address_in_page = false;
             self.refresh_url(cx);
         }
     }
@@ -2203,6 +2209,7 @@ impl Render for BrowserWindow {
         self.sync_settings(cx);
         self.sync_palette(cx);
         self.sync_suggestions();
+        self.sync_homes(cx);
         self.sync_find();
         self.sync_toast();
         self.sync_address_focus(window, cx);
@@ -2385,7 +2392,12 @@ impl BrowserWindow {
     /// Hangs the address suggestions below the address field while it is focused, or updates them.
     fn sync_suggestions(&mut self) {
         use crate::native::{Ink, Node, Weight};
-        let Some(bounds) = self.address_bounds.filter(|_| self.address_focused && !self.suggestions.is_empty()) else {
+        let anchor = match self.address_bounds.filter(|_| self.address_focused) {
+            Some(bounds) => Some((f64::from(bounds.origin.x), f64::from(bounds.origin.y + bounds.size.height), f64::from(bounds.size.width))),
+            // Or a new tab page's search field, while it is being typed in.
+            None => self.engine.field_frame(crate::native::HOME_QUERY).map(|frame| (frame.x - 32., frame.y + frame.height + 8., frame.width + 40.)),
+        };
+        let Some((x, bottom, width)) = anchor.filter(|_| !self.suggestions.is_empty()) else {
             return self.engine.close_list();
         };
         let mut pop = crate::native::Pop::list();
@@ -2406,8 +2418,7 @@ impl BrowserWindow {
             rows.push(if self.suggestion == Some(index) { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
         }
         let content = Node::Column { gap: 0., pad: (4., 4.), children: rows };
-        let at = (f64::from(bounds.origin.x), f64::from(bounds.origin.y + bounds.size.height) + 4.);
-        self.engine.show_list(1, at, f64::from(bounds.size.width.max(px(320.))), &content);
+        self.engine.show_list(1, (x, bottom + 4.), width.max(320.), &content);
         self.list_actions = pop.actions;
     }
 
@@ -3157,13 +3168,14 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn place_windows(&mut self) {
+    /// Places pages for this frame; true when a new tab page's area changed size and needs laying out again.
+    fn place_windows(&mut self) -> bool {
         if self.self_test.is_some() {
-            return;
+            return false;
         }
         self.engine.set_modal(self.modal_open());
         let Some(stage) = self.stage_bounds else {
-            return;
+            return false;
         };
         let origin_x = f64::from(stage.origin.x);
         let origin_y = f64::from(stage.origin.y);
@@ -3172,8 +3184,9 @@ impl BrowserWindow {
         let ids = self.order.clone();
         // `order` spans every space; only this space's windows are on the stage.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        let drawn = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url) || is_blank(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
+        let drawn = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
+        let mut resized = false;
         let preview = self.drop_preview();
         let carried = self.carried().map(|(id, _)| id);
         for id in ids {
@@ -3222,6 +3235,10 @@ impl BrowserWindow {
             if id == self.find_tab {
                 self.find_anchor = Some(rect.clone());
             }
+            if self.engine.has_home(&id) {
+                let size = (rect.width, rect.height);
+                resized |= self.page_sizes.insert(id.clone(), size) != Some(size);
+            }
             self.engine.place_tab(&id, Some(rect.clone()));
             self.engine.set_alpha(&id, f64::from(alpha));
             let shell = LogicalRect {
@@ -3243,6 +3260,7 @@ impl BrowserWindow {
         self.engine.set_page_holes(&holes, &notches);
         let resizable = self.chrome.iter().filter(|(_, entry)| !entry.maximized).map(|(id, _)| id.clone()).collect::<Vec<_>>();
         self.engine.set_grab_zones(&grab_zones(&stack, &resizable));
+        resized
     }
 
     fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
@@ -3343,7 +3361,9 @@ impl BrowserWindow {
                     move |bounds, _, cx| watch.update(cx, |view, cx| view.note_stage(bounds, cx)),
                     move |_bounds, listening, window, cx| {
                         paint_watch.update(cx, |view, cx| {
-                            view.place_windows();
+                            if view.place_windows() {
+                                cx.notify();
+                            }
                             if listening {
                                 view.listen_gesture(window, cx);
                             }
@@ -3447,7 +3467,7 @@ impl BrowserWindow {
             self.refresh_url(cx);
         }
         // After placing: a page un-minimized just now is hidden until placed, and AppKit won't focus a hidden view.
-        self.place_windows();
+        let _ = self.place_windows();
         self.focus_active_content();
         cx.notify();
     }
@@ -3541,15 +3561,6 @@ impl BrowserWindow {
                         .bg(paint.bg)
                         // Cached: the screen rebuilds only when the terminal itself notifies, not on every chrome repaint.
                         .child(terminal::terminal_for(&tab.id, &tab.url, cx).cached(gpui::StyleRefinement::default().size_full())),
-                    false if is_blank(&tab.url) => div()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .mx(px(PAGE_INSET as f32))
-                        .mb(px(PAGE_INSET as f32))
-                        .rounded_b(px(PAGE_RADIUS as f32))
-                        .overflow_hidden()
-                        .bg(paint.bg)
-                        .child(self.new_tab_page(tab, cx)),
                     false => div().flex_1().min_h(px(0.)),
                 }),
         );
@@ -3815,7 +3826,7 @@ impl BrowserWindow {
     fn address_slot(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
         let paint = paint(cx);
         // One input can only be drawn once: a blank tab's edit started from the page's big field is drawn there.
-        let editing = tab.active && !(is_blank(&tab.url) && self.address_in_page) && (self.address_editing || self.address_focused);
+        let editing = tab.active && (self.address_editing || self.address_focused);
         let pill = div()
             .h(px(self.pill_h()))
             .w_full()
@@ -3882,188 +3893,6 @@ impl BrowserWindow {
     }
 
     /// Drawn in place of a blank tab's page: bookmarks along the top, then a big address field over pinned and recently visited sites.
-    fn new_tab_page(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let id = tab.id.clone();
-        let pill = div()
-            .h(px(46.))
-            .w_full()
-            .px(px(16.))
-            .gap(px(10.))
-            .rounded(px(12.))
-            .flex()
-            .items_center()
-            .bg(paint.secondary)
-            .border_1()
-            .shadow_sm()
-            .child(Icons::magnifying_glass().size(px(16.)).text_color(paint.muted));
-        let field = if tab.active && self.address_in_page && (self.address_editing || self.address_focused) {
-            self.address_field(pill.border_color(paint.accent.opacity(0.6)), 16., cx)
-        } else {
-            let open = id.clone();
-            div().w_full().child(
-                pill.id(SharedString::from(format!("home-field-{id}")))
-                    .border_color(paint.border)
-                    .cursor_text()
-                    .text_size(paint.text(16.))
-                    .text_color(paint.muted)
-                    .child("Search or enter an address")
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.focus_window(&open, cx);
-                        this.focus_address = true;
-                        this.address_in_page = true;
-                        cx.notify();
-                    })),
-            )
-        };
-        let (bookmarks, recent) = {
-            let model = self.model.lock();
-            let bookmarks = model.bookmarks().unwrap_or_default();
-            // Pinned sites already have a tile; recent skips them too.
-            let mut hosts = bookmarks.iter().filter(|b| b.pinned).map(|b| site_host(&b.url)).collect::<HashSet<_>>();
-            let recent = model
-                .history()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|entry| hosts.insert(site_host(&entry.url)))
-                .take(8)
-                .collect::<Vec<_>>();
-            (bookmarks, recent)
-        };
-        let (pinned, saved): (Vec<_>, Vec<_>) = bookmarks.into_iter().partition(|b| b.pinned);
-        let action = |key: String, icon: gpui::Svg, run: WindowAction, cx: &mut Context<Self>| {
-            div()
-                .id(SharedString::from(key))
-                .size(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(5.))
-                .bg(paint.surface)
-                .border_1()
-                .border_color(paint.border)
-                .hover(|style| style.bg(paint.secondary))
-                .child(icon.size(px(10.)).text_color(paint.fg))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    run(this, cx);
-                    cx.notify();
-                }))
-        };
-        let tile = |key: String, url: &str, title: &str, actions: gpui::Div, cx: &mut Context<Self>| {
-            let (window_id, open) = (id.clone(), url.to_string());
-            let name = if title.is_empty() { site_host(url) } else { title.to_string() };
-            v_stack()
-                .id(SharedString::from(key.clone()))
-                .group(SharedString::from(key.clone()))
-                .relative()
-                .w(px(72.))
-                .p(px(8.))
-                .gap(px(6.))
-                .items_center()
-                .rounded(px(10.))
-                .cursor_pointer()
-                .hover(|tile| tile.bg(paint.secondary))
-                .child(site_icon(url, 32., false))
-                .child(div().w_full().text_size(paint.text(11.)).text_center().truncate().child(name))
-                .child(h_stack().absolute().top(px(2.)).right(px(2.)).gap(px(2.)).opacity(0.).group_hover(SharedString::from(key), |style| style.opacity(1.)).child(actions))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.focus_window(&window_id, cx);
-                    this.commit_navigation(&open, cx);
-                }))
-        };
-        let mut column = v_stack().w_full().max_w(px(640.)).gap(px(20.)).child(field);
-        let mut grid = div().flex().flex_wrap().gap(px(8.));
-        for bookmark in pinned.iter().rev() {
-            let (edit, unpin) = (bookmark.clone(), bookmark.clone());
-            let actions = h_stack()
-                .gap(px(2.))
-                .child(action(format!("home-edit-{}-{id}", bookmark.id), Icons::pencil_1(), Box::new(move |this, cx| this.open_bookmark_editor(Some(&edit), cx)), cx))
-                .child(action(format!("home-unpin-{}-{id}", bookmark.id), Icons::cross_2(), Box::new(move |this, _| {
-                    let _ = this.model.lock().save_bookmark(Some(&unpin.id), &unpin.url, &unpin.title, false);
-                }), cx));
-            grid = grid.child(tile(format!("home-pin-{}-{id}", bookmark.id), &bookmark.url, &bookmark.title, actions, cx));
-        }
-        grid = grid.child(
-            v_stack()
-                .id(SharedString::from(format!("home-add-{id}")))
-                .w(px(72.))
-                .p(px(8.))
-                .gap(px(6.))
-                .items_center()
-                .rounded(px(10.))
-                .cursor_pointer()
-                .text_color(paint.muted)
-                .hover(|tile| tile.bg(paint.secondary))
-                .child(div().size(px(32.)).flex().items_center().justify_center().rounded_full().bg(paint.secondary).child(Icons::plus().size(px(14.))))
-                .child(div().text_size(paint.text(11.)).child("Add"))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_bookmark_editor(None, cx))),
-        );
-        column = column.child(v_stack().gap(px(6.)).child(self.section_label("Pinned", paint)).child(grid));
-        if !recent.is_empty() {
-            let mut grid = div().flex().flex_wrap().gap(px(8.));
-            for (index, entry) in recent.into_iter().enumerate() {
-                let (url, title) = (entry.url.clone(), entry.title.clone());
-                let actions = h_stack().child(action(format!("home-pin-recent-{index}-{id}"), Icons::drawing_pin(), Box::new(move |this, _| {
-                    let _ = this.model.lock().save_bookmark(None, &url, &title, true);
-                }), cx));
-                grid = grid.child(tile(format!("home-recent-{index}-{id}"), &entry.url, &entry.title, actions, cx));
-            }
-            column = column.child(v_stack().gap(px(6.)).child(self.section_label("Recent", paint)).child(grid));
-        }
-        // Bookmarks as a bar of chips along the top, like a bookmarks bar.
-        let mut bar = div().w_full().flex().flex_wrap().justify_center().gap(px(6.)).px(px(16.)).pt(px(12.));
-        for bookmark in saved.iter().take(12) {
-            let (window_id, open) = (id.clone(), bookmark.url.clone());
-            let name = if bookmark.title.is_empty() { site_host(&bookmark.url) } else { bookmark.title.clone() };
-            bar = bar.child(
-                h_stack()
-                    .id(SharedString::from(format!("home-mark-{}-{id}", bookmark.id)))
-                    .h(px(28.))
-                    .px(px(10.))
-                    .gap(px(6.))
-                    .items_center()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(paint.border)
-                    .bg(paint.secondary)
-                    .text_size(paint.text(12.))
-                    .cursor_pointer()
-                    .hover(|chip| chip.border_color(paint.accent.opacity(0.5)))
-                    .child(site_icon(&bookmark.url, 14., false))
-                    .child(div().max_w(px(160.)).truncate().child(name))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.focus_window(&window_id, cx);
-                        this.commit_navigation(&open, cx);
-                    })),
-            );
-        }
-        if saved.len() > 12 {
-            bar = bar.child(
-                div()
-                    .id(SharedString::from(format!("home-marks-more-{id}")))
-                    .h(px(28.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(8.))
-                    .text_size(paint.text(12.))
-                    .text_color(paint.muted)
-                    .cursor_pointer()
-                    .hover(|chip| chip.bg(paint.secondary))
-                    .child(format!("{} more", saved.len() - 12))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.popover = Some(Popover::Bookmarks);
-                        cx.notify();
-                    })),
-            );
-        }
-        v_stack()
-            .size_full()
-            .when(!saved.is_empty(), |page| page.child(bar))
-            .child(div().flex_1().flex().justify_center().pt(relative(0.14)).px(px(24.)).child(column))
-    }
-
     fn nav_controls(&self, tab_id: &str, cx: &mut Context<Self>) -> gpui::Div {
         if self.model.lock().tabs.iter().any(|tab| tab.id == tab_id && is_terminal(&tab.url)) {
             return h_stack();
@@ -4200,7 +4029,7 @@ impl BrowserWindow {
                 (entry.snap, entry.frame, entry.maximized) = (Some(snap), Some(fitted), false);
             }
         }
-        self.place_windows();
+        let _ = self.place_windows();
         cx.notify();
     }
 
@@ -5437,13 +5266,6 @@ impl BrowserWindow {
         Some((format!("dialog:{request}"), sheet(title, body, buttons)))
     }
 
-    fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
-        div()
-            .mt(px(4.))
-            .text_size(paint.text(12.))
-            .text_color(paint.muted)
-            .child(label)
-    }
 
 }
 
@@ -6206,7 +6028,7 @@ pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {
 }
 
 /// A new tab: drawn by GPUI as the new-tab page, its web view kept hidden until it navigates.
-fn is_blank(url: &str) -> bool {
+pub(crate) fn is_blank(url: &str) -> bool {
     url.is_empty() || url == "about:blank" || url == "nxbrowser://home"
 }
 
@@ -6297,7 +6119,6 @@ thread_local! {
 }
 
 type MainBar = (gpui::WeakEntity<BrowserWindow>, gpui::AnyWindowHandle, gpui::Bounds<Pixels>);
-type WindowAction = Box<dyn Fn(&mut BrowserWindow, &mut Context<BrowserWindow>)>;
 
 /// A torn-off window closing: it no longer reopens at launch, and with `delete` its space and tabs go too.
 fn forget_detached(model: &mut Model, id: &str, delete: bool) {
