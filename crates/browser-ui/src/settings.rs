@@ -1,18 +1,14 @@
-use crate::native::{button, field, para, sheet, text, Ink, Key, Node, Pop, Style, Weight, PROFILE_NAME};
-use crate::window::{profile_badge_node, paint, profile_badge, BrowserWindow, Paint};
+use crate::native::{
+    button, button_if, commit, field, heading, para, setting, sheet, text, title, Initial, Ink, Key, Node, Pop, Style, Weight, HOME_PAGE,
+    PASSWORD_SEARCH, PROFILE_EDIT, PROFILE_NAME, SETTINGS_QUERY, SHELL, TERM_FONT, UI_FONT, USER_AGENT,
+};
+use crate::window::{profile_badge_node, paint, BrowserWindow, Paint};
 use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
 use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
 use crate::terminal::is_terminal;
 use browser_engine::LogicalRect;
-use gpui::{FontWeight, canvas, div, prelude::*, px, ClickEvent, Context, KeyDownEvent, MouseButton, SharedString};
-use crate::ui::{action_button, Kind};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::elements::text_field::text_field;
-use gpuikit::icons::Icons;
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::theme::{parse_hex, ActiveTheme, Themeable};
-use gpuikit::traits::control_sized::ControlSized;
+use gpui::{canvas, prelude::*, Context};
+use gpuikit::theme::parse_hex;
 
 pub const PROFILE_ICONS: [&str; 17] =
     ["", "😀", "🦊", "🐱", "🐼", "🚀", "💼", "🏠", "🎮", "🎨", "📚", "🌙", "⭐", "🔥", "🌿", "☕", "🎵"];
@@ -116,18 +112,11 @@ impl BrowserWindow {
         self.settings_open = !self.settings_open;
         self.settings_note = None;
         self.passwords.lock_view();
+        for field in [HOME_PAGE, USER_AGENT, SHELL, SETTINGS_QUERY, PASSWORD_SEARCH, UI_FONT, TERM_FONT] {
+            self.popover_texts.remove(&field);
+        }
         if self.settings_open {
-            let (settings, active) = {
-                let model = self.model.lock();
-                (model.settings.clone(), model.active_profile_id.clone())
-            };
-            self.home_input.update(cx, |input, cx| input.set_content_silent(settings.home_page, cx));
-            self.ua_input.update(cx, |input, cx| input.set_content_silent(settings.user_agent, cx));
-            // Rebuilt on show, so it lists fonts installed since and selects the saved one.
-            self.term_font_picker = None;
-            self.ui_font_picker = None;
-            self.term_shell_input.update(cx, |input, cx| input.set_content_silent(settings.terminal_shell, cx));
-            self.settings_query.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+            let active = self.model.lock().active_profile_id.clone();
             self.select_settings_profile(active, cx);
         } else {
             // Keys go back to the page, which may have been opened or activated while settings held them.
@@ -192,41 +181,15 @@ impl BrowserWindow {
         };
         let create = pop.act(|this, cx| this.create_new_profile(cx));
         let cancel = pop.act(|this, _| this.new_profile = None);
-        let mut icons = Vec::new();
-        for option in PROFILE_ICONS.into_iter().chain(PROFILE_SVG_ICONS) {
-            let glyph = if option.ends_with(".svg") {
-                crate::native::asset(option).map(|data| Node::Svg { data, size: 15., ink: Ink::Primary })
-            } else {
-                Some(text(if option.is_empty() { crate::window::rail_mark(&preview.name) } else { option.to_string() }, 15., Weight::Regular, Ink::Primary))
-            };
-            let color = color.clone();
-            let pick = pop.act(move |this, _| this.new_profile = Some((option.to_string(), color.clone())));
-            icons.push(Node::Swatch { size: 30., fill: Some(rgba(paint.secondary)), selected: icon == option, action: Some(pick), child: glyph.map(Box::new) });
-        }
-        let mut colors = Vec::new();
-        for option in PROFILE_COLORS {
-            let icon = icon.clone();
-            let pick = pop.act(move |this, _| this.new_profile = Some((icon.clone(), option.to_string())));
-            let fill = if option.is_empty() { paint.accent } else { parse_hex(option) };
-            colors.push(Node::Swatch { size: 30., fill: Some(rgba(fill)), selected: color == option, action: Some(pick), child: None });
-        }
-        // 11 to a row fills the 400pt of a 440pt sheet.
-        let rows = |swatches: Vec<Node>| -> Vec<Node> {
-            let mut swatches = swatches.into_iter().peekable();
-            let mut rows = Vec::new();
-            while swatches.peek().is_some() {
-                rows.push(Node::Row { gap: 6., children: swatches.by_ref().take(11).collect() });
-            }
-            rows
-        };
+        let (icons, colors) = appearance_swatches(pop, &preview.name, &icon, &color, paint, |this, icon, color| this.new_profile = Some((icon, color)));
         let mut body = vec![
             para("Each profile keeps its own tabs, history, cookies and site data.", 13., Ink::Secondary),
             Node::Row { gap: 12., children: vec![profile_badge_node(&preview, false, 44., paint), field(PROFILE_NAME, "", "Profile name", create)] },
             text("Icon", 13., Weight::Semibold, Ink::Primary),
         ];
-        body.extend(rows(icons));
+        body.extend(swatch_rows(icons));
         body.push(text("Color", 13., Weight::Semibold, Ink::Primary));
-        body.extend(rows(colors));
+        body.extend(swatch_rows(colors));
         sheet("New profile", body, vec![button("Cancel", cancel, Style::Plain, Key::Escape), button("Create profile", create, Style::Primary, Key::Return)])
     }
 
@@ -285,59 +248,6 @@ impl BrowserWindow {
         body.push(Node::Column { gap: 2., pad: (0., 0.), children: rows });
         let cancel = pop.act(|this, _| this.pending_links.clear());
         sheet(heading, body, vec![button("Cancel", cancel, Style::Plain, Key::Escape)])
-    }
-
-    /// Dimmed backdrop + centred card. Reports the card's bounds so web pages under it are cut out.
-    pub(crate) fn modal_shell(
-        &self,
-        id: &'static str,
-        card: gpui::Div,
-        dismiss: fn(&mut Self, &mut Context<Self>),
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let paint = paint(cx);
-        let watch = cx.entity();
-        let card = card
-            .relative()
-            .rounded(px(12.))
-            .overflow_hidden()
-            .bg(paint.bg)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                canvas(
-                    move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| {
-                        watch.update(cx, |view, _| {
-                            view.overlay_rects.push((logical(bounds), 12.))
-                        })
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            );
-        div()
-            .id(id)
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(24.))
-            .bg(gpui::black().opacity(0.45))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| dismiss(this, cx)))
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    dismiss(this, cx);
-                }
-            }))
-            .child(card)
     }
 
     pub(crate) fn open_rail_menu(&mut self, id: String, index: usize, position: gpui::Point<gpui::Pixels>) {
@@ -450,447 +360,326 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn select_settings_profile(&mut self, id: String, cx: &mut Context<Self>) {
+    fn select_settings_profile(&mut self, id: String, _cx: &mut Context<Self>) {
         let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
-        self.name_input.update(cx, |input, cx| input.set_content_silent(name, cx));
+        // The field is rebuilt with this name; a stale edit of another profile must not rename this one.
+        self.popover_texts.insert(PROFILE_EDIT, name);
         self.settings_profile = Some(id);
     }
 
-    pub(crate) fn settings_modal(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// The native Settings window: sections in a glass sidebar, the chosen one's controls beside it.
+    pub(crate) fn settings_window(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
         let paint = paint(cx);
-        let query = self.settings_query.read(cx).content().trim().to_lowercase();
+        let query = self.typed(SETTINGS_QUERY).trim().to_lowercase();
         let shown = SettingsSection::ALL.into_iter().filter(|section| section.matches(&query)).collect::<Vec<_>>();
         let current = if shown.contains(&self.settings_section) { Some(self.settings_section) } else { shown.first().copied() };
-        let mut nav = v_stack()
-            .w(px(168.))
-            .h_full()
-            .gap(px(1.))
-            .p(px(8.))
-            .bg(paint.surface)
-            .border_r_1()
-            .border_color(paint.border)
-            .child(div().pb(px(6.)).child(text_field(&self.settings_query, cx).placeholder("Search").full_width(true)))
-            .when(shown.is_empty(), |nav| nav.child(div().px(px(10.)).py(px(6.)).text_size(paint.text(13.)).text_color(paint.muted).child("No matches")));
-        for section in shown {
-            let selected = current == Some(section);
-            nav = nav.child(
-                div()
-                    .id(SharedString::from(format!("settings-nav-{}", section.label())))
-                    .h(px(28.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .text_size(paint.text(13.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .bg(if selected { paint.accent_bg } else { gpui::transparent_black() })
-                    .text_color(if selected { paint.accent } else { paint.fg })
-                    .hover(|style| style.bg(paint.secondary))
-                    .child(section.label())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.end_recording();
-                        this.settings_section = section;
-                        cx.notify();
-                    })),
-            );
+        let search = pop.act(|_, _| {});
+        // Room for the traffic lights, which sit over the sidebar.
+        let mut nav = vec![Node::Item { height: 30., click: None, drag: None, children: Vec::new() }, field(SETTINGS_QUERY, "", "Search", search)];
+        if shown.is_empty() {
+            nav.push(Node::Item { height: 28., click: None, drag: None, children: vec![text("No matches", 13., Weight::Regular, Ink::Secondary)] });
         }
-        let card = v_stack()
-            .w(px(780.))
-            .h(px(580.))
-            .max_w_full()
-            .max_h_full()
-            .child(
-                h_stack()
-                    .w_full()
-                    .px(px(20.))
-                    .py(px(10.))
-                    .justify_between()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(paint.border)
-                    .child(title("Settings", paint))
-                    .child(icon_button("settings-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx),
-                    ))),
-            )
-            .child(
-                h_stack().flex_1().min_h(px(0.)).w_full().child(nav).child(
-                    div().flex_1().h_full().overflow_hidden().child(
-                        scroll_area("settings-content")
-                            .vertical()
-                            .full_height(true)
-                            .child(v_stack().w_full().px(px(28.)).py(px(24.)).children(current.map(|section| self.settings_page(section, &query, paint, cx)))),
-                    ),
-                ),
-            )
-            .when_some(self.settings_note.clone(), |card, note| {
-                card.child(
-                    div()
-                        .px(px(20.))
-                        .py(px(8.))
-                        .border_t_1()
-                        .border_color(paint.border)
-                        .text_size(paint.text(12.))
-                        .text_color(paint.muted)
-                        .child(note),
-                )
+        for section in shown {
+            let open = pop.act(move |this, _| {
+                this.end_recording();
+                this.settings_section = section;
             });
-        self.modal_shell("settings-backdrop", card, Self::toggle_settings, cx)
+            let selected = current == Some(section);
+            let row = Node::Item { height: 28., click: Some(open), drag: None, children: vec![text(section.label(), 13., Weight::Regular, if selected { Ink::Accent } else { Ink::Primary })] };
+            nav.push(if selected { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
+        }
+        let mut page = Vec::new();
+        if let Some(section) = current {
+            page.push(text(section.label(), 17., Weight::Semibold, Ink::Primary));
+            if let Some(note) = &self.settings_note {
+                page.push(para(note.to_string(), 12., Ink::Secondary));
+            }
+            page.extend(self.settings_page(section, &query, pop, paint, cx));
+        }
+        Node::Split {
+            sidebar_width: 180.,
+            height: 560.,
+            sidebar: Box::new(Node::Column { gap: 1., pad: (10., 10.), children: nav }),
+            content: Box::new(Node::Column { gap: 0., pad: (28., 20.), children: page }),
+        }
     }
 
-    fn settings_page(&self, section: SettingsSection, query: &str, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    fn settings_page(&self, section: SettingsSection, query: &str, pop: &mut Pop, paint: Paint, cx: &gpui::App) -> Vec<Node> {
         let settings = self.model.lock().settings.clone();
-        let page = v_stack()
-            .w_full()
-            .gap(px(4.))
-            .child(div().pb(px(8.)).text_size(paint.text(17.)).font_weight(FontWeight::SEMIBOLD).child(section.label()));
         match section {
-            SettingsSection::Profiles => page.child(self.profiles_settings(paint, cx)),
-            SettingsSection::General => page
-                .child(row(
-                    "On startup",
-                    None,
-                    choice(
-                        "startup",
-                        vec![("Restore last session", true), ("Open new tab page", false)],
-                        settings.restore_session,
-                        |s, v| s.restore_session = v,
-                        paint,
-                        cx,
+            SettingsSection::Profiles => self.profiles_settings(pop, paint),
+            SettingsSection::General => {
+                let home = pop.act(|this, cx| {
+                    let value = this.typed(HOME_PAGE).trim().to_string();
+                    this.set_pref(cx, |s| s.home_page = value);
+                });
+                let make_default = pop.act(|this, _| {
+                    if let Err(error) = browser_engine_macos::make_default_browser() {
+                        this.settings_note = Some(error.to_string().into());
+                    }
+                });
+                vec![
+                    setting("On startup", None, choice(pop, vec![("Restore last session", true), ("Open new tab page", false)], settings.restore_session, |s, v| s.restore_session = v)),
+                    setting("New tab page", Some("Address opened for new tabs. Press Return to save."), commit(HOME_PAGE, settings.home_page.clone(), "nxbrowser://home", home)),
+                    setting(
+                        "Focus windows",
+                        Some("Hover focuses the window under the pointer; click waits for a click."),
+                        choice(pop, vec![("Click", false), ("Hover", true)], settings.focus_on_hover, |s, v| s.focus_on_hover = v),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "New tab page",
-                    Some("Address opened for new tabs. Press Return to save."),
-                    div().w(px(260.)).child(text_field(&self.home_input, cx).placeholder("nxbrowser://home").full_width(true)),
-                    paint,
-                ))
-                .child(row(
-                    "Focus windows",
-                    Some("Hover focuses the window under the pointer; click waits for a click."),
-                    choice("window-focus", vec![("Click", false), ("Hover", true)], settings.focus_on_hover, |s, v| s.focus_on_hover = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Links from other apps",
-                    Some("Which profile a link clicked in another app opens in."),
-                    choice("link-profile", vec![("Ask each time", true), ("Active profile", false)], settings.ask_link_profile, |s, v| s.ask_link_profile = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Default browser",
-                    Some("Open web links from every app in NxBrowser. macOS asks you to confirm."),
-                    action_button("make-default", "Make default", Kind::Secondary, true, cx, |this, cx| {
-                        if let Err(error) = browser_engine_macos::make_default_browser() {
-                            this.settings_note = Some(error.to_string().into());
-                        }
-                        cx.notify();
-                    }),
-                    paint,
-                )),
-            SettingsSection::Shortcuts => page.child(self.shortcuts_settings(&settings, query, paint, cx)),
-            SettingsSection::Appearance => page
-                .child(row(
-                    "Theme",
-                    None,
-                    choice(
-                        "theme",
-                        vec![("System", "system".to_string()), ("Light", "light".into()), ("Dark", "dark".into())],
-                        settings.theme.clone(),
-                        |s, v| s.theme = v,
-                        paint,
-                        cx,
+                    setting(
+                        "Links from other apps",
+                        Some("Which profile a link clicked in another app opens in."),
+                        choice(pop, vec![("Ask each time", true), ("Active profile", false)], settings.ask_link_profile, |s, v| s.ask_link_profile = v),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Font",
-                    Some("Used across the browser's interface. Type to search, or type any font name."),
-                    font_field(self.ui_font_picker.clone(), cx),
-                    paint,
-                ))
-                .child(row(
-                    "Use font for web pages",
-                    Some("Pages that don't choose their own font use it."),
-                    switch("ui-font-pages", settings.ui_font_pages, |s, v| s.ui_font_pages = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Font size",
-                    Some("Size of the browser's interface text."),
-                    stepper(
-                        "ui-size",
-                        format!("{:.0} pt", settings.ui_font_size),
-                        |s| s.ui_font_size = (s.ui_font_size - 1.0).max(10.0),
-                        |s| s.ui_font_size = (s.ui_font_size + 1.0).min(18.0),
-                        cx,
+                    setting("Default browser", Some("Open web links from every app in NxBrowser. macOS asks you to confirm."), button("Make default", make_default, Style::Plain, Key::None)),
+                ]
+            }
+            SettingsSection::Shortcuts => self.shortcuts_settings(&settings, query, pop),
+            SettingsSection::Appearance => {
+                let fonts = std::iter::once("System".to_string()).chain(crate::terminal::all_fonts().iter().cloned()).collect();
+                let font = pop.act(|this, cx| {
+                    let typed = this.typed(UI_FONT).trim().to_string();
+                    // "System" is the interface's own font, stored as none.
+                    let font = if typed == "System" { String::new() } else { typed };
+                    this.set_pref(cx, |s| s.ui_font = font);
+                });
+                let shown = if settings.ui_font.is_empty() { "System".to_string() } else { settings.ui_font.clone() };
+                let mut accents = Vec::new();
+                for option in PROFILE_COLORS {
+                    // Empty means the theme's own accent, so show that rather than the current override.
+                    let fill = if option.is_empty() { paint.muted } else { parse_hex(option) };
+                    let pick = pop.act(move |this, cx| this.set_pref(cx, |s| s.accent = option.to_string()));
+                    accents.push(Node::Swatch { size: 18., fill: Some(rgba(fill)), selected: settings.accent == option, action: Some(pick), child: None });
+                }
+                let mut page = vec![
+                    setting("Theme", None, choice(pop, vec![("System", "system".to_string()), ("Light", "light".into()), ("Dark", "dark".into())], settings.theme.clone(), |s, v| s.theme = v)),
+                    setting("Font", Some("Used across the browser's interface. Type to search, or type any font name."), Node::Combo { field: UI_FONT, value: Initial(shown), items: fonts, submit: font }),
+                    setting("Use font for web pages", Some("Pages that don't choose their own font use it."), switch(pop, settings.ui_font_pages, |s, v| s.ui_font_pages = v)),
+                    setting(
+                        "Font size",
+                        Some("Size of the browser's interface text."),
+                        stepper(pop, format!("{:.0} pt", settings.ui_font_size), |s| s.ui_font_size = (s.ui_font_size - 1.0).max(10.0), |s| s.ui_font_size = (s.ui_font_size + 1.0).min(18.0)),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Line height",
-                    Some("Line height as a multiple of the font size."),
-                    stepper(
-                        "ui-line",
-                        format!("{:.2}", settings.ui_line_height),
-                        |s| s.ui_line_height = ((s.ui_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
-                        |s| s.ui_line_height = ((s.ui_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
-                        cx,
+                    setting(
+                        "Line height",
+                        Some("Line height as a multiple of the font size."),
+                        stepper(
+                            pop,
+                            format!("{:.2}", settings.ui_line_height),
+                            |s| s.ui_line_height = ((s.ui_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
+                            |s| s.ui_line_height = ((s.ui_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
+                        ),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Page zoom",
-                    Some("Default zoom for web pages."),
-                    stepper(
-                        "zoom",
-                        format!("{:.0}%", settings.page_zoom * 100.0),
-                        |s| s.page_zoom = (s.page_zoom - 0.1).max(0.5),
-                        |s| s.page_zoom = (s.page_zoom + 0.1).min(2.0),
-                        cx,
+                    setting(
+                        "Page zoom",
+                        Some("Default zoom for web pages."),
+                        stepper(pop, format!("{:.0}%", settings.page_zoom * 100.0), |s| s.page_zoom = (s.page_zoom - 0.1).max(0.5), |s| s.page_zoom = (s.page_zoom + 0.1).min(2.0)),
                     ),
-                    paint,
-                ))
-                .child(row("Accent color", Some("Highlights, focus rings and the active window border."), self.accent_picker(&settings.accent, paint, cx), paint))
-                .child(row(
-                    "Reduce motion",
-                    Some("Panels, windows and messages appear without animating."),
-                    switch("reduce-motion", settings.reduce_motion, |s, v| s.reduce_motion = v, paint, cx),
-                    paint,
-                ))
-                .child(heading("Site zoom", paint))
-                .child(self.site_zoom_list(&settings, paint, cx)),
-            SettingsSection::Search => page.child(row(
+                    setting("Accent color", Some("Highlights, focus rings and the active window border."), Node::Row { gap: 4., children: accents }),
+                    setting("Reduce motion", Some("Panels, windows and messages appear without animating."), switch(pop, settings.reduce_motion, |s, v| s.reduce_motion = v)),
+                    heading("Site zoom"),
+                ];
+                if settings.site_zoom.is_empty() {
+                    page.push(para("Zoom a site with ⌘+ or ⌘− and it is remembered here", 13., Ink::Secondary));
+                }
+                for (host, zoom) in &settings.site_zoom {
+                    let reset = {
+                        let host = host.clone();
+                        pop.act(move |this, cx| {
+                            this.set_pref(cx, |s| {
+                                s.site_zoom.remove(&host);
+                            })
+                        })
+                    };
+                    page.push(Node::Row {
+                        gap: 8.,
+                        children: vec![
+                            title(host.clone(), 13., Weight::Regular, Ink::Primary),
+                            Node::Spacer,
+                            text(format!("{:.0}%", zoom * 100.0), 13., Weight::Regular, Ink::Secondary),
+                            button("Reset", reset, Style::Plain, Key::None),
+                        ],
+                    });
+                }
+                page
+            }
+            SettingsSection::Search => vec![setting(
                 "Search engine used in the address bar",
                 None,
-                choice(
-                    "engine",
-                    SEARCH_ENGINES.iter().map(|(name, _)| (*name, name.to_string())).collect(),
-                    settings.search_engine.clone(),
-                    |s, v| s.search_engine = v,
-                    paint,
-                    cx,
-                ),
-                paint,
-            )),
-            SettingsSection::Privacy => page
-                .child(row("Save browsing history", None, switch("history", settings.save_history, |s, v| s.save_history = v, paint, cx), paint))
-                .child(row(
-                    "HTTPS-only mode",
-                    Some("Upgrade http:// pages to https://."),
-                    switch("https", settings.https_only, |s, v| s.https_only = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Block ads and trackers",
-                    Some("Blocks requests to known ad and tracking hosts."),
-                    switch("ads", settings.block_ads, |s, v| s.block_ads = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Block pop-ups",
-                    Some("Stops pages opening windows on their own. Applies to new tabs."),
-                    switch("popups", settings.block_popups, |s, v| s.block_popups = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Fraudulent website warnings",
-                    Some("Applies to new tabs."),
-                    switch("fraud", settings.fraud_warnings, |s, v| s.fraud_warnings = v, paint, cx),
-                    paint,
-                ))
-                .child(heading("Clear browsing data (current profile)", paint))
-                .child(
-                    h_stack()
-                        .gap(px(8.))
-                        .flex_wrap()
-                        .child(action_button("clear-history", "Clear history", Kind::Secondary, true, cx, |this, cx| {
-                            let _ = this.model.lock().clear_data(true, false);
-                            this.settings_note = Some("History cleared".into());
-                            cx.notify();
-                        }))
-                        .child(action_button("clear-downloads", "Clear download list", Kind::Secondary, true, cx, |this, cx| {
-                            let _ = this.model.lock().clear_data(false, true);
-                            this.settings_note = Some("Download list cleared".into());
-                            cx.notify();
-                        }))
-                        .child(action_button("clear-site-data", "Clear cookies & site data", Kind::Secondary, true, cx, |this, cx| {
-                            let store = Some(this.model.lock()).and_then(|model| model.active_profile().map(|p| p.data_store_id.clone()));
-                            if let Some(store) = store {
-                                this.engine.clear_site_data(&store);
-                            }
-                            this.settings_note = Some("Cookies, cache and site data cleared".into());
-                            cx.notify();
-                        })),
-                )
-                .child(heading("Site permissions (current profile)", paint))
-                .child(self.permission_list(paint, cx)),
-            SettingsSection::Passwords => page
-                .child(row(
-                    "Offer to save passwords",
-                    Some("Asks after you sign in. Passwords stay on this Mac."),
-                    switch("offer-passwords", settings.offer_passwords, |s, v| s.offer_passwords = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Suggest saved passwords",
-                    Some("Lists saved logins when you click a sign-in field."),
-                    switch("autofill-passwords", settings.autofill_passwords, |s, v| s.autofill_passwords = v, paint, cx),
-                    paint,
-                ))
-                .child(self.passwords_settings(paint, cx)),
-            SettingsSection::Content => page
-                .child(row(
-                    "JavaScript",
-                    Some("Applies to new tabs."),
-                    switch("javascript", settings.javascript, |s, v| s.javascript = v, paint, cx),
-                    paint,
-                ))
-                .child(row(
-                    "Custom user agent",
-                    Some("Leave empty for the default. Press Return to save."),
-                    div().w(px(260.)).child(text_field(&self.ua_input, cx).placeholder("Default").full_width(true)),
-                    paint,
-                )),
-            SettingsSection::Downloads => page
-                .child(row(
-                    "Location",
-                    Some(settings.download_dir.as_str()),
-                    action_button("download-dir", "Change…", Kind::Secondary, true, cx, |_, cx| pick_folder(cx, |s, dir| s.download_dir = dir)),
-                    paint,
-                ))
-                .child(row(
-                    "Screenshot location",
-                    Some(if settings.screenshot_dir.is_empty() { "Same as downloads" } else { settings.screenshot_dir.as_str() }),
-                    h_stack()
-                        .gap(px(6.))
-                        .when(!settings.screenshot_dir.is_empty(), |buttons| {
-                            buttons.child(action_button("screenshot-dir-reset", "Use Downloads", Kind::Secondary, true, cx, |this, cx| {
-                                this.set_pref(cx, |s| s.screenshot_dir.clear())
-                            }))
-                        })
-                        .child(action_button("screenshot-dir", "Change…", Kind::Secondary, true, cx, |_, cx| pick_folder(cx, |s, dir| s.screenshot_dir = dir))),
-                    paint,
-                ))
-                .child(row(
-                    "Ask where to save each file",
-                    None,
-                    switch("ask-download", settings.ask_download_path, |s, v| s.ask_download_path = v, paint, cx),
-                    paint,
-                )),
-            SettingsSection::Terminal => page
-                .child(row(
-                    "Font",
-                    Some("Installed monospace fonts. Type to search, or type any font name."),
-                    font_field(self.term_font_picker.clone(), cx),
-                    paint,
-                ))
-                .child(row(
-                    "Font size",
-                    None,
-                    stepper(
-                        "term-size",
-                        format!("{:.0} pt", settings.terminal_font_size),
-                        |s| s.terminal_font_size = (s.terminal_font_size - 1.0).max(8.0),
-                        |s| s.terminal_font_size = (s.terminal_font_size + 1.0).min(32.0),
-                        cx,
+                choice(pop, SEARCH_ENGINES.iter().map(|(name, _)| (*name, name.to_string())).collect(), settings.search_engine.clone(), |s, v| s.search_engine = v),
+            )],
+            SettingsSection::Privacy => {
+                let clear_history = pop.act(|this, _| {
+                    let _ = this.model.lock().clear_data(true, false);
+                    this.settings_note = Some("History cleared".into());
+                });
+                let clear_downloads = pop.act(|this, _| {
+                    let _ = this.model.lock().clear_data(false, true);
+                    this.settings_note = Some("Download list cleared".into());
+                });
+                let clear_site_data = pop.act(|this, _| {
+                    let store = Some(this.model.lock()).and_then(|model| model.active_profile().map(|p| p.data_store_id.clone()));
+                    if let Some(store) = store {
+                        this.engine.clear_site_data(&store);
+                    }
+                    this.settings_note = Some("Cookies, cache and site data cleared".into());
+                });
+                let mut page = vec![
+                    setting("Save browsing history", None, switch(pop, settings.save_history, |s, v| s.save_history = v)),
+                    setting("HTTPS-only mode", Some("Upgrade http:// pages to https://."), switch(pop, settings.https_only, |s, v| s.https_only = v)),
+                    setting("Block ads and trackers", Some("Blocks requests to known ad and tracking hosts."), switch(pop, settings.block_ads, |s, v| s.block_ads = v)),
+                    setting("Block pop-ups", Some("Stops pages opening windows on their own. Applies to new tabs."), switch(pop, settings.block_popups, |s, v| s.block_popups = v)),
+                    setting("Fraudulent website warnings", Some("Applies to new tabs."), switch(pop, settings.fraud_warnings, |s, v| s.fraud_warnings = v)),
+                    heading("Clear browsing data (current profile)"),
+                    Node::Row {
+                        gap: 8.,
+                        children: vec![
+                            button("Clear history", clear_history, Style::Plain, Key::None),
+                            button("Clear download list", clear_downloads, Style::Plain, Key::None),
+                            button("Clear cookies & site data", clear_site_data, Style::Plain, Key::None),
+                            Node::Spacer,
+                        ],
+                    },
+                    heading("Site permissions (current profile)"),
+                ];
+                page.extend(self.permission_list(pop));
+                page
+            }
+            SettingsSection::Passwords => {
+                let mut page = vec![
+                    setting("Offer to save passwords", Some("Asks after you sign in. Passwords stay on this Mac."), switch(pop, settings.offer_passwords, |s, v| s.offer_passwords = v)),
+                    setting("Suggest saved passwords", Some("Lists saved logins when you click a sign-in field."), switch(pop, settings.autofill_passwords, |s, v| s.autofill_passwords = v)),
+                ];
+                page.extend(self.passwords_settings(pop));
+                page
+            }
+            SettingsSection::Content => {
+                let agent = pop.act(|this, cx| {
+                    let value = this.typed(USER_AGENT).trim().to_string();
+                    this.set_pref(cx, |s| s.user_agent = value);
+                });
+                vec![
+                    setting("JavaScript", Some("Applies to new tabs."), switch(pop, settings.javascript, |s, v| s.javascript = v)),
+                    setting("Custom user agent", Some("Leave empty for the default. Press Return to save."), commit(USER_AGENT, settings.user_agent.clone(), "Default", agent)),
+                ]
+            }
+            SettingsSection::Downloads => {
+                let downloads = pop.act(|_, cx| pick_folder(cx, |s, dir| s.download_dir = dir));
+                let shots = pop.act(|_, cx| pick_folder(cx, |s, dir| s.screenshot_dir = dir));
+                let mut shot_buttons = Vec::new();
+                if !settings.screenshot_dir.is_empty() {
+                    shot_buttons.push(button("Use Downloads", pop.act(|this, cx| this.set_pref(cx, |s| s.screenshot_dir.clear())), Style::Plain, Key::None));
+                }
+                shot_buttons.push(button("Change…", shots, Style::Plain, Key::None));
+                vec![
+                    setting("Location", Some(settings.download_dir.as_str()), button("Change…", downloads, Style::Plain, Key::None)),
+                    setting(
+                        "Screenshot location",
+                        Some(if settings.screenshot_dir.is_empty() { "Same as downloads" } else { settings.screenshot_dir.as_str() }),
+                        Node::Row { gap: 6., children: shot_buttons },
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Line height",
-                    Some("Row height as a multiple of the font size."),
-                    stepper(
-                        "term-line",
-                        format!("{:.2}", settings.terminal_line_height),
-                        |s| s.terminal_line_height = ((s.terminal_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
-                        |s| s.terminal_line_height = ((s.terminal_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
-                        cx,
+                    setting("Ask where to save each file", None, switch(pop, settings.ask_download_path, |s, v| s.ask_download_path = v)),
+                ]
+            }
+            SettingsSection::Terminal => {
+                let mut fonts = crate::terminal::monospace_fonts().to_vec();
+                if !fonts.contains(&settings.terminal_font) {
+                    // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
+                    fonts.insert(0, settings.terminal_font.clone());
+                }
+                let font = pop.act(|this, cx| {
+                    let font = this.typed(TERM_FONT).trim().to_string();
+                    if !font.is_empty() {
+                        this.set_pref(cx, |s| s.terminal_font = font);
+                    }
+                });
+                let shell = pop.act(|this, cx| {
+                    let value = this.typed(SHELL).trim().to_string();
+                    this.set_pref(cx, |s| s.terminal_shell = value);
+                });
+                let login_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                vec![
+                    setting(
+                        "Font",
+                        Some("Installed monospace fonts. Type to search, or type any font name."),
+                        Node::Combo { field: TERM_FONT, value: Initial(settings.terminal_font.clone()), items: fonts, submit: font },
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Cursor",
-                    Some("Programs like vim may still change it while they run."),
-                    choice(
-                        "term-cursor",
-                        vec![("Block", "block".to_string()), ("Bar", "beam".into()), ("Underline", "underline".into())],
-                        settings.terminal_cursor.clone(),
-                        |s, v| s.terminal_cursor = v,
-                        paint,
-                        cx,
+                    setting(
+                        "Font size",
+                        None,
+                        stepper(
+                            pop,
+                            format!("{:.0} pt", settings.terminal_font_size),
+                            |s| s.terminal_font_size = (s.terminal_font_size - 1.0).max(8.0),
+                            |s| s.terminal_font_size = (s.terminal_font_size + 1.0).min(32.0),
+                        ),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Scrollback",
-                    Some("Lines of history kept per terminal."),
-                    choice(
-                        "term-scrollback",
-                        vec![("1,000", 1_000), ("10,000", 10_000), ("50,000", 50_000), ("100,000", 100_000)],
-                        settings.terminal_scrollback,
-                        |s, v| s.terminal_scrollback = v,
-                        paint,
-                        cx,
+                    setting(
+                        "Line height",
+                        Some("Row height as a multiple of the font size."),
+                        stepper(
+                            pop,
+                            format!("{:.2}", settings.terminal_line_height),
+                            |s| s.terminal_line_height = ((s.terminal_line_height - 0.05) * 100.0).round().max(100.0) / 100.0,
+                            |s| s.terminal_line_height = ((s.terminal_line_height + 0.05) * 100.0).round().min(200.0) / 100.0,
+                        ),
                     ),
-                    paint,
-                ))
-                .child(row(
-                    "Shell",
-                    Some("Program started in new terminals. Leave empty for your login shell. Press Return to save."),
-                    div().w(px(260.)).child(text_field(&self.term_shell_input, cx).placeholder(std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())).full_width(true)),
-                    paint,
-                )),
-            SettingsSection::Performance => page
-                .child(row(
+                    setting(
+                        "Cursor",
+                        Some("Programs like vim may still change it while they run."),
+                        choice(pop, vec![("Block", "block".to_string()), ("Bar", "beam".into()), ("Underline", "underline".into())], settings.terminal_cursor.clone(), |s, v| {
+                            s.terminal_cursor = v
+                        }),
+                    ),
+                    setting(
+                        "Scrollback",
+                        Some("Lines of history kept per terminal."),
+                        choice(pop, vec![("1,000", 1_000), ("10,000", 10_000), ("50,000", 50_000), ("100,000", 100_000)], settings.terminal_scrollback, |s, v| {
+                            s.terminal_scrollback = v
+                        }),
+                    ),
+                    setting(
+                        "Shell",
+                        Some("Program started in new terminals. Leave empty for your login shell. Press Return to save."),
+                        commit(SHELL, settings.terminal_shell.clone(), &login_shell, shell),
+                    ),
+                ]
+            }
+            SettingsSection::Performance => vec![
+                setting(
                     "Suspend background tabs after",
                     Some("Frees memory from tabs you haven't looked at."),
-                    choice(
-                        "suspend",
-                        SUSPEND_OPTIONS.to_vec(),
-                        settings.suspend_after_secs,
-                        |s, v| s.suspend_after_secs = v,
-                        paint,
-                        cx,
-                    ),
-                    paint,
-                ))
-                .child(row(
+                    choice(pop, SUSPEND_OPTIONS.to_vec(), settings.suspend_after_secs, |s, v| s.suspend_after_secs = v),
+                ),
+                setting(
                     "Maximum live tabs",
                     Some("Older background tabs are suspended past this count."),
-                    stepper(
-                        "live-tabs",
-                        settings.max_live_tabs.to_string(),
-                        |s| s.max_live_tabs = s.max_live_tabs.saturating_sub(1).max(1),
-                        |s| s.max_live_tabs = (s.max_live_tabs + 1).min(30),
-                        cx,
-                    ),
-                    paint,
-                )),
-            SettingsSection::Developer => page.child(row(
+                    stepper(pop, settings.max_live_tabs.to_string(), |s| s.max_live_tabs = s.max_live_tabs.saturating_sub(1).max(1), |s| s.max_live_tabs = (s.max_live_tabs + 1).min(30)),
+                ),
+            ],
+            SettingsSection::Developer => vec![setting(
                 "Allow Web Inspector",
                 Some(&match crate::shortcuts::hint(&settings, browser_engine::Shortcut::Inspect) {
                     keys if keys.is_empty() => "Right-click a page and choose Inspect Element.".to_string(),
                     keys => format!("Right-click a page and choose Inspect Element, or press {keys}."),
                 }),
-                switch("inspector", settings.inspector, |s, v| s.inspector = v, paint, cx),
-                paint,
-            )),
-            SettingsSection::About => page
-                .child(row("Version", None, div().child(env!("CARGO_PKG_VERSION")), paint))
-                .child(self.update_row(paint, cx))
-                .child(row(
+                switch(pop, settings.inspector, |s, v| s.inspector = v),
+            )],
+            SettingsSection::About => vec![
+                setting("Version", None, text(env!("CARGO_PKG_VERSION"), 13., Weight::Regular, Ink::Secondary)),
+                self.update_row(pop, cx),
+                setting(
                     "Check for updates automatically",
                     Some("New versions download in the background and install when you restart."),
-                    switch("auto-update", settings.auto_update, |s, v| s.auto_update = v, paint, cx),
-                    paint,
-                ))
-                .child(row("Engine", None, div().child("WebKit (WKWebView)"), paint))
-                .child(row("Data folder", Some(app_support_dir().display().to_string().as_str()), div(), paint)),
+                    switch(pop, settings.auto_update, |s, v| s.auto_update = v),
+                ),
+                setting("Engine", None, text("WebKit (WKWebView)", 13., Weight::Regular, Ink::Secondary)),
+                setting("Data folder", Some(app_support_dir().display().to_string().as_str()), Node::Spacer),
+            ],
         }
     }
 
-    fn update_row(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    fn update_row(&self, pop: &mut Pop, cx: &gpui::App) -> Node {
         use crate::update::Status;
         let status = crate::update::status(cx).clone();
         let detail = match &status {
@@ -903,132 +692,99 @@ impl BrowserWindow {
         };
         let ready = matches!(status, Status::Ready { .. });
         let enabled = matches!(status, Status::Idle | Status::Failed(_) | Status::Ready { .. });
-        let (label, kind) = if ready { ("Restart to Update", Kind::Primary) } else { ("Check for Updates", Kind::Secondary) };
-        let button = action_button("check-updates", label, kind, enabled, cx, move |_, cx| {
+        let run = pop.act(move |_, cx| {
             if ready {
                 crate::update::restart(cx);
             } else {
                 crate::update::check(true, cx);
             }
         });
-        row("Updates", Some(&detail), button, paint)
+        let control = Node::Button {
+            title: if ready { "Restart to Update" } else { "Check for Updates" }.into(),
+            action: run,
+            style: if ready { Style::Primary } else { Style::Plain },
+            key: Key::None,
+            enabled,
+        };
+        setting("Updates", Some(&detail), control)
     }
 
-    fn profiles_settings(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    fn profiles_settings(&self, pop: &mut Pop, paint: Paint) -> Vec<Node> {
         let (profiles, active) = {
             let model = self.model.lock();
             (model.profiles.clone(), model.active_profile_id.clone())
         };
         let only_one = profiles.len() <= 1;
-        let mut list = v_stack().w_full().p(px(4.)).gap(px(2.)).rounded(px(10.)).border_1().border_color(paint.border);
+        let new_profile = pop.act(|this, cx| this.open_new_profile(cx));
+        let mut page = vec![Node::Row {
+            gap: 8.,
+            children: vec![title("Click a profile to edit it.", 12., Weight::Regular, Ink::Secondary), Node::Spacer, button("New profile…", new_profile, Style::Primary, Key::None)],
+        }];
+        let mut list = Vec::new();
         for profile in &profiles {
             let id = profile.id.clone();
             let is_active = profile.id == active;
             let expanded = self.settings_profile.as_deref() == Some(profile.id.as_str());
-            let switch_id = profile.id.clone();
-            list = list.child(
-                h_stack()
-                    .id(SharedString::from(format!("settings-profile-{id}")))
-                    .w_full()
-                    .gap(px(10.))
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(8.))
-                    .items_center()
-                    .cursor_pointer()
-                    .bg(if expanded { paint.secondary } else { gpui::transparent_black() })
-                    .hover(|style| style.bg(paint.secondary))
-                    .child(profile_badge(profile, is_active, 28., paint))
-                    .child(div().flex_1().child(profile.name.clone()))
-                    .child(if is_active {
-                        div().px(px(8.)).text_size(paint.text(11.)).text_color(paint.muted).child("Active")
-                    } else {
-                        // Its own click must not also expand the row.
-                        div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
-                            action_button(SharedString::from(format!("settings-switch-{id}")), "Switch", Kind::Secondary, true, cx, move |this, cx| {
-                                this.with_model(|model| {
-                                    let _ = model.switch_profile(&switch_id);
-                                });
-                                this.refresh_url(cx);
-                                cx.notify();
-                            }),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        if this.settings_profile.as_deref() == Some(id.as_str()) {
-                            this.settings_profile = None;
-                        } else {
-                            this.select_settings_profile(id.clone(), cx);
-                        }
-                        cx.notify();
-                    })),
-            );
+            let toggle = pop.act(move |this, cx| {
+                if this.settings_profile.as_deref() == Some(id.as_str()) {
+                    this.settings_profile = None;
+                } else {
+                    this.select_settings_profile(id.clone(), cx);
+                }
+            });
+            let state = if is_active {
+                text("Active", 11., Weight::Regular, Ink::Secondary)
+            } else {
+                let switch_id = profile.id.clone();
+                let switch_to = pop.act(move |this, cx| {
+                    this.with_model(|model| {
+                        let _ = model.switch_profile(&switch_id);
+                    });
+                    this.refresh_url(cx);
+                });
+                button("Switch", switch_to, Style::Plain, Key::None)
+            };
+            let row = Node::Item {
+                height: 40.,
+                click: Some(toggle),
+                drag: None,
+                children: vec![profile_badge_node(profile, is_active, 28., paint), title(profile.name.clone(), 13., Weight::Regular, Ink::Primary), Node::Spacer, state],
+            };
+            list.push(if expanded { Node::Card { tint: Ink::Secondary, child: Box::new(row) } } else { row });
             if !expanded {
                 continue;
             }
-            let (icons, colors) = appearance_pickers("edit", &profile.name, &profile.icon, &profile.color, |this, icon, color| {
+            let save = pop.act(|this, cx| this.save_profile_name(cx));
+            let mut editor = vec![commit(PROFILE_EDIT, profile.name.clone(), "Profile name", save), text("Icon", 12., Weight::Semibold, Ink::Secondary)];
+            let (icons, colors) = appearance_swatches(pop, &profile.name, &profile.icon, &profile.color, paint, |this, icon, color| {
                 if let Some(id) = this.settings_profile.clone() {
                     let _ = this.model.lock().set_profile_appearance(&id, &icon, &color);
                 }
-            }, paint, cx);
+            });
+            editor.extend(swatch_rows(icons));
+            editor.push(text("Color", 12., Weight::Semibold, Ink::Secondary));
+            editor.extend(swatch_rows(colors));
             let delete_id = profile.id.clone();
-            list = list.child(
-                v_stack()
-                    .w_full()
-                    .gap(px(8.))
-                    .pl(px(46.))
-                    .pr(px(8.))
-                    .pt(px(6.))
-                    .pb(px(12.))
-                    .child(text_field(&self.name_input, cx).placeholder("Profile name").full_width(true))
-                    .child(heading("Icon", paint))
-                    .child(icons)
-                    .child(heading("Color", paint))
-                    .child(colors)
-                    .child(h_stack().pt(px(8.)).justify_end().child(action_button(
-                        "settings-delete-profile",
-                        "Delete profile…",
-                        Kind::Danger,
-                        !only_one,
-                        cx,
-                        move |this, cx| {
-                            this.delete_prompt = Some(delete_id.clone());
-                            cx.notify();
-                        },
-                    ))),
-            );
+            let delete = pop.act(move |this, _| this.delete_prompt = Some(delete_id.clone()));
+            editor.push(Node::Row {
+                gap: 0.,
+                children: vec![Node::Spacer, Node::Button { title: "Delete profile…".into(), action: delete, style: Style::Danger, key: Key::None, enabled: !only_one }],
+            });
+            list.push(Node::Column { gap: 8., pad: (46., 8.), children: editor });
         }
-        v_stack()
-            .w_full()
-            .gap(px(12.))
-            .child(
-                h_stack()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_size(paint.text(12.)).text_color(paint.muted).child("Click a profile to edit it."))
-                    .child(action_button("settings-new-profile", "New profile…", Kind::Primary, true, cx, |this, cx| {
-                        this.open_new_profile(cx);
-                    })),
-            )
-            .child(list)
-            .child(row(
-                "Backup",
-                Some("Export the active profile, or import one from a file."),
-                h_stack()
-                    .gap(px(8.))
-                    .child(action_button("settings-export", "Export active", Kind::Secondary, true, cx, |this, cx| {
-                        this.export_profile(cx);
-                        cx.notify();
-                    }))
-                    .child(action_button("settings-import", "Import…", Kind::Secondary, true, cx, |this, cx| {
-                        this.import_profile(cx);
-                    })),
-                paint,
-            ))
+        page.push(Node::Column { gap: 2., pad: (0., 8.), children: list });
+        let export = pop.act(|this, cx| this.export_profile(cx));
+        let import = pop.act(|this, cx| this.import_profile(cx));
+        page.push(setting(
+            "Backup",
+            Some("Export the active profile, or import one from a file."),
+            Node::Row { gap: 8., children: vec![button("Export active", export, Style::Plain, Key::None), button("Import…", import, Style::Plain, Key::None)] },
+        ));
+        page
     }
 
     pub(crate) fn save_profile_name(&mut self, cx: &mut Context<Self>) {
-        let name = self.name_input.read(cx).content().trim().to_string();
+        let name = self.typed(PROFILE_EDIT).trim().to_string();
         if let (false, Some(id)) = (name.is_empty(), self.settings_profile.clone()) {
             let mut model = self.model.lock();
             // Blur saves too, so leaving the field untouched must not rename or note anything.
@@ -1041,241 +797,95 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn accent_picker(&self, current: &str, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
-        let mut colors = h_stack().flex_wrap().justify_end().gap(px(6.)).max_w(px(360.));
-        for option in PROFILE_COLORS {
-            colors = colors.child(
-                swatch(format!("accent-{option}"), current == option, paint)
-                    .size(px(24.))
-                    // Empty means the theme's own accent, so show that rather than the current override.
-                    .bg(if option.is_empty() { cx.theme().fg_muted() } else { parse_hex(option) })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| s.accent = option.to_string()))),
-            );
-        }
-        colors
-    }
-
-    fn site_zoom_list(&self, settings: &Settings, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
-        if settings.site_zoom.is_empty() {
-            return div().text_color(paint.muted).child("Zoom a site with ⌘+ or ⌘− and it is remembered here");
-        }
-        let mut list = v_stack().w_full().gap(px(4.));
-        for (index, (host, zoom)) in settings.site_zoom.iter().enumerate() {
-            let host = host.clone();
-            list = list.child(
-                h_stack()
-                    .w_full()
-                    .gap(px(8.))
-                    .items_center()
-                    .child(div().flex_1().child(host.clone()))
-                    .child(div().text_color(paint.muted).child(format!("{:.0}%", zoom * 100.0)))
-                    .child(action_button(SharedString::from(format!("zoom-reset-{index}")), "Reset", Kind::Secondary, true, cx, move |this, cx| {
-                        this.set_pref(cx, |s| {
-                            s.site_zoom.remove(&host);
-                        });
-                    })),
-            );
-        }
-        list
-    }
-
-    fn permission_list(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    fn permission_list(&self, pop: &mut Pop) -> Vec<Node> {
         let entries = self.model.lock().permissions_map().unwrap_or_default();
         if entries.is_empty() {
-            return div().text_color(paint.muted).child("No sites have asked for permissions yet");
+            return vec![para("No sites have asked for permissions yet", 13., Ink::Secondary)];
         }
-        let mut list = v_stack().w_full().gap(px(4.));
-        for (index, (origin, kind, decision)) in entries.into_iter().enumerate() {
-            let actions = ["allow", "deny", "reset"].map(|action| {
+        let mut rows = Vec::new();
+        for (origin, kind, decision) in entries {
+            let mut children = vec![Node::Column {
+                gap: 2.,
+                pad: (0., 0.),
+                children: vec![title(origin.clone(), 13., Weight::Regular, Ink::Primary), title(format!("{kind}: {decision}"), 11., Weight::Regular, Ink::Secondary)],
+            }];
+            for (action, label) in [("allow", "Allow"), ("deny", "Deny"), ("reset", "Reset")] {
                 let (origin, kind) = (origin.clone(), kind.clone());
-                let label = match action {
-                    "allow" => "Allow",
-                    "deny" => "Deny",
-                    _ => "Reset",
-                };
-                action_button(SharedString::from(format!("perm-{index}-{action}")), label, Kind::Secondary, action != decision, cx, move |this, cx| {
+                let run = pop.act(move |this, _| {
                     let model = this.model.lock();
-                    let _ = if action == "reset" {
-                        model.remove_permission(&origin, &kind)
-                    } else {
-                        model.set_permission(&origin, &kind, action)
-                    };
+                    let _ = if action == "reset" { model.remove_permission(&origin, &kind) } else { model.set_permission(&origin, &kind, action) };
                     drop(model);
                     this.sync_permissions();
-                    cx.notify();
-                })
-            });
-            list = list.child(
-                h_stack()
-                    .w_full()
-                    .gap(px(8.))
-                    .items_center()
-                    .child(
-                        v_stack()
-                            .flex_1()
-                            .child(origin.clone())
-                            .child(div().text_size(paint.text(11.)).text_color(paint.muted).child(format!("{kind}: {decision}"))),
-                    )
-                    .children(actions),
-            );
+                });
+                children.push(button_if(action != decision, label, run));
+            }
+            rows.push(Node::Row { gap: 8., children });
         }
-        list
+        vec![Node::Column { gap: 6., pad: (0., 0.), children: rows }]
     }
+
 }
 
-pub(crate) fn heading(label: &'static str, paint: Paint) -> gpui::Div {
-    div().pt(px(14.)).pb(px(4.)).text_size(paint.text(12.)).font_weight(FontWeight::SEMIBOLD).text_color(paint.muted).child(label)
-}
-
-pub(crate) fn title(text: impl Into<SharedString>, paint: Paint) -> gpui::Div {
-    div().text_size(paint.text(17.)).font_weight(FontWeight::SEMIBOLD).child(text.into())
-}
-
-pub(crate) fn row(title: &'static str, detail: Option<&str>, control: impl IntoElement, paint: Paint) -> gpui::Div {
-    h_stack()
-        .w_full()
-        .gap(px(16.))
-        .items_center()
-        .justify_between()
-        .py(px(12.))
-        .border_b_1()
-        .border_color(paint.border.opacity(0.5))
-        .child(
-            v_stack()
-                .flex_1()
-                .min_w(px(0.))
-                .gap(px(3.))
-                .child(title)
-                .when_some(detail.map(str::to_string), |column, detail| {
-                    column.child(div().text_size(paint.text(11.)).text_color(paint.muted).child(detail))
-                }),
-        )
-        .child(control)
-}
-
-/// Icon and color swatch grids; `pick` receives the chosen (icon, color).
-fn appearance_pickers(
-    prefix: &'static str,
-    name: &str,
-    icon: &str,
-    color: &str,
-    pick: fn(&mut BrowserWindow, String, String),
-    paint: Paint,
-    cx: &mut Context<BrowserWindow>,
-) -> (gpui::Div, gpui::Div) {
-    let mut icons = h_stack().flex_wrap().gap(px(6.));
+/// Icon and colour swatches for a profile named `name`; `pick` receives the chosen (icon, color).
+fn appearance_swatches(pop: &mut Pop, name: &str, icon: &str, color: &str, paint: Paint, pick: fn(&mut BrowserWindow, String, String)) -> (Vec<Node>, Vec<Node>) {
+    let mut icons = Vec::new();
     for option in PROFILE_ICONS.into_iter().chain(PROFILE_SVG_ICONS) {
-        let label = crate::window::profile_glyph(option, name, 15., paint.fg);
+        let glyph = if option.ends_with(".svg") {
+            crate::native::asset(option).map(|data| Node::Svg { data, size: 15., ink: Ink::Primary })
+        } else {
+            Some(text(if option.is_empty() { crate::window::rail_mark(name) } else { option.to_string() }, 15., Weight::Regular, Ink::Primary))
+        };
         let color = color.to_string();
-        icons = icons.child(
-            swatch(format!("{prefix}-icon-{option}"), icon == option, paint)
-                .bg(paint.secondary)
-                .child(label)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    pick(this, option.to_string(), color.clone());
-                    cx.notify();
-                })),
-        );
+        let choose = pop.act(move |this, _| pick(this, option.to_string(), color.clone()));
+        icons.push(Node::Swatch { size: 30., fill: Some(rgba(paint.secondary)), selected: icon == option, action: Some(choose), child: glyph.map(Box::new) });
     }
-    let mut colors = h_stack().flex_wrap().gap(px(6.));
+    let mut colors = Vec::new();
     for option in PROFILE_COLORS {
         let icon = icon.to_string();
-        colors = colors.child(
-            swatch(format!("{prefix}-color-{option}"), color == option, paint)
-                .bg(if option.is_empty() { paint.accent } else { parse_hex(option) })
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    pick(this, icon.clone(), option.to_string());
-                    cx.notify();
-                })),
-        );
+        let choose = pop.act(move |this, _| pick(this, icon.clone(), option.to_string()));
+        let fill = if option.is_empty() { paint.accent } else { parse_hex(option) };
+        colors.push(Node::Swatch { size: 30., fill: Some(rgba(fill)), selected: color == option, action: Some(choose), child: None });
     }
     (icons, colors)
 }
 
-fn swatch(id: String, selected: bool, paint: Paint) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(SharedString::from(id))
-        .size(px(30.))
-        .rounded(px(8.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .border_2()
-        .border_color(if selected { paint.fg } else { gpui::transparent_black() })
-}
-
-fn switch(id: &'static str, on: bool, apply: Apply<bool>, paint: Paint, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
-    toggle(id, on, paint).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, |s| apply(s, !on))))
-}
-
-/// An on/off track; the caller adds the click handler.
-pub(crate) fn toggle(id: impl Into<gpui::ElementId>, on: bool, paint: Paint) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id.into())
-        .w(px(36.))
-        .h(px(20.))
-        .p(px(2.))
-        .rounded_full()
-        .cursor_pointer()
-        .flex()
-        .when(on, |track| track.justify_end())
-        .bg(if on { paint.accent } else { paint.border })
-        .child(div().size(px(16.)).rounded_full().bg(gpui::white()))
-}
-
-/// A segmented control.
-fn choice<T: Clone + PartialEq + 'static>(
-    id: &'static str,
-    options: Vec<(&'static str, T)>,
-    current: T,
-    apply: Apply<T>,
-    paint: Paint,
-    cx: &mut Context<BrowserWindow>,
-) -> gpui::Div {
-    let mut group = h_stack().flex_wrap().justify_end().gap(px(4.)).max_w(px(360.));
-    for (label, value) in options {
-        let selected = value == current;
-        group = group.child(
-            div()
-                .id(SharedString::from(format!("{id}-{label}")))
-                .h(px(30.))
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .rounded(px(7.))
-                .cursor_pointer()
-                .border_1()
-                .border_color(if selected { paint.accent } else { paint.border })
-                .bg(if selected { paint.accent_bg } else { gpui::transparent_black() })
-                .text_color(if selected { paint.accent } else { paint.fg })
-                .child(label)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    let value = value.clone();
-                    this.set_pref(cx, |s| apply(s, value));
-                })),
-        );
+/// Swatches 11 to a row, which fills 400pt.
+fn swatch_rows(swatches: Vec<Node>) -> Vec<Node> {
+    let mut swatches = swatches.into_iter().peekable();
+    let mut rows = Vec::new();
+    while swatches.peek().is_some() {
+        // The spacer keeps a short last row's final swatch from stretching across the rest.
+        rows.push(Node::Row { gap: 6., children: swatches.by_ref().take(11).chain([Node::Spacer]).collect() });
     }
-    group
+    rows
 }
 
-fn stepper(
-    id: &'static str,
-    value: String,
-    minus: fn(&mut Settings),
-    plus: fn(&mut Settings),
-    cx: &mut Context<BrowserWindow>,
-) -> impl IntoElement {
-    h_stack()
-        .gap(px(6.))
-        .items_center()
-        .child(icon_button(SharedString::from(format!("{id}-minus")), Icons::minus()).small().on_click(
-            cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, minus)),
-        ))
-        .child(div().min_w(px(44.)).flex().justify_center().child(value))
-        .child(icon_button(SharedString::from(format!("{id}-plus")), Icons::plus()).small().on_click(
-            cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pref(cx, plus)),
-        ))
+fn switch(pop: &mut Pop, on: bool, apply: Apply<bool>) -> Node {
+    Node::Switch { on, action: pop.act(move |this, cx| this.set_pref(cx, |s| apply(s, !on))) }
+}
+
+/// A pop-up menu of `options`, showing the one equal to `current`.
+fn choice<T: Clone + PartialEq + 'static>(pop: &mut Pop, options: Vec<(&'static str, T)>, current: T, apply: Apply<T>) -> Node {
+    let selected = options.iter().position(|(_, value)| *value == current).unwrap_or(0);
+    let mut first = None;
+    let mut items = Vec::new();
+    for (label, value) in options {
+        // Consecutive ids: the pop-up runs `first + index`.
+        let id = pop.act(move |this, cx| {
+            let value = value.clone();
+            this.set_pref(cx, |s| apply(s, value));
+        });
+        first.get_or_insert(id);
+        items.push(label.to_string());
+    }
+    Node::Popup { items, selected, first: first.unwrap_or_default() }
+}
+
+fn stepper(pop: &mut Pop, value: String, minus: fn(&mut Settings), plus: fn(&mut Settings)) -> Node {
+    // `plus` must follow `minus`: the stepper's up arrow runs `down + 1`.
+    let down = pop.act(move |this, cx| this.set_pref(cx, minus));
+    pop.act(move |this, cx| this.set_pref(cx, plus));
+    Node::Stepper { value, down }
 }
 
 /// Reports its parent's bounds each frame so web pages are cut out under that overlay.
@@ -1291,29 +901,6 @@ pub(crate) fn measure_overlay(radius: f64, cx: &mut Context<BrowserWindow>) -> i
     .size_full()
 }
 
-/// A font picker whose open list is cut out of web pages; it's taller than the settings card can hold.
-fn font_field(picker: Option<gpui::Entity<gpuikit::elements::combobox::ComboboxState<String>>>, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
-    let watch = cx.entity();
-    let open = picker.clone();
-    div().w(px(260.)).relative().children(picker).child(
-        canvas(
-            move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| {
-                if open.as_ref().is_some_and(|picker| picker.read(cx).is_open()) {
-                    // shortcut: cuts the list's 480px max height below the field even when a filter shortens it; measure the popup if that gap shows.
-                    let mut list = logical(bounds);
-                    list.y += list.height;
-                    list.height = 488.;
-                    watch.update(cx, |view, _| view.overlay_rects.push((list, 8.)));
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full(),
-    )
-}
 
 /// A colour as RGBA for a native swatch.
 fn rgba(color: gpui::Hsla) -> [f64; 4] {

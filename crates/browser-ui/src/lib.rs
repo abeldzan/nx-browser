@@ -9,7 +9,6 @@ mod settings;
 mod shortcuts;
 mod tabs;
 mod terminal;
-mod ui;
 mod update;
 mod window;
 

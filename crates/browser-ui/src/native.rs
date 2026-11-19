@@ -18,6 +18,17 @@ pub(crate) const LOGIN_USER: u32 = 6;
 pub(crate) const LOGIN_PASSWORD: u32 = 7;
 pub(crate) const LOGIN_NOTE: u32 = 8;
 pub(crate) const DIALOG_INPUT: u32 = 9;
+pub(crate) const HOME_PAGE: u32 = 10;
+pub(crate) const USER_AGENT: u32 = 11;
+pub(crate) const SHELL: u32 = 12;
+pub(crate) const PROFILE_EDIT: u32 = 13;
+pub(crate) const SETTINGS_QUERY: u32 = 14;
+pub(crate) const PASSWORD_SEARCH: u32 = 15;
+pub(crate) const UI_FONT: u32 = 16;
+pub(crate) const TERM_FONT: u32 = 17;
+
+/// Action ids from here up belong to the open native window (settings).
+pub(crate) const WINDOW_BASE: u32 = 2 << 20;
 
 /// Collects a popover's or sheet's handlers while its content is built; a control carries the id `act` returns.
 #[derive(Default)]
@@ -29,6 +40,10 @@ pub(crate) struct Pop {
 impl Pop {
     pub(crate) fn sheet() -> Self {
         Self { actions: Vec::new(), base: SHEET_BASE }
+    }
+
+    pub(crate) fn window() -> Self {
+        Self { actions: Vec::new(), base: WINDOW_BASE }
     }
 
     pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {
@@ -91,12 +106,45 @@ pub(crate) fn para(text: impl Into<String>, size: f64, ink: Ink) -> Node {
 }
 
 pub(crate) fn button(title: &str, action: u32, style: Style, key: Key) -> Node {
-    Node::Button { title: title.into(), action, style, key }
+    Node::Button { title: title.into(), action, style, key, enabled: true }
+}
+
+/// A plain button, greyed out unless `enabled`.
+pub(crate) fn button_if(enabled: bool, title: &str, action: u32) -> Node {
+    Node::Button { title: title.into(), action, style: Style::Plain, key: Key::None, enabled }
 }
 
 /// A text field that starts out showing `value`.
 pub(crate) fn field(field: u32, value: impl Into<String>, placeholder: &str, submit: u32) -> Node {
-    Node::Field { field, value: Initial(value.into()), placeholder: placeholder.into(), submit, secure: false }
+    Node::Field { field, value: Initial(value.into()), placeholder: placeholder.into(), submit, secure: false, blur: false }
+}
+
+/// A 260pt settings field that saves (`submit`) on Return or on leaving it.
+pub(crate) fn commit(field: u32, value: impl Into<String>, placeholder: &str, submit: u32) -> Node {
+    Node::Width(260., Box::new(Node::Field { field, value: Initial(value.into()), placeholder: placeholder.into(), submit, secure: false, blur: true }))
+}
+
+/// A settings row: its name and an optional explanation on the left, `control` on the right, a hairline under it.
+pub(crate) fn setting(name: &str, detail: Option<&str>, control: Node) -> Node {
+    let mut words = vec![text(name, 13., Weight::Regular, Ink::Primary)];
+    words.extend(detail.map(|detail| para(detail, 11., Ink::Secondary)));
+    Node::Column {
+        gap: 0.,
+        pad: (0., 0.),
+        children: vec![
+            Node::Column {
+                gap: 0.,
+                pad: (0., 10.),
+                children: vec![Node::Row { gap: 16., children: vec![Node::Width(260., Box::new(Node::Column { gap: 3., pad: (0., 0.), children: words })), Node::Spacer, control] }],
+            },
+            Node::Separator,
+        ],
+    }
+}
+
+/// A muted label over a group of settings rows.
+pub(crate) fn heading(name: &str) -> Node {
+    Node::Column { gap: 0., pad: (0., 8.), children: vec![Node::Column { gap: 0., pad: (0., 4.), children: vec![text(name, 12., Weight::Semibold, Ink::Secondary)] }] }
 }
 
 /// A dialog sheet: a bold title, `body`, then `buttons` along the bottom right.

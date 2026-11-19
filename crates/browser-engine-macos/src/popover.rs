@@ -17,7 +17,8 @@ use objc2_app_kit::{
     NSLayoutConstraintOrientation, NSLineBreakMode, NSPanel, NSPopover, NSPopoverBehavior, NSPopoverDelegate,
     NSProgressIndicator, NSProgressIndicatorStyle, NSResponder, NSScrollView, NSSecureTextField, NSStackView, NSSwitch,
     NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation,
-    NSView, NSViewController, NSWindow, NSWindowStyleMask,
+    NSView, NSViewController, NSWindow, NSWindowStyleMask, NSComboBox, NSPopUpButton, NSStepper, NSVisualEffectView,
+    NSVisualEffectMaterial, NSVisualEffectBlendingMode, NSWindowDelegate,
 };
 use objc2_foundation::{NSArray, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -37,13 +38,25 @@ pub enum Node {
     Glyph { name: &'static str, size: f64, ink: Ink },
     /// A monochrome SVG icon, tinted.
     Svg { data: &'static [u8], size: f64, ink: Ink },
-    Button { title: String, action: u32, style: Style, key: Key },
+    Button { title: String, action: u32, style: Style, key: Key, enabled: bool },
     Link { title: String, action: u32 },
     /// A borderless SF Symbol button; `on` tints it with the accent.
     Tool { symbol: &'static str, tip: &'static str, action: u32, on: bool },
     Switch { on: bool, action: u32 },
-    /// A text field showing `value` when created; edits arrive as `PopoverText`, Return runs `submit`.
-    Field { field: u32, value: Initial, placeholder: String, submit: u32, secure: bool },
+    /// A text field showing `value` when created; edits arrive as `PopoverText`, Return runs `submit` (and so
+    /// does leaving the field, when `blur`).
+    Field { field: u32, value: Initial, placeholder: String, submit: u32, secure: bool, blur: bool },
+    /// A text field with a list to pick from (`NSComboBox`); a pick or Return runs `submit`, as does leaving it.
+    Combo { field: u32, value: Initial, items: Vec<String>, submit: u32 },
+    /// A pop-up menu of `items` showing `selected`; picking item `i` runs action `first + i`.
+    Popup { items: Vec<String>, selected: usize, first: u32 },
+    /// `value` beside up/down arrows: down runs `down`, up runs `down + 1`.
+    Stepper { value: String, down: u32 },
+    /// `child` exactly `width` wide; text inside wraps at that width.
+    Width(f64, Box<Node>),
+    /// A window's layout: a `sidebar_width` sidebar on the system sidebar material, then `content` scrolling,
+    /// both `height` tall.
+    Split { sidebar_width: f64, height: f64, sidebar: Box<Node>, content: Box<Node> },
     Progress(f64),
     Separator,
     /// A list row `height` tall: highlights on hover when it has a `click`, and can drag `drag` out as a file.
@@ -126,6 +139,18 @@ enum Host {
     Popover(Retained<NSPopover>),
     /// The sheet, and the window it hangs from.
     Sheet(Retained<NSPanel>, Retained<NSWindow>),
+    Window(Retained<NSWindow>),
+}
+
+impl Host {
+    /// The view showing the content now.
+    fn root(&self) -> Option<Retained<NSView>> {
+        match self {
+            Host::Popover(popover) => popover.contentViewController().map(|controller| controller.view()),
+            Host::Sheet(panel, _) => panel.contentView(),
+            Host::Window(window) => window.contentView(),
+        }
+    }
 }
 
 /// A popover or sheet on screen.
@@ -144,6 +169,7 @@ struct Surface {
 thread_local! {
     static POPOVER: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static SHEET: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static WINDOW: RefCell<Option<Surface>> = const { RefCell::new(None) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -164,6 +190,11 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
             return true;
         }
         let editing = surface.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
+        // Rebuilt from scratch, so scroll views would jump back to the top (a download's progress rebuilds every frame).
+        let mut offsets = Vec::new();
+        if let Some(old) = surface.host.root() {
+            scroll_offsets(&old, &mut offsets);
+        }
         let (view, _) = root(mtm, content, surface.width, &mut surface.submits, &mut surface.fields);
         let size = view.fittingSize();
         match &surface.host {
@@ -177,7 +208,13 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
                 panel.setContentView(Some(&view));
                 panel.setContentSize(size);
             }
+            Host::Window(window) => {
+                window.setContentView(Some(&view));
+                window.setContentSize(size);
+            }
         }
+        view.layoutSubtreeIfNeeded();
+        restore_offsets(&view, &mut offsets.into_iter());
         surface.content = content.clone();
         if let Some(field) = editing.and_then(|id| surface.fields.get(&id)) {
             focus(field);
@@ -253,7 +290,7 @@ pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width
     if refresh(&SHEET, window_no, key, content) {
         return;
     }
-    close_sheet();
+    close_sheet(None);
     let mtm = MainThreadMarker::new().expect("sheets live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
     let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
@@ -276,16 +313,120 @@ pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width
     SHEET.set(Some(Surface { host: Host::Sheet(panel, parent.retain()), window_no, key, width, content: content.clone(), submits, fields }));
 }
 
-pub(crate) fn close_sheet() {
-    if let Some(Surface { host: Host::Sheet(panel, parent), .. }) = SHEET.take() {
+/// Closes the open sheet if browser window `owner` opened it, or whichever is open for None.
+pub(crate) fn close_sheet(owner: Option<isize>) {
+    let surface = match owner {
+        Some(window_no) => take_owned(&SHEET, window_no),
+        None => SHEET.take(),
+    };
+    if let Some(Surface { host: Host::Sheet(panel, parent), .. }) = surface {
         parent.endSheet(&panel);
         panel.orderOut(None);
     }
 }
 
-/// Replaces the text in field `field` of the open popover or sheet.
+/// The surface in `slot` if browser window `window_no` opened it; another window's stays.
+fn take_owned(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, window_no: isize) -> Option<Surface> {
+    slot.with_borrow_mut(|surface| surface.take_if(|surface| surface.window_no == window_no))
+}
+
+/// The open native window, which sheets hang from while it is up.
+pub(crate) fn native_window() -> Option<Retained<NSWindow>> {
+    WINDOW.with_borrow(|surface| match surface.as_ref().map(|surface| &surface.host) {
+        Some(Host::Window(window)) => Some(window.clone()),
+        _ => None,
+    })
+}
+
+/// Shows `content` in its own window titled `title`, centred on `parent`, or updates the one open under `key`.
+pub(crate) fn present_window(window_no: isize, parent: &NSWindow, key: u64, title: &str, width: f64, content: &Node) {
+    if refresh(&WINDOW, window_no, key, content) {
+        return;
+    }
+    close_window(None);
+    let mtm = MainThreadMarker::new().expect("windows live on the main thread");
+    let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
+    let (view, _) = root(mtm, content, width, &mut submits, &mut fields);
+    let size = view.fittingSize();
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            NSRect::new(NSPoint::ZERO, size),
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::FullSizeContentView,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    // Held by `WINDOW`; AppKit releasing it on close as well would free it twice.
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str(title));
+    // The sidebar's glass runs up under the title bar, as in System Settings.
+    window.setTitlebarAppearsTransparent(true);
+    window.setContentView(Some(&view));
+    window.setContentSize(size);
+    TARGET.with(|target| window.setDelegate(Some(ProtocolObject::from_ref(&**target))));
+    let (outer, own) = (parent.frame(), window.frame());
+    window.setFrameOrigin(NSPoint::new(
+        outer.origin.x + (outer.size.width - own.size.width) / 2.,
+        outer.origin.y + (outer.size.height - own.size.height) / 2.,
+    ));
+    window.makeKeyAndOrderFront(None);
+    WINDOW.set(Some(Surface { host: Host::Window(window), window_no, key, width, content: content.clone(), submits, fields }));
+}
+
+/// Closes the native window if browser window `owner` opened it, or whichever is open for None.
+pub(crate) fn close_window(owner: Option<isize>) {
+    // Taken first: closing calls the delegate, which looks at `WINDOW`.
+    let surface = match owner {
+        Some(window_no) => take_owned(&WINDOW, window_no),
+        None => WINDOW.take(),
+    };
+    if let Some(Surface { host: Host::Window(window), .. }) = surface {
+        window.close();
+    }
+}
+
+/// Whether `window` is the open native window; Esc and ⌘W close it.
+pub(crate) fn is_native_window(window: &NSWindow) -> bool {
+    WINDOW.with_borrow(|surface| matches!(surface.as_ref().map(|surface| &surface.host), Some(Host::Window(own)) if std::ptr::eq(&**own, window)))
+}
+
+/// Closes the open native window as if from its close button.
+pub(crate) fn dismiss_window() {
+    if let Some(Surface { host: Host::Window(window), window_no, .. }) = WINDOW.take() {
+        window.close();
+        crate::webkit::send_event(window_no, EngineEvent::NativeWindowClosed);
+    }
+}
+
+/// The scroll offset of every scroll view under `view`, in tree order.
+fn scroll_offsets(view: &NSView, out: &mut Vec<NSPoint>) {
+    if let Some(scroll) = view.downcast_ref::<NSScrollView>() {
+        out.push(scroll.contentView().bounds().origin);
+    }
+    for child in view.subviews().iter() {
+        scroll_offsets(&child, out);
+    }
+}
+
+/// Puts `scroll_offsets` back on the matching scroll views of a rebuilt tree.
+fn restore_offsets(view: &NSView, offsets: &mut impl Iterator<Item = NSPoint>) {
+    if let Some(scroll) = view.downcast_ref::<NSScrollView>() {
+        let Some(point) = offsets.next() else {
+            return;
+        };
+        let clip = scroll.contentView();
+        clip.scrollToPoint(point);
+        scroll.reflectScrolledClipView(&clip);
+    }
+    for child in view.subviews().iter() {
+        restore_offsets(&child, offsets);
+    }
+}
+
+/// Replaces the text in field `field` of the open popover, sheet or window.
 pub(crate) fn set_field(field: u32, text: &str) {
-    for slot in [&SHEET, &POPOVER] {
+    for slot in [&WINDOW, &SHEET, &POPOVER] {
         slot.with_borrow(|surface| {
             if let Some(input) = surface.as_ref().and_then(|surface| surface.fields.get(&field)) {
                 input.setStringValue(&NSString::from_str(text));
@@ -296,11 +437,17 @@ pub(crate) fn set_field(field: u32, text: &str) {
 
 /// Field `field`'s Return action, in whichever surface has it.
 fn submit_action(field: u32) -> Option<u32> {
-    [&SHEET, &POPOVER].into_iter().find_map(|slot| slot.with_borrow(|surface| surface.as_ref().and_then(|surface| surface.submits.get(&field).copied())))
+    [&WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+}
+
+/// `read` of the surface in `slot`, skipping one being rebuilt: moving its focused field ends editing, which calls
+/// back in here while `refresh` holds the slot.
+fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read: impl FnOnce(&Surface) -> Option<T>) -> Option<T> {
+    slot.with(|cell| cell.try_borrow().ok().and_then(|surface| surface.as_ref().and_then(read)))
 }
 
 fn send(event: EngineEvent) {
-    let window_no = [&SHEET, &POPOVER].into_iter().find_map(|slot| slot.with_borrow(|surface| surface.as_ref().map(|surface| surface.window_no)));
+    let window_no = [&WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
     if let Some(window_no) = window_no {
         crate::webkit::send_event(window_no, event);
     }
@@ -329,6 +476,16 @@ define_class!(
         }
     }
 
+    unsafe impl NSWindowDelegate for NxPopoverTarget {
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            // Its close button; `close_window()` already took the entry when the app closed it.
+            if let Some(surface) = WINDOW.take() {
+                crate::webkit::send_event(surface.window_no, EngineEvent::NativeWindowClosed);
+            }
+        }
+    }
+
     unsafe impl NSControlTextEditingDelegate for NxPopoverTarget {}
 
     unsafe impl NSTextFieldDelegate for NxPopoverTarget {}
@@ -342,9 +499,28 @@ define_class!(
             }
         }
 
+        #[unsafe(method(picked:))]
+        fn picked(&self, sender: &NSPopUpButton) {
+            if let Some(action) = sender.selectedItem().and_then(|item| u32::try_from(item.tag()).ok()) {
+                send(EngineEvent::PopoverAction(action));
+            }
+        }
+
+        #[unsafe(method(stepped:))]
+        fn stepped(&self, sender: &NSStepper) {
+            // Parked at 1 between 0 and 2, so the new value says which arrow was pressed.
+            let up = sender.integerValue() > 1;
+            sender.setIntegerValue(1);
+            if let Ok(down) = u32::try_from(sender.tag()) {
+                send(EngineEvent::PopoverAction(down + u32::from(up)));
+            }
+        }
+
         #[unsafe(method(submit:))]
         fn submit(&self, sender: &NSTextField) {
             let field = sender.tag() as u32;
+            // A combo box pick changes the text without a text-change notification.
+            send(EngineEvent::PopoverText { field, text: sender.stringValue().to_string() });
             if let Some(action) = submit_action(field) {
                 send(EngineEvent::PopoverAction(action));
             }
@@ -576,9 +752,10 @@ impl Build<'_> {
                 view.setContentTintColor(Some(&color(*ink)));
                 Retained::into_super(Retained::into_super(view))
             }
-            Node::Button { title, action, style, key } => {
+            Node::Button { title, action, style, key, enabled } => {
                 let button = TARGET.with(|target| unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(target), Some(sel!(act:)), mtm) });
                 button.setTag(*action as isize);
+                button.setEnabled(*enabled);
                 match style {
                     Style::Plain => {}
                     Style::Primary => button.setBezelColor(Some(&NSColor::controlAccentColor())),
@@ -654,16 +831,99 @@ impl Build<'_> {
                 });
                 Retained::into_super(Retained::into_super(switch))
             }
-            Node::Field { field, value, placeholder, submit, secure } => {
+            Node::Combo { field, value, items, submit } => {
+                let input = self.kept.remove(field).unwrap_or_else(|| {
+                    let combo = NSComboBox::new(mtm);
+                    let names = items.iter().map(|item| NSString::from_str(item)).collect::<Vec<_>>();
+                    // SAFETY: an array of strings is an array of objects.
+                    let names: Retained<NSArray> = unsafe { Retained::cast_unchecked(NSArray::from_retained_slice(&names)) };
+                    unsafe { combo.addItemsWithObjectValues(&names) };
+                    combo.setCompletes(true);
+                    combo.setNumberOfVisibleItems(14);
+                    let input = Retained::into_super(combo);
+                    input.setStringValue(&NSString::from_str(&value.0));
+                    self.wire_field(&input, *field, true);
+                    input
+                });
+                self.submits.insert(*field, *submit);
+                self.fields.insert(*field, input.clone());
+                input.widthAnchor().constraintEqualToConstant(260.).setActive(true);
+                Retained::into_super(Retained::into_super(input))
+            }
+            Node::Popup { items, selected, first } => {
+                let popup = NSPopUpButton::initWithFrame_pullsDown(NSPopUpButton::alloc(mtm), NSRect::ZERO, false);
+                for (index, title) in items.iter().enumerate() {
+                    popup.addItemWithTitle(&NSString::from_str(title));
+                    if let Some(item) = popup.lastItem() {
+                        item.setTag((first + index as u32) as isize);
+                    }
+                }
+                popup.selectItemAtIndex(*selected as isize);
+                TARGET.with(|target| unsafe {
+                    popup.setTarget(Some(target));
+                    popup.setAction(Some(sel!(picked:)));
+                });
+                Retained::into_super(Retained::into_super(Retained::into_super(popup)))
+            }
+            Node::Stepper { value, down } => {
+                let stepper = NSStepper::new(mtm);
+                stepper.setMinValue(0.);
+                stepper.setMaxValue(2.);
+                stepper.setIncrement(1.);
+                stepper.setIntegerValue(1);
+                stepper.setTag(*down as isize);
+                TARGET.with(|target| unsafe {
+                    stepper.setTarget(Some(target));
+                    stepper.setAction(Some(sel!(stepped:)));
+                });
+                let label = self.node(&Node::Text { text: value.clone(), size: 13., weight: Weight::Regular, ink: Ink::Primary, wrap: Wrap::Line, shrink: false });
+                let views = [label, Retained::into_super(Retained::into_super(stepper))];
+                let row = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&views), mtm);
+                row.setSpacing(6.);
+                Retained::into_super(row)
+            }
+            Node::Width(width, child) => {
+                let outer = self.width;
+                self.width = *width;
+                let view = self.node(child);
+                self.width = outer;
+                view.widthAnchor().constraintEqualToConstant(*width).setActive(true);
+                view
+            }
+            Node::Split { sidebar_width, height, sidebar, content } => {
+                let outer = self.width;
+                let side = NSVisualEffectView::new(mtm);
+                side.setMaterial(NSVisualEffectMaterial::Sidebar);
+                side.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+                self.width = *sidebar_width;
+                let list = self.node(sidebar);
+                side.addSubview(&list);
+                list.leadingAnchor().constraintEqualToAnchor(&side.leadingAnchor()).setActive(true);
+                list.trailingAnchor().constraintEqualToAnchor(&side.trailingAnchor()).setActive(true);
+                list.topAnchor().constraintEqualToAnchor(&side.topAnchor()).setActive(true);
+                fixed(&side, *sidebar_width, *height);
+                self.width = outer - sidebar_width;
+                let page = self.scroll(content, *height, true);
+                self.width = outer;
+                let split = NSView::new(mtm);
+                for view in [Retained::into_super(side), page.clone()] {
+                    view.setTranslatesAutoresizingMaskIntoConstraints(false);
+                    split.addSubview(&view);
+                    view.topAnchor().constraintEqualToAnchor(&split.topAnchor()).setActive(true);
+                    view.bottomAnchor().constraintEqualToAnchor(&split.bottomAnchor()).setActive(true);
+                }
+                let side = &split.subviews().objectAtIndex(0);
+                side.leadingAnchor().constraintEqualToAnchor(&split.leadingAnchor()).setActive(true);
+                page.leadingAnchor().constraintEqualToAnchor(&side.trailingAnchor()).setActive(true);
+                page.trailingAnchor().constraintEqualToAnchor(&split.trailingAnchor()).setActive(true);
+                fixed(&split, outer, *height);
+                split
+            }
+            Node::Field { field, value, placeholder, submit, secure, blur } => {
                 let input = self.kept.remove(field).unwrap_or_else(|| {
                     let input = if *secure { Retained::into_super(NSSecureTextField::new(mtm)) } else { NSTextField::new(mtm) };
                     input.setStringValue(&NSString::from_str(&value.0));
-                    input.setTag(*field as isize);
-                    TARGET.with(|target| unsafe {
-                        input.setDelegate(Some(ProtocolObject::from_ref(&**target)));
-                        input.setTarget(Some(target));
-                        input.setAction(Some(sel!(submit:)));
-                    });
+                    self.wire_field(&input, *field, *blur);
                     input
                 });
                 input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
@@ -719,30 +979,51 @@ impl Build<'_> {
                 card.setBorderWidth(0.);
                 card.setCornerRadius(8.);
                 card.setFillColor(&color(*tint).colorWithAlphaComponent(0.12));
-                card.setContentViewMargins(NSSize::ZERO);
-                card.setContentView(Some(&self.node(child)));
+                // Pinned to the box itself: as its content view the child sized nothing, and the card collapsed.
+                pin(&card, &self.node(child), 0.);
                 Retained::into_super(card)
             }
-            Node::Scroll { max, child } => {
-                let scroll = NSScrollView::new(mtm);
-                scroll.setDrawsBackground(false);
-                scroll.setHasVerticalScroller(true);
-                scroll.setAutohidesScrollers(true);
-                let document: Retained<NxFlippedView> = unsafe { msg_send![super(NxFlippedView::alloc(mtm).set_ivars(())), initWithFrame: NSRect::ZERO] };
-                let inner = self.node(child);
-                pin(&document, &inner, 0.);
-                document.setTranslatesAutoresizingMaskIntoConstraints(false);
-                scroll.setDocumentView(Some(&document));
-                // A fixed width, not the clip view's: that has none until the popover is on screen, which squashed the rows.
-                document.widthAnchor().constraintEqualToConstant(self.width).setActive(true);
-                document.layoutSubtreeIfNeeded();
-                let height = document.fittingSize().height.min(*max);
-                scroll.heightAnchor().constraintEqualToConstant(height).setActive(true);
-                Retained::into_super(scroll)
-            }
+            Node::Scroll { max, child } => self.scroll(child, *max, false),
         };
         view.setTranslatesAutoresizingMaskIntoConstraints(false);
         view
+    }
+
+    /// `child` in a scroll view as tall as it is up to `height`, or exactly `height` when `exact`.
+    fn scroll(&mut self, child: &Node, height: f64, exact: bool) -> Retained<NSView> {
+        let scroll = NSScrollView::new(self.mtm);
+        scroll.setDrawsBackground(false);
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        let document: Retained<NxFlippedView> = unsafe { msg_send![super(NxFlippedView::alloc(self.mtm).set_ivars(())), initWithFrame: NSRect::ZERO] };
+        let inner = self.node(child);
+        pin(&document, &inner, 0.);
+        document.setTranslatesAutoresizingMaskIntoConstraints(false);
+        scroll.setDocumentView(Some(&document));
+        // A fixed width, not the clip view's: that has none until the popover is on screen, which squashed the rows.
+        document.widthAnchor().constraintEqualToConstant(self.width).setActive(true);
+        document.layoutSubtreeIfNeeded();
+        let height = if exact { height } else { document.fittingSize().height.min(height) };
+        scroll.heightAnchor().constraintEqualToConstant(height).setActive(true);
+        scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
+        Retained::into_super(scroll)
+    }
+
+    /// Reports `input`'s edits and runs its `submits` action on Return, and on leaving it when `blur`.
+    fn wire_field(&self, input: &NSTextField, field: u32, blur: bool) {
+        input.setTag(field as isize);
+        TARGET.with(|target| unsafe {
+            input.setDelegate(Some(ProtocolObject::from_ref(&**target)));
+            input.setTarget(Some(target));
+            input.setAction(Some(sel!(submit:)));
+        });
+        if let Some(cell) = input.cell() {
+            cell.setSendsActionOnEndEditing(blur);
+            // One scrolling line: wrapping, it grew taller once clicked into.
+            cell.setWraps(false);
+            cell.setScrollable(true);
+            cell.setUsesSingleLineMode(true);
+        }
     }
 
     fn stack(&mut self, children: &[Node], orientation: NSUserInterfaceLayoutOrientation, gap: f64) -> Retained<NSStackView> {

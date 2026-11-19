@@ -1,17 +1,11 @@
-use crate::settings::heading;
-use crate::ui::{action_button, Kind};
-use crate::native::{button, field, label, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, LOGIN_NOTE, LOGIN_PASSWORD, LOGIN_SITE, LOGIN_USER};
-use crate::window::{site_icon, BrowserWindow, Paint};
+use crate::native::{
+    button, button_if, field, heading, label, para, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, LOGIN_NOTE, LOGIN_PASSWORD,
+    LOGIN_SITE, LOGIN_USER, PASSWORD_SEARCH,
+};
+use crate::window::{site_image, BrowserWindow};
 use browser_core::passwords::{self, site_of};
-use browser_engine::WebEngine;
 use browser_engine_macos::{authenticate, vault_key};
-use gpui::{div, prelude::*, px, ClickEvent, Context, Entity, SharedString, Subscription};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::text_field::text_field;
-use gpuikit::icons::Icons;
-use gpuikit::input::{InputState, InputStateEvent};
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::traits::control_sized::ControlSized;
+use gpui::Context;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -31,6 +25,7 @@ pub(crate) struct SavePrompt {
     existing: Option<String>,
 }
 
+#[derive(Default)]
 pub(crate) struct PasswordState {
     pub(crate) prompt: Option<SavePrompt>,
     /// Login editor: `Some(None)` adds one, `Some(Some(id))` edits that login.
@@ -40,28 +35,9 @@ pub(crate) struct PasswordState {
     revealed: HashMap<String, String>,
     /// (weak, reused) by login id, from the last "Check passwords".
     health: HashMap<String, (bool, bool)>,
-    search: Entity<InputState>,
 }
 
 impl PasswordState {
-    pub(crate) fn new(cx: &mut Context<BrowserWindow>) -> (Self, Vec<Subscription>) {
-        let search = cx.new(InputState::new_singleline);
-        let subscriptions = vec![cx.subscribe(&search, |this: &mut BrowserWindow, _, event, cx| match event {
-            InputStateEvent::Focus => this.engine.focus_chrome(),
-            InputStateEvent::TextChanged => cx.notify(),
-            _ => {}
-        })];
-        let state = Self {
-            prompt: None,
-            edit: None,
-            unlocked_until: None,
-            revealed: HashMap::new(),
-            health: HashMap::new(),
-            search,
-        };
-        (state, subscriptions)
-    }
-
     fn unlocked(&self) -> bool {
         self.unlocked_until.is_some_and(|until| Instant::now() < until)
     }
@@ -248,98 +224,19 @@ impl BrowserWindow {
     }
 
     /// Settings → Passwords, below the two switches.
-    pub(crate) fn passwords_settings(&self, paint: Paint, cx: &mut Context<Self>) -> gpui::Div {
+    pub(crate) fn passwords_settings(&self, pop: &mut Pop) -> Vec<Node> {
         // Not inline: `manager_profile` locks the model too, and a second lock on this thread deadlocks.
         let profile_id = self.manager_profile();
         let logins = self.model.lock().logins(&profile_id, None).unwrap_or_default();
-        let query = self.passwords.search.read(cx).content().trim().to_lowercase();
+        let query = self.typed(PASSWORD_SEARCH).trim().to_lowercase();
         let unlocked = self.passwords.unlocked();
         // Counted over this profile's logins: `health` may still hold another profile's results (ids never collide).
         let checks: Vec<(bool, bool)> = logins.iter().filter_map(|login| self.passwords.health.get(&login.id).copied()).collect();
         let (weak, reused) = checks.iter().fold((0, 0), |(w, r), &(weak, reused)| (w + weak as usize, r + reused as usize));
-        let actions = h_stack()
-            .gap(px(8.))
-            .pt(px(8.))
-            .child(action_button("password-add", "Add…", Kind::Secondary, true, cx, |this, cx| this.open_login_editor(None, cx)))
-            .child(action_button("password-import", "Import CSV…", Kind::Secondary, true, cx, |this, cx| this.import_logins(cx)))
-            .child(action_button("password-export", "Export CSV…", Kind::Secondary, !logins.is_empty(), cx, |this, cx| {
-                this.with_unlock("export your saved passwords", cx, |this, cx| this.export_logins(cx))
-            }))
-            .child(action_button("password-check", "Check passwords", Kind::Secondary, !logins.is_empty(), cx, |this, cx| {
-                this.with_unlock("check your saved passwords", cx, |this, cx| this.check_logins(cx))
-            }));
-        let mut list = v_stack().w_full().gap(px(2.));
-        let shown: Vec<_> = logins
-            .iter()
-            .filter(|login| query.is_empty() || login.origin.to_lowercase().contains(&query) || login.username.to_lowercase().contains(&query))
-            .collect();
-        for login in &shown {
-            let revealed = unlocked.then(|| self.passwords.revealed.get(&login.id)).flatten();
-            let (is_weak, is_reused) = self.passwords.health.get(&login.id).copied().unwrap_or_default();
-            let (reveal, copy, edit) = (login.id.clone(), login.id.clone(), login.id.clone());
-            let badge = |text: &'static str| {
-                div().flex_none().px(px(6.)).py(px(1.)).rounded(px(4.)).text_size(paint.text(10.5)).bg(paint.secondary).text_color(paint.muted).child(text)
-            };
-            list = list.child(
-                h_stack()
-                    .w_full()
-                    .gap(px(10.))
-                    .py(px(6.))
-                    .items_center()
-                    .border_b_1()
-                    .border_color(paint.border.opacity(0.5))
-                    .child(div().flex_none().child(site_icon(&login.origin, 16., false)))
-                    .child(
-                        v_stack()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(div().truncate().child(site_of(&login.origin).to_string()))
-                            .child(div().truncate().text_size(paint.text(11.)).text_color(paint.muted).child(if login.username.is_empty() {
-                                "No username".to_string()
-                            } else {
-                                login.username.clone()
-                            })),
-                    )
-                    .when(is_weak, |row| row.child(badge("Weak")))
-                    .when(is_reused, |row| row.child(badge("Reused")))
-                    .child(div().flex_none().w(px(140.)).truncate().text_size(paint.text(12.)).text_color(paint.muted).child(
-                        revealed.cloned().unwrap_or_else(|| "••••••••".into()),
-                    ))
-                    .child(
-                        icon_button(SharedString::from(format!("password-reveal-{}", login.id)), if revealed.is_some() { Icons::eye_closed() } else { Icons::eye_open() })
-                            .small()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if this.passwords.unlocked() && this.passwords.revealed.remove(&reveal).is_some() {
-                                    return cx.notify();
-                                }
-                                let id = reveal.clone();
-                                this.with_unlock("show a saved password", cx, move |this, cx| {
-                                    let profile_id = this.manager_profile();
-                                    if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
-                                        this.passwords.revealed.insert(id, password);
-                                    }
-                                    cx.notify();
-                                });
-                            })),
-                    )
-                    .child(icon_button(SharedString::from(format!("password-copy-{}", login.id)), Icons::copy()).small().on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            let id = copy.clone();
-                            this.with_unlock("copy a saved password", cx, move |this, cx| {
-                                let profile_id = this.manager_profile();
-                                if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(password));
-                                    this.settings_note = Some("Password copied".into());
-                                }
-                                cx.notify();
-                            });
-                        },
-                    )))
-                    .child(icon_button(SharedString::from(format!("password-edit-{}", login.id)), Icons::pencil_1()).small().on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| this.open_login_editor(Some(edit.clone()), cx),
-                    ))),
-            );
-        }
+        let add = pop.act(|this, cx| this.open_login_editor(None, cx));
+        let import = pop.act(|this, cx| this.import_logins(cx));
+        let export = pop.act(|this, cx| this.with_unlock("export your saved passwords", cx, |this, cx| this.export_logins(cx)));
+        let check = pop.act(|this, cx| this.with_unlock("check your saved passwords", cx, |this, cx| this.check_logins(cx)));
         let summary = if logins.is_empty() {
             "No saved passwords yet. They are kept on this Mac only, encrypted with a key in your Keychain.".to_string()
         } else if checks.is_empty() {
@@ -347,16 +244,97 @@ impl BrowserWindow {
         } else {
             format!("{} saved on this Mac · {weak} weak · {reused} reused.", logins.len())
         };
-        v_stack()
-            .w_full()
-            .child(actions)
-            .child(heading("Saved passwords (current profile)", paint))
-            .child(div().pb(px(8.)).text_size(paint.text(11.)).text_color(paint.muted).child(summary))
-            .when(!logins.is_empty(), |column| {
-                column.child(div().w(px(260.)).pb(px(8.)).child(text_field(&self.passwords.search, cx).placeholder("Search sites and usernames").full_width(true)))
-            })
-            .when(!logins.is_empty() && shown.is_empty(), |column| column.child(div().text_color(paint.muted).child("No matches")))
-            .child(list)
+        let mut page = vec![
+            Node::Column {
+                gap: 0.,
+                pad: (0., 8.),
+                children: vec![Node::Row {
+                    gap: 8.,
+                    children: vec![
+                        button("Add…", add, Style::Plain, Key::None),
+                        button("Import CSV…", import, Style::Plain, Key::None),
+                        button_if(!logins.is_empty(), "Export CSV…", export),
+                        button_if(!logins.is_empty(), "Check passwords", check),
+                        Node::Spacer,
+                    ],
+                }],
+            },
+            heading("Saved passwords (current profile)"),
+            para(summary, 11., Ink::Secondary),
+        ];
+        let shown: Vec<_> = logins
+            .iter()
+            .filter(|login| query.is_empty() || login.origin.to_lowercase().contains(&query) || login.username.to_lowercase().contains(&query))
+            .collect();
+        if !logins.is_empty() {
+            let search = pop.act(|_, _| {});
+            page.push(Node::Row { gap: 0., children: vec![Node::Width(260., Box::new(field(PASSWORD_SEARCH, "", "Search sites and usernames", search))), Node::Spacer] });
+        }
+        if !logins.is_empty() && shown.is_empty() {
+            page.push(para("No matches", 13., Ink::Secondary));
+        }
+        let mut rows = Vec::new();
+        for login in &shown {
+            let revealed = unlocked.then(|| self.passwords.revealed.get(&login.id)).flatten();
+            let (is_weak, is_reused) = self.passwords.health.get(&login.id).copied().unwrap_or_default();
+            let (reveal, copy, edit) = (login.id.clone(), login.id.clone(), login.id.clone());
+            let mut children = vec![
+                site_image(&login.origin, 16.),
+                Node::Column {
+                    gap: 1.,
+                    pad: (0., 0.),
+                    children: vec![
+                        title(site_of(&login.origin).to_string(), 13., Weight::Regular, Ink::Primary),
+                        title(if login.username.is_empty() { "No username".to_string() } else { login.username.clone() }, 11., Weight::Regular, Ink::Secondary),
+                    ],
+                },
+                Node::Spacer,
+            ];
+            for (on, badge) in [(is_weak, "Weak"), (is_reused, "Reused")] {
+                if on {
+                    children.push(Node::Card { tint: Ink::Secondary, child: Box::new(Node::Column { gap: 0., pad: (6., 1.), children: vec![text(badge, 10.5, Weight::Regular, Ink::Secondary)] }) });
+                }
+            }
+            let reveal = pop.act(move |this, cx| {
+                if this.passwords.unlocked() && this.passwords.revealed.remove(&reveal).is_some() {
+                    return;
+                }
+                let id = reveal.clone();
+                this.with_unlock("show a saved password", cx, move |this, cx| {
+                    let profile_id = this.manager_profile();
+                    if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
+                        this.passwords.revealed.insert(id, password);
+                    }
+                    cx.notify();
+                });
+            });
+            let copy = pop.act(move |this, cx| {
+                let id = copy.clone();
+                this.with_unlock("copy a saved password", cx, move |this, cx| {
+                    let profile_id = this.manager_profile();
+                    if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(password));
+                        this.settings_note = Some("Password copied".into());
+                    }
+                    cx.notify();
+                });
+            });
+            let edit = pop.act(move |this, cx| this.open_login_editor(Some(edit.clone()), cx));
+            children.extend([
+                Node::Width(140., Box::new(title(revealed.cloned().unwrap_or_else(|| "••••••••".into()), 12., Weight::Regular, Ink::Secondary))),
+                Node::Tool {
+                    symbol: if revealed.is_some() { "eye.slash" } else { "eye" },
+                    tip: if revealed.is_some() { "Hide password" } else { "Show password" },
+                    action: reveal,
+                    on: false,
+                },
+                Node::Tool { symbol: "doc.on.doc", tip: "Copy password", action: copy, on: false },
+                Node::Tool { symbol: "pencil", tip: "Edit", action: edit, on: false },
+            ]);
+            rows.push(Node::Column { gap: 0., pad: (0., 0.), children: vec![Node::Column { gap: 0., pad: (0., 6.), children: vec![Node::Row { gap: 10., children }] }, Node::Separator] });
+        }
+        page.push(Node::Column { gap: 0., pad: (0., 0.), children: rows });
+        page
     }
 
     fn check_logins(&mut self, cx: &mut Context<Self>) {

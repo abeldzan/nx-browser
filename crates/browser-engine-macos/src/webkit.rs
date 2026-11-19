@@ -1011,13 +1011,30 @@ impl MacEngine {
 
     /// Shows a native sheet of `content` on this window, or updates the one open under `key`.
     pub fn present_sheet(&self, key: u64, width: f64, content: &crate::Node) {
-        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+        // Over settings while it is open: that is where the button opening it was pressed.
+        if let Some(window) = crate::popover::native_window().or_else(|| self.content.as_ref().and_then(|view| view.window())) {
             crate::popover::present_sheet(self.window_no, &window, key, width, content);
         }
     }
 
     pub fn close_sheet(&self) {
-        crate::popover::close_sheet();
+        crate::popover::close_sheet(Some(self.window_no));
+    }
+
+    /// Shows `content` in a native window titled `title`, or updates the one open under `key`.
+    pub fn present_window(&self, key: u64, title: &str, width: f64, content: &crate::Node) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::present_window(self.window_no, &window, key, title, width, content);
+        }
+    }
+
+    pub fn close_window(&self) {
+        crate::popover::close_window(Some(self.window_no));
+    }
+
+    /// While on, every key press goes to this window as `EngineEvent::RecordedKey` instead of running anything.
+    pub fn record_keys(&self, on: bool) {
+        RECORDING.set(on.then_some(self.window_no));
     }
 
     /// Replaces the text in the open popover's or sheet's field `field`.
@@ -2017,10 +2034,27 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
     let block = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
         let window = MainThreadMarker::new().and_then(|mtm| event_ref.window(mtm));
+        const ESCAPE: u16 = 53;
+        if let Some(window_no) = RECORDING.get() {
+            let flags = event_ref.modifierFlags() & NSEventModifierFlags::DeviceIndependentFlagsMask;
+            let keys = match event_ref.keyCode() {
+                ESCAPE => "escape".to_string(),
+                51 | 117 if !flags.intersects(NSEventModifierFlags::Command | NSEventModifierFlags::Control | NSEventModifierFlags::Option | NSEventModifierFlags::Shift) => "backspace".into(),
+                _ => combo(event_ref).unwrap_or_default(),
+            };
+            send_event(window_no, EngineEvent::RecordedKey(keys));
+            return std::ptr::null_mut();
+        }
+        // The settings window closes on Esc or ⌘W, like any macOS settings window.
+        if window.as_ref().is_some_and(|window| crate::popover::is_native_window(window))
+            && (event_ref.keyCode() == ESCAPE || combo(event_ref).as_deref() == Some("cmd-w"))
+        {
+            crate::popover::dismiss_window();
+            return std::ptr::null_mut();
+        }
         let Some(window_no) = window.map(|window| window.windowNumber()).filter(|&no| with_window(no, |state| state.events.is_some()) == Some(true)) else {
             return event.as_ptr();
         };
-        const ESCAPE: u16 = 53;
         if event_ref.keyCode() == ESCAPE {
             send_event(window_no, EngineEvent::Shortcut(Shortcut::Dismiss));
         }
@@ -2477,6 +2511,8 @@ define_class!(
 );
 
 thread_local! {
+    /// The window recording a shortcut (`MacEngine::record_keys`), which gets every key press meanwhile.
+    static RECORDING: Cell<Option<isize>> = const { Cell::new(None) };
     /// The window whose `show_menu` menu is up.
     static CONTEXT_MENU_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Menu items hold their target weakly.

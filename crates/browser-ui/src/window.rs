@@ -21,7 +21,6 @@ use crate::extensions::extension_icon;
 use crate::settings::{logical, measure_overlay};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::elements::combobox::{combobox, ComboboxState};
 use gpuikit::elements::input::input;
 use gpuikit::elements::text_field::{text_field, Adornment};
 use gpuikit::icons::Icons;
@@ -49,7 +48,6 @@ pub struct BrowserWindow {
     /// The shortcut whose new keys settings is waiting for; app shortcuts are paused meanwhile.
     pub(crate) recording: Option<&'static str>,
     /// Takes the keys being recorded.
-    pub(crate) shortcut_focus: FocusHandle,
     /// Each space's tiled windows, keyed by window group, as a split tree laid out over the stage.
     tiles: HashMap<String, Tile>,
     /// Holds one torn-off window instead of a space: its tabs take the spaces' place in the title bar.
@@ -70,17 +68,10 @@ pub struct BrowserWindow {
     ext_active: Option<String>,
     address: Entity<InputState>,
     find_input: Entity<InputState>,
-    pub(crate) home_input: Entity<InputState>,
-    pub(crate) ua_input: Entity<InputState>,
     /// Searchable font list in the Terminal settings; built on first show since it needs a `Window`.
-    pub(crate) term_font_picker: Option<Entity<ComboboxState<String>>>,
-    pub(crate) ui_font_picker: Option<Entity<ComboboxState<String>>>,
-    pub(crate) term_shell_input: Entity<InputState>,
-    pub(crate) name_input: Entity<InputState>,
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
     /// Filters the settings nav and the shortcut list.
-    pub(crate) settings_query: Entity<InputState>,
     /// Confirmation shown in the settings footer after an action.
     pub(crate) settings_note: Option<SharedString>,
     pub(crate) settings_profile: Option<String>,
@@ -94,6 +85,8 @@ pub struct BrowserWindow {
     popover_actions: Vec<crate::settings::MenuAction>,
     /// The same for the open native sheet, whose ids start at `native::SHEET_BASE`.
     sheet_actions: Vec<crate::settings::MenuAction>,
+    /// The settings window's handlers, from `native::WINDOW_BASE` up.
+    window_actions: Vec<crate::settings::MenuAction>,
     /// What is typed in the open popover's text fields, by field id.
     pub(crate) popover_texts: HashMap<u32, String>,
     /// Where each popover's button was last drawn, for the popover to point at.
@@ -302,11 +295,6 @@ impl BrowserWindow {
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let settings_query = cx.new(InputState::new_singleline);
         let mut subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -348,43 +336,8 @@ impl BrowserWindow {
                 }
                 _ => {}
             }),
-            cx.subscribe(&home_input, |this, input, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit | InputStateEvent::Blur => {
-                    let value = input.read(cx).content().trim().to_string();
-                    this.set_pref(cx, |s| s.home_page = value);
-                }
-                _ => {}
-            }),
-            cx.subscribe(&ua_input, |this, input, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit | InputStateEvent::Blur => {
-                    let value = input.read(cx).content().trim().to_string();
-                    this.set_pref(cx, |s| s.user_agent = value);
-                }
-                _ => {}
-            }),
-            cx.subscribe(&term_shell_input, |this, input, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit | InputStateEvent::Blur => {
-                    let value = input.read(cx).content().trim().to_string();
-                    this.set_pref(cx, |s| s.terminal_shell = value);
-                }
-                _ => {}
-            }),
-            cx.subscribe(&settings_query, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::TextChanged => cx.notify(),
-                _ => {}
-            }),
-            cx.subscribe(&name_input, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit | InputStateEvent::Blur => this.save_profile_name(cx),
-                _ => {}
-            }),
         ];
-        let (passwords, password_subscriptions) = PasswordState::new(cx);
-        subscriptions.extend(password_subscriptions);
+        let passwords = PasswordState::default();
         // The update status lives app-wide; every window's title bar shows "Restart to Update".
         subscriptions.push(cx.observe_global::<crate::update::Updates>(|_, cx| cx.notify()));
         let (detached, tab_window, extensions, pages, chrome) = match handoff {
@@ -396,7 +349,6 @@ impl BrowserWindow {
             space_drag: None,
             gesture_focus: cx.focus_handle(),
             recording: None,
-            shortcut_focus: cx.focus_handle(),
             tiles: HashMap::new(),
             tab_window,
             close_window: false,
@@ -409,15 +361,8 @@ impl BrowserWindow {
             ext_active: None,
             address,
             find_input,
-            home_input,
-            ua_input,
-            term_font_picker: None,
-            ui_font_picker: None,
-            term_shell_input,
-            name_input,
             settings_open: false,
             settings_section: SettingsSection::Profiles,
-            settings_query,
             settings_note: None,
             settings_profile: None,
             delete_prompt: None,
@@ -426,6 +371,7 @@ impl BrowserWindow {
             popover: None,
             popover_actions: Vec::new(),
             sheet_actions: Vec::new(),
+            window_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
             history_modal: false,
@@ -817,15 +763,34 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
-                let sheet = action >= crate::native::SHEET_BASE;
+                use crate::native::{SHEET_BASE, WINDOW_BASE};
+                let (slot, base) = match action {
+                    WINDOW_BASE.. => (&mut self.window_actions, WINDOW_BASE),
+                    SHEET_BASE.. => (&mut self.sheet_actions, SHEET_BASE),
+                    _ => (&mut self.popover_actions, 0),
+                };
                 // Taken while it runs, as it gets `self` mutably.
-                let actions = std::mem::take(if sheet { &mut self.sheet_actions } else { &mut self.popover_actions });
-                if let Some(run) = actions.get((action - if sheet { crate::native::SHEET_BASE } else { 0 }) as usize) {
+                let actions = std::mem::take(slot);
+                if let Some(run) = actions.get((action - base) as usize) {
                     run(self, cx);
                     cx.notify();
                 }
-                *(if sheet { &mut self.sheet_actions } else { &mut self.popover_actions }) = actions;
+                let slot = match action {
+                    WINDOW_BASE.. => &mut self.window_actions,
+                    SHEET_BASE.. => &mut self.sheet_actions,
+                    _ => &mut self.popover_actions,
+                };
+                // Unless running it rebuilt the window, which registered fresh handlers.
+                if slot.is_empty() {
+                    *slot = actions;
+                }
             }
+            EngineEvent::NativeWindowClosed => {
+                if self.settings_open {
+                    self.toggle_settings(cx);
+                }
+            }
+            EngineEvent::RecordedKey(keys) => self.record_key(&keys, cx),
             EngineEvent::PopoverText { field, text } => {
                 self.popover_texts.insert(field, text);
                 // Sheets that show what is typed (the new profile's badge, history's matches) follow it.
@@ -1642,6 +1607,18 @@ impl BrowserWindow {
         }
     }
 
+    /// Shows the settings window while settings are open, or updates it; closes it once they're not.
+    fn sync_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return self.engine.close_window();
+        }
+        let mut pop = crate::native::Pop::window();
+        let content = self.settings_window(&mut pop, cx);
+        // One key: it stays the same window, updated in place, from section to section.
+        self.engine.present_window(1, "Settings", 780., &content);
+        self.window_actions = pop.actions;
+    }
+
     /// What is typed in native field `field`.
     pub(crate) fn typed(&self, field: u32) -> String {
         self.popover_texts.get(&field).cloned().unwrap_or_default()
@@ -2008,60 +1985,6 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&view.focus_handle(cx), cx));
     }
 
-    fn build_font_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings_open {
-            return;
-        }
-        let settings = self.model.lock().settings.clone();
-        match self.settings_section {
-            SettingsSection::Terminal if self.term_font_picker.is_none() => {
-                let fonts = terminal::monospace_fonts().iter().map(|name| (name.clone(), name.clone())).collect();
-                let picker = Self::font_picker("terminal-font", "Terminal font", fonts, settings.terminal_font, |s, font| s.terminal_font = font, cx);
-                self.term_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
-            }
-            SettingsSection::Appearance if self.ui_font_picker.is_none() => {
-                let fonts = std::iter::once((String::new(), "System".to_string()))
-                    .chain(terminal::all_fonts().iter().map(|name| (name.clone(), name.clone())))
-                    .collect();
-                let picker = Self::font_picker("ui-font", "Interface font", fonts, settings.ui_font, |s, font| s.ui_font = font, cx);
-                self.ui_font_picker = Some(cx.new(|cx| ComboboxState::new(picker, window, cx)));
-            }
-            _ => {}
-        }
-    }
-
-    /// A searchable font list of (value, label) saving the pick through `apply`; `current` stays listed even if not installed.
-    fn font_picker(
-        id: &'static str,
-        name: &'static str,
-        mut fonts: Vec<(String, String)>,
-        current: String,
-        apply: fn(&mut browser_core::Settings, String),
-        cx: &mut Context<Self>,
-    ) -> gpuikit::elements::combobox::Combobox<String> {
-        if !fonts.iter().any(|(value, _)| *value == current) {
-            // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
-            fonts.insert(0, (current.clone(), current.clone()));
-        }
-        let (pick, create) = (cx.entity().downgrade(), cx.entity().downgrade());
-        combobox(id, name, fonts)
-            .selected(current)
-            .placeholder("Search fonts…")
-            .full_width(true)
-            .on_change(move |font: Option<String>, _, cx| {
-                if let Some(font) = font {
-                    let _ = pick.update(cx, |this, cx| this.set_pref(cx, |s| apply(s, font)));
-                }
-            })
-            // A name not in the list is kept as typed, so any installed family works.
-            .on_create(move |font, _, cx| {
-                let font = font.trim().to_string();
-                if !font.is_empty() {
-                    let _ = create.update(cx, |this, cx| this.set_pref(cx, |s| apply(s, font)));
-                }
-            })
-    }
-
     /// Opens the find bar on the active window, unless it's a terminal, which has no page to search.
     fn open_find(&mut self, cx: &mut Context<Self>) {
         let active = self.model.lock().active_tab().filter(|tab| !is_terminal(&tab.url)).map(|tab| tab.id.clone());
@@ -2263,12 +2186,12 @@ impl Render for BrowserWindow {
         self.apply_theme(window, cx);
         self.sync_popover(window);
         self.sync_sheet(cx);
+        self.sync_settings(cx);
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
         self.request_palette_focus(window, cx);
         self.request_find_focus(window, cx);
         self.request_terminal_focus(window, cx);
-        self.build_font_picker(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
@@ -2403,7 +2326,6 @@ impl Render for BrowserWindow {
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
-            .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
     }
 }
 

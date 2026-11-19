@@ -89,6 +89,11 @@ pub enum EngineEvent {
     },
     /// The popover closed on its own (a press outside it, or Esc).
     PopoverClosed,
+    /// The native window (settings) was closed: its close button, Esc or ⌘W.
+    NativeWindowClosed,
+    /// Keys pressed while recording a shortcut, in gpui keystroke form: `escape`, `backspace`, or a combination
+    /// with ⌘ or ⌃; empty for a key without either.
+    RecordedKey(String),
     /// An extension finished loading, failed, or changed its toolbar button (badge, icon).
     ExtensionChanged {
         id: String,
