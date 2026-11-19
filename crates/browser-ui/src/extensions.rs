@@ -1,15 +1,9 @@
-use crate::history::{popover_header, INSET};
-use crate::native::{rgb, text, title, Ink, Node, Pop, Weight};
+use crate::native::{button, empty, field, rgb, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, Wrap};
 use crate::window::Popover;
-use crate::ui::{action_button, Kind};
 use crate::window::{paint, site_color, BrowserWindow};
 use browser_extensions::store_id;
 use gpui::{div, img, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::icons::Icons;
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::traits::control_sized::ControlSized;
+use gpuikit::layout::h_stack;
 
 /// The install field in the extensions popover.
 pub(crate) const EXT_FIELD: u32 = 0;
@@ -46,7 +40,7 @@ impl BrowserWindow {
                                 Node::Glyph { name: "puzzlepiece.extension", size: 14., ink: Ink::Accent },
                                 title("This page is a Chrome Web Store listing.", 12., Weight::Regular, Ink::Primary),
                                 Node::Spacer,
-                                Node::Button { title: "Add to NxBrowser".into(), action: add, primary: true },
+                                button("Add to NxBrowser", add, Style::Primary, Key::None),
                             ],
                         }],
                     }),
@@ -71,8 +65,8 @@ impl BrowserWindow {
                                 gap: 8.,
                                 children: vec![
                                     Node::Spacer,
-                                    Node::Button { title: "Deny".into(), action: deny, primary: false },
-                                    Node::Button { title: "Allow".into(), action: allow, primary: true },
+                                    button("Deny", deny, Style::Plain, Key::None),
+                                    button("Allow", allow, Style::Primary, Key::None),
                                 ],
                             },
                         ],
@@ -101,13 +95,13 @@ impl BrowserWindow {
                 pad: (24., 20.),
                 children: vec![
                     Node::Glyph { name: "puzzlepiece.extension", size: 26., ink: Ink::Secondary },
-                    Node::Text { text: "No extensions yet".into(), size: 13., weight: Weight::Medium, ink: Ink::Primary, wrap: Some(352.), shrink: false },
+                    Node::Text { text: "No extensions yet".into(), size: 13., weight: Weight::Medium, ink: Ink::Primary, wrap: Wrap::Center, shrink: false },
                     Node::Text {
                         text: "Add one from the Chrome Web Store, or load an unpacked folder.".into(),
                         size: 12.,
                         weight: Weight::Regular,
                         ink: Ink::Secondary,
-                        wrap: Some(352.),
+                        wrap: Wrap::Center,
                         shrink: false,
                     },
                 ],
@@ -136,8 +130,8 @@ impl BrowserWindow {
                 Node::Row {
                     gap: 8.,
                     children: vec![
-                        Node::Field { field: EXT_FIELD, placeholder: "Chrome Web Store link or extension ID".into(), submit: install },
-                        Node::Button { title: "Install".into(), action: install, primary: true },
+                        field(EXT_FIELD, "", "Chrome Web Store link or extension ID", install),
+                        button("Install", install, Style::Primary, Key::None),
                     ],
                 },
                 Node::Row {
@@ -243,37 +237,26 @@ impl BrowserWindow {
     /// An extension's errors, one per line, with a button that copies them all.
     // shortcut: WebKit exposes only the error list (runtime errors and console.error), not console.log; capture
     // console output in the polyfill if full logs are needed.
-    pub(crate) fn ext_logs_modal(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
+    pub(crate) fn logs_sheet(&self, id: &str, pop: &mut Pop) -> Node {
         let name = self.ext_meta.get(id).map(|meta| meta.name.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| id.to_string());
         let lines = self.engine.extensions().errors(id);
-        let text = lines.join("\n");
-        let mut list = v_stack().w_full().gap(px(6.)).p(px(INSET)).font_family("Menlo").text_size(paint.text(11.));
-        if lines.is_empty() {
-            list = list.child(div().py(px(24.)).text_center().text_color(paint.muted).child("No logs"));
-        }
-        for line in lines {
-            list = list.child(div().w_full().pb(px(6.)).border_b_1().border_color(paint.border).child(line));
-        }
-        let card = v_stack()
-            .w(px(640.))
-            .h(px(480.))
-            .max_w_full()
-            .max_h_full()
-            .child(popover_header(
-                format!("Logs · {name}"),
-                h_stack()
-                    .child(action_button("ext-logs-copy", "Copy", Kind::Secondary, !text.is_empty(), cx, move |this, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
-                        this.status = "Copied logs".into();
-                    }))
-                    .child(icon_button("ext-logs-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.close_ext_logs(cx);
-                    }))),
-                paint,
-            ))
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(scroll_area("ext-logs-list").vertical().full_height(true).child(list)));
-        self.modal_shell("ext-logs-modal", card, Self::close_ext_logs, cx)
+        let text_ = lines.join("\n");
+        let list = if lines.is_empty() {
+            empty(None, "No logs")
+        } else {
+            let mut rows = Vec::new();
+            for line in lines {
+                rows.push(Node::Text { text: line, size: 11., weight: Weight::Mono, ink: Ink::Primary, wrap: Wrap::Left, shrink: false });
+                rows.push(Node::Separator);
+            }
+            Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 6., pad: (0., 0.), children: rows }) }
+        };
+        let copy = pop.act(move |this, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text_.clone()));
+            this.status = "Copied logs".into();
+        });
+        let done = pop.act(|this, cx| this.close_ext_logs(cx));
+        sheet(format!("Logs · {name}"), vec![list], vec![button("Copy", copy, Style::Plain, Key::None), button("Done", done, Style::Primary, Key::Escape)])
     }
 
     fn close_ext_logs(&mut self, cx: &mut Context<Self>) {

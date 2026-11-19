@@ -1,14 +1,15 @@
-use crate::settings::{heading, measure_overlay};
+use crate::settings::heading;
 use crate::ui::{action_button, Kind};
-use crate::window::{paint, site_icon, BrowserWindow, Paint};
+use crate::native::{button, field, label, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, LOGIN_NOTE, LOGIN_PASSWORD, LOGIN_SITE, LOGIN_USER};
+use crate::window::{site_icon, BrowserWindow, Paint};
 use browser_core::passwords::{self, site_of};
 use browser_engine::WebEngine;
 use browser_engine_macos::{authenticate, vault_key};
-use gpui::{div, prelude::*, px, ClickEvent, Context, Entity, FontWeight, SharedString, Subscription};
+use gpui::{div, prelude::*, px, ClickEvent, Context, Entity, SharedString, Subscription};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
-use gpuikit::input::{InputState, InputStateEvent, SubmitOn};
+use gpuikit::input::{InputState, InputStateEvent};
 use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::traits::control_sized::ControlSized;
 use serde::Deserialize;
@@ -40,29 +41,16 @@ pub(crate) struct PasswordState {
     /// (weak, reused) by login id, from the last "Check passwords".
     health: HashMap<String, (bool, bool)>,
     search: Entity<InputState>,
-    site: Entity<InputState>,
-    username: Entity<InputState>,
-    password: Entity<InputState>,
-    note: Entity<InputState>,
 }
 
 impl PasswordState {
     pub(crate) fn new(cx: &mut Context<BrowserWindow>) -> (Self, Vec<Subscription>) {
         let search = cx.new(InputState::new_singleline);
-        let fields = [(); 4].map(|_| cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter)));
-        let mut subscriptions = vec![cx.subscribe(&search, |this: &mut BrowserWindow, _, event, cx| match event {
+        let subscriptions = vec![cx.subscribe(&search, |this: &mut BrowserWindow, _, event, cx| match event {
             InputStateEvent::Focus => this.engine.focus_chrome(),
             InputStateEvent::TextChanged => cx.notify(),
             _ => {}
         })];
-        for field in &fields {
-            subscriptions.push(cx.subscribe(field, |this: &mut BrowserWindow, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => this.save_login_edit(cx),
-                _ => {}
-            }));
-        }
-        let [site, username, password, note] = fields;
         let state = Self {
             prompt: None,
             edit: None,
@@ -70,10 +58,6 @@ impl PasswordState {
             revealed: HashMap::new(),
             health: HashMap::new(),
             search,
-            site,
-            username,
-            password,
-            note,
         };
         (state, subscriptions)
     }
@@ -190,17 +174,14 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    /// "Save password for site?" floating under the title bar after a sign-in form is sent.
-    pub(crate) fn save_password_prompt(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let Some(prompt) = self.passwords.prompt.clone() else {
-            return div();
-        };
-        let paint = paint(cx);
+    /// "Save password for site?" under the title bar after a sign-in form is sent; it stays until answered.
+    pub(crate) fn save_password_popover(&self, pop: &mut Pop) -> Option<Node> {
+        let prompt = self.passwords.prompt.clone()?;
         let host = site_of(&prompt.origin).to_string();
         let update = prompt.existing.is_some();
         let save = {
             let prompt = prompt.clone();
-            move |this: &mut Self, cx: &mut Context<Self>| {
+            pop.act(move |this, _| {
                 let saved =
                     this.model.lock().save_login(&prompt.profile_id, prompt.existing.as_deref(), &prompt.origin, &prompt.username, &prompt.password, "");
                 this.status = match saved {
@@ -208,52 +189,31 @@ impl BrowserWindow {
                     Err(error) => format!("Password not saved: {error}").into(),
                 };
                 this.passwords.prompt = None;
-                cx.notify();
-            }
+            })
         };
-        let never = move |this: &mut Self, cx: &mut Context<Self>| {
-            let _ = this.model.lock().never_save(&prompt.profile_id, &prompt.origin);
-            this.passwords.prompt = None;
-            cx.notify();
-        };
+        let not_now = pop.act(|this, _| this.passwords.prompt = None);
         let username = if prompt.username.is_empty() { "No username".to_string() } else { prompt.username.clone() };
-        div().absolute().top(px(self.titlebar_h() + 10.)).right(px(12.)).child(
-            v_stack()
-                .relative()
-                .w(px(320.))
-                .p(px(14.))
-                .gap(px(10.))
-                .rounded(px(10.))
-                .bg(paint.surface)
-                .border_1()
-                .border_color(paint.border)
-                .shadow_md()
-                .text_size(paint.text(13.))
-                .occlude()
-                .child(measure_overlay(10., cx))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(if update { format!("Update password for {host}?") } else { format!("Save password for {host}?") }),
-                )
-                .child(
-                    v_stack()
-                        .gap(px(2.))
-                        .child(div().truncate().child(username))
-                        .child(div().text_color(paint.muted).child("•".repeat(prompt.password.chars().count().min(16)))),
-                )
-                .child(
-                    h_stack()
-                        .gap(px(8.))
-                        .when(!update, |row| row.child(action_button("password-never", "Never", Kind::Secondary, true, cx, never)))
-                        .child(div().flex_1())
-                        .child(action_button("password-not-now", "Not now", Kind::Secondary, true, cx, |this, cx| {
-                            this.passwords.prompt = None;
-                            cx.notify();
-                        }))
-                        .child(action_button("password-save", if update { "Update" } else { "Save" }, Kind::Primary, true, cx, save)),
-                ),
-        )
+        let dots = "•".repeat(prompt.password.chars().count().min(16));
+        let mut buttons = Vec::new();
+        if !update {
+            let never = pop.act(move |this, _| {
+                let _ = this.model.lock().never_save(&prompt.profile_id, &prompt.origin);
+                this.passwords.prompt = None;
+            });
+            buttons.push(button("Never", never, Style::Plain, Key::None));
+        }
+        buttons.push(Node::Spacer);
+        buttons.push(button("Not now", not_now, Style::Plain, Key::None));
+        buttons.push(button(if update { "Update" } else { "Save" }, save, Style::Primary, Key::None));
+        Some(Node::Column {
+            gap: 10.,
+            pad: (14., 14.),
+            children: vec![
+                text(if update { format!("Update password for {host}?") } else { format!("Save password for {host}?") }, 13., Weight::Semibold, Ink::Primary),
+                Node::Column { gap: 2., pad: (0., 0.), children: vec![title(username, 13., Weight::Regular, Ink::Primary), text(dots, 13., Weight::Regular, Ink::Secondary)] },
+                Node::Row { gap: 8., children: buttons },
+            ],
+        })
     }
 
     /// Runs `then` after Touch ID or the Mac password, or straight away within `UNLOCK_FOR` of the last check.
@@ -474,8 +434,8 @@ impl BrowserWindow {
     /// `None` adds a login; editing shows the password, so it asks for Touch ID first.
     fn open_login_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         let Some(id) = id else {
-            for field in [&self.passwords.site, &self.passwords.username, &self.passwords.password, &self.passwords.note] {
-                field.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+            for field in [LOGIN_SITE, LOGIN_USER, LOGIN_PASSWORD, LOGIN_NOTE] {
+                self.popover_texts.remove(&field);
             }
             self.passwords.edit = Some(None);
             return cx.notify();
@@ -491,8 +451,8 @@ impl BrowserWindow {
                 return;
             };
             let values = [login.origin, login.username, password, login.note];
-            for (field, value) in [&this.passwords.site, &this.passwords.username, &this.passwords.password, &this.passwords.note].into_iter().zip(values) {
-                field.update(cx, |input, cx| input.set_content_silent(value, cx));
+            for (field, value) in [LOGIN_SITE, LOGIN_USER, LOGIN_PASSWORD, LOGIN_NOTE].into_iter().zip(values) {
+                this.popover_texts.insert(field, value);
             }
             this.passwords.edit = Some(Some(id));
             cx.notify();
@@ -503,9 +463,8 @@ impl BrowserWindow {
         let Some(id) = self.passwords.edit.clone() else {
             return;
         };
-        let read = |field: &Entity<InputState>| field.read(cx).content().to_string();
         let (site, username, password, note) =
-            (read(&self.passwords.site), read(&self.passwords.username).trim().to_string(), read(&self.passwords.password), read(&self.passwords.note));
+            (self.typed(LOGIN_SITE), self.typed(LOGIN_USER).trim().to_string(), self.typed(LOGIN_PASSWORD), self.typed(LOGIN_NOTE));
         let site = site.trim();
         let origin = passwords::origin_of(site).or_else(|| passwords::origin_of(&format!("https://{site}")));
         let (Some(origin), false) = (origin, password.is_empty()) else {
@@ -526,57 +485,44 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    pub(crate) fn login_editor(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let paint = paint(cx);
+    pub(crate) fn login_sheet(&self, pop: &mut Pop) -> Node {
         let id = self.passwords.edit.clone().flatten();
-        let label = |text: &'static str| div().text_size(paint.text(12.)).text_color(paint.muted).child(text);
-        let close = |this: &mut Self, cx: &mut Context<Self>| {
-            this.passwords.edit = None;
-            cx.notify();
-        };
-        let card = v_stack()
-            .w(px(420.))
-            .max_w_full()
-            .gap(px(8.))
-            .p(px(24.))
-            .child(div().pb(px(6.)).text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit password" } else { "Add password" }))
-            .child(label("Website"))
-            .child(text_field(&self.passwords.site, cx).placeholder("example.com").full_width(true))
-            .child(label("Username"))
-            .child(text_field(&self.passwords.username, cx).placeholder("Username or email").full_width(true))
-            .child(label("Password"))
-            .child(
-                h_stack()
-                    .gap(px(8.))
-                    .child(div().flex_1().child(text_field(&self.passwords.password, cx).placeholder("Password").full_width(true)))
-                    .child(action_button("password-generate", "Generate", Kind::Secondary, true, cx, |this, cx| {
-                        let password = passwords::generate();
-                        this.passwords.password.update(cx, |input, cx| input.set_content_silent(password, cx));
-                        cx.notify();
-                    })),
-            )
-            .child(label("Note"))
-            .child(text_field(&self.passwords.note, cx).placeholder("Optional").full_width(true))
-            .child(
-                h_stack()
-                    .pt(px(16.))
-                    .gap(px(10.))
-                    .when_some(id, |row, id| {
-                        row.child(action_button("password-delete", "Delete", Kind::Danger, true, cx, move |this, cx| {
-                            let profile_id = this.manager_profile();
-                            let _ = this.model.lock().delete_login(&profile_id, &id);
-                            this.passwords.edit = None;
-                            this.passwords.revealed.remove(&id);
-                            this.passwords.health.clear();
-                            this.settings_note = Some("Password deleted".into());
-                            cx.notify();
-                        }))
-                    })
-                    .child(div().flex_1())
-                    .child(action_button("password-cancel", "Cancel", Kind::Secondary, true, cx, close))
-                    .child(action_button("password-save-edit", "Save", Kind::Primary, true, cx, |this, cx| this.save_login_edit(cx))),
-            );
-        self.modal_shell("login-editor", card, close, cx)
+        let save = pop.act(|this, cx| this.save_login_edit(cx));
+        let cancel = pop.act(|this, _| this.passwords.edit = None);
+        let generate = pop.act(|this, _| {
+            let password = passwords::generate();
+            this.engine.set_popover_field(LOGIN_PASSWORD, &password);
+            this.popover_texts.insert(LOGIN_PASSWORD, password);
+        });
+        let mut buttons = Vec::new();
+        if let Some(id) = id.clone() {
+            let delete = pop.act(move |this, _| {
+                let profile_id = this.manager_profile();
+                let _ = this.model.lock().delete_login(&profile_id, &id);
+                this.passwords.edit = None;
+                this.passwords.revealed.remove(&id);
+                this.passwords.health.clear();
+                this.settings_note = Some("Password deleted".into());
+            });
+            buttons.push(button("Delete", delete, Style::Danger, Key::None));
+            buttons.push(Node::Spacer);
+        }
+        buttons.push(button("Cancel", cancel, Style::Plain, Key::Escape));
+        buttons.push(button("Save", save, Style::Primary, Key::Return));
+        sheet(
+            if id.is_some() { "Edit password" } else { "Add password" },
+            vec![
+                label("Website"),
+                field(LOGIN_SITE, self.typed(LOGIN_SITE), "example.com", save),
+                label("Username"),
+                field(LOGIN_USER, self.typed(LOGIN_USER), "Username or email", save),
+                label("Password"),
+                Node::Row { gap: 8., children: vec![field(LOGIN_PASSWORD, self.typed(LOGIN_PASSWORD), "Password", save), button("Generate", generate, Style::Plain, Key::None)] },
+                label("Note"),
+                field(LOGIN_NOTE, self.typed(LOGIN_NOTE), "Optional", save),
+            ],
+            buttons,
+        )
     }
 }
 

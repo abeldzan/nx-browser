@@ -19,7 +19,6 @@ use gpui::{
 };
 use crate::extensions::extension_icon;
 use crate::settings::{logical, measure_overlay};
-use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
 use gpuikit::elements::combobox::{combobox, ComboboxState};
@@ -93,6 +92,8 @@ pub struct BrowserWindow {
     pub(crate) popover: Option<Popover>,
     /// What each control in the open native popover runs, by its action id.
     popover_actions: Vec<crate::settings::MenuAction>,
+    /// The same for the open native sheet, whose ids start at `native::SHEET_BASE`.
+    sheet_actions: Vec<crate::settings::MenuAction>,
     /// What is typed in the open popover's text fields, by field id.
     pub(crate) popover_texts: HashMap<u32, String>,
     /// Where each popover's button was last drawn, for the popover to point at.
@@ -102,15 +103,10 @@ pub struct BrowserWindow {
     pub(crate) ext_logs: Option<String>,
     /// Links from other apps waiting for the user to pick a profile.
     pub(crate) pending_links: Vec<String>,
-    pub(crate) history_query: Entity<InputState>,
     /// The bookmark editor: (bookmark id, pinned); no id adds a new pinned site.
     pub(crate) bookmark_edit: Option<(Option<String>, bool)>,
-    pub(crate) bookmark_title: Entity<InputState>,
-    pub(crate) bookmark_url: Entity<InputState>,
-    pub(crate) focus_history: bool,
     /// Icon and color picked in the new-profile modal while it is open.
     pub(crate) new_profile: Option<(String, String)>,
-    pub(crate) new_profile_input: Entity<InputState>,
     /// Live (received, total) bytes per download id, fed by the download threads.
     pub(crate) download_progress: HashMap<String, (u64, Option<u64>)>,
     /// What each row of the native menu last shown runs, by index; `None` for separators.
@@ -156,10 +152,6 @@ pub struct BrowserWindow {
     permission: Option<(u64, String, String)>,
     /// Page dialogs waiting on the user, oldest first; only the first one shows.
     dialogs: Vec<PageDialog>,
-    dialog_input: Entity<InputState>,
-    /// Holds the keys while an alert or confirm shows, so Enter and Escape answer it.
-    dialog_focus: FocusHandle,
-    focus_dialog: bool,
     pub(crate) passwords: PasswordState,
     /// Downloads WebKit is writing, by engine id: (download id in the model, file path).
     web_downloads: HashMap<u64, (String, String)>,
@@ -310,16 +302,11 @@ impl BrowserWindow {
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let dialog_input = cx.new(InputState::new_singleline);
         let home_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let ua_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let term_shell_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let name_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let new_profile_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let history_query = cx.new(InputState::new_singleline);
         let settings_query = cx.new(InputState::new_singleline);
-        let bookmark_title = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let bookmark_url = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let mut subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
                 InputStateEvent::Submit => {
@@ -349,11 +336,6 @@ impl BrowserWindow {
                 }
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
-            }),
-            cx.subscribe(&dialog_input, |this, _, event, _| {
-                if let InputStateEvent::Focus = event {
-                    this.engine.focus_chrome();
-                }
             }),
             cx.subscribe(&space_input, |this, input, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
@@ -390,30 +372,9 @@ impl BrowserWindow {
                 }
                 _ => {}
             }),
-            cx.subscribe(&new_profile_input, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => this.create_new_profile(cx),
-                // Keeps the badge preview in step with the typed name.
-                _ => cx.notify(),
-            }),
-            cx.subscribe(&history_query, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::TextChanged => cx.notify(),
-                _ => {}
-            }),
             cx.subscribe(&settings_query, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::TextChanged => cx.notify(),
-                _ => {}
-            }),
-            cx.subscribe(&bookmark_title, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => this.save_bookmark_edit(cx),
-                _ => {}
-            }),
-            cx.subscribe(&bookmark_url, |this, _, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => this.save_bookmark_edit(cx),
                 _ => {}
             }),
             cx.subscribe(&name_input, |this, _, event, cx| match event {
@@ -464,18 +425,14 @@ impl BrowserWindow {
             menu_actions: Vec::new(),
             popover: None,
             popover_actions: Vec::new(),
+            sheet_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
             history_modal: false,
             ext_logs: None,
             pending_links: Vec::new(),
-            history_query,
             bookmark_edit: None,
-            bookmark_title,
-            bookmark_url,
-            focus_history: false,
             new_profile: None,
-            new_profile_input,
             download_progress: HashMap::new(),
             address_focused: false,
             focus_address: false,
@@ -507,9 +464,6 @@ impl BrowserWindow {
             space_input,
             permission: None,
             dialogs: Vec::new(),
-            dialog_input,
-            dialog_focus: cx.focus_handle(),
-            focus_dialog: false,
             web_downloads: HashMap::new(),
             attached: false,
             playing: HashSet::new(),
@@ -863,21 +817,27 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
+                let sheet = action >= crate::native::SHEET_BASE;
                 // Taken while it runs, as it gets `self` mutably.
-                let actions = std::mem::take(&mut self.popover_actions);
-                if let Some(run) = actions.get(action as usize) {
+                let actions = std::mem::take(if sheet { &mut self.sheet_actions } else { &mut self.popover_actions });
+                if let Some(run) = actions.get((action - if sheet { crate::native::SHEET_BASE } else { 0 }) as usize) {
                     run(self, cx);
                     cx.notify();
                 }
-                self.popover_actions = actions;
+                *(if sheet { &mut self.sheet_actions } else { &mut self.popover_actions }) = actions;
             }
             EngineEvent::PopoverText { field, text } => {
                 self.popover_texts.insert(field, text);
+                // Sheets that show what is typed (the new profile's badge, history's matches) follow it.
+                cx.notify();
             }
             EngineEvent::PopoverClosed => {
                 if !self.engine.popover_shown() {
-                    self.popover = None;
-                    self.popover_texts.clear();
+                    // With no title-bar popover open, the one that closed was the save-password offer: not now.
+                    if self.popover.take().is_none() {
+                        self.passwords.prompt = None;
+                    }
+                    self.popover_texts.remove(&crate::extensions::EXT_FIELD);
                     cx.notify();
                 }
             }
@@ -1611,9 +1571,17 @@ impl BrowserWindow {
 
     /// Shows the open popover natively, or updates it from the model; closes it once `popover` is `None`.
     fn sync_popover(&mut self, window: &Window) {
+        let mut pop = crate::native::Pop::default();
         let Some(kind) = self.popover else {
-            if self.engine.popover_shown() {
-                self.engine.close_popover();
+            // The save-password offer sits under the title bar's right end until answered.
+            match self.save_password_popover(&mut pop) {
+                Some(content) => {
+                    let anchor = LogicalRect { x: f64::from(window.viewport_size().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) };
+                    self.engine.present_popover(SAVE_PASSWORD_KEY, &anchor, browser_engine_macos::Edge::Below, 320., false, &content);
+                    self.popover_actions = pop.actions;
+                }
+                None if self.engine.popover_shown() => self.engine.close_popover(),
+                None => {}
             }
             return;
         };
@@ -1622,7 +1590,6 @@ impl BrowserWindow {
             self.popover = None;
             return;
         }
-        let mut pop = crate::native::Pop::default();
         let (content, width) = match kind {
             Popover::History => (self.history_popover(&mut pop), crate::history::POPOVER_W),
             Popover::Bookmarks => (self.bookmarks_popover(&mut pop), crate::history::POPOVER_W),
@@ -1635,8 +1602,49 @@ impl BrowserWindow {
             Popover::Downloads => LogicalRect { x: 8., y: f64::from(window.viewport_size().height) - 40., width: 28., height: 28. },
             _ => LogicalRect { x: f64::from(window.viewport_size().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) },
         });
-        self.engine.present_popover(kind as u64, &anchor, edge, width, &content);
+        self.engine.present_popover(kind as u64, &anchor, edge, width, true, &content);
         self.popover_actions = pop.actions;
+    }
+
+    /// Shows the topmost open dialog as a native sheet, or updates it; closes the sheet once none is open.
+    fn sync_sheet(&mut self, cx: &mut Context<Self>) {
+        let mut pop = crate::native::Pop::sheet();
+        // Checked top down, in the order the dialogs used to stack.
+        let page = self.dialog_sheet(&mut pop).or_else(|| self.permission_sheet(&mut pop));
+        let open = if let Some((key, content)) = page {
+            Some((key, 400., content))
+        } else if let Some(edit) = self.passwords.edit.clone() {
+            Some((format!("login:{edit:?}"), 420., self.login_sheet(&mut pop)))
+        } else if let Some((id, _)) = self.bookmark_edit.clone() {
+            Some((format!("bookmark:{id:?}"), 400., self.bookmark_sheet(&mut pop)))
+        } else if let Some(id) = self.ext_logs.clone() {
+            Some((format!("logs:{id}"), 640., self.logs_sheet(&id, &mut pop)))
+        } else if self.history_modal {
+            Some(("history".into(), 560., self.history_sheet(&mut pop)))
+        } else if !self.pending_links.is_empty() {
+            Some(("links".into(), 380., self.link_sheet(&mut pop, cx)))
+        } else if let Some(id) = self.delete_prompt.clone() {
+            Some((format!("delete:{id}"), 380., self.delete_sheet(&id, &mut pop)))
+        } else if self.new_profile.is_some() {
+            Some(("profile".into(), 440., self.profile_sheet(&mut pop, cx)))
+        } else {
+            None
+        };
+        match open {
+            Some((key, width, content)) => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                self.engine.present_sheet(hasher.finish(), width, &content);
+                self.sheet_actions = pop.actions;
+            }
+            None => self.engine.close_sheet(),
+        }
+    }
+
+    /// What is typed in native field `field`.
+    pub(crate) fn typed(&self, field: u32) -> String {
+        self.popover_texts.get(&field).cloned().unwrap_or_default()
     }
 
     /// Records where `popover`'s button is drawn; goes inside the button.
@@ -2112,27 +2120,6 @@ impl BrowserWindow {
         window.defer(cx, move |window, cx| window.focus(&find.focus_handle(cx), cx));
     }
 
-    fn request_dialog_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.focus_dialog) {
-            return;
-        }
-        let Some(dialog) = self.dialogs.first() else {
-            return;
-        };
-        let handle = if dialog.kind == DialogKind::Prompt { self.dialog_input.focus_handle(cx) } else { self.dialog_focus.clone() };
-        self.engine.focus_chrome();
-        window.defer(cx, move |window, cx| window.focus(&handle, cx));
-    }
-
-    fn request_history_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.focus_history) {
-            return;
-        }
-        let query = self.history_query.clone();
-        self.engine.focus_chrome();
-        window.defer(cx, move |window, cx| window.focus(&query.focus_handle(cx), cx));
-    }
-
     /// Follows GPUI's focus on the address input. The input's own Focus/Blur events fire only while it is drawn,
     /// so they went stale once the field collapsed to a pill, and a stale Blur closed the next edit as it opened.
     fn sync_address_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2275,12 +2262,11 @@ impl Render for BrowserWindow {
         self.slots.clear();
         self.apply_theme(window, cx);
         self.sync_popover(window);
+        self.sync_sheet(cx);
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
         self.request_palette_focus(window, cx);
-        self.request_history_focus(window, cx);
         self.request_find_focus(window, cx);
-        self.request_dialog_focus(window, cx);
         self.request_terminal_focus(window, cx);
         self.build_font_picker(window, cx);
         let _subscriptions = &self.subscriptions;
@@ -2416,18 +2402,8 @@ impl Render for BrowserWindow {
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
-            .child(self.permission_prompt(cx))
-            .child(self.dialog_card(cx))
-            .child(self.save_password_prompt(cx))
             .when(self.palette_open, |root| root.child(self.palette_view(cx)))
             .when(self.settings_open, |root| root.child(self.settings_modal(cx)))
-            .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
-            .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
-            .when(!self.pending_links.is_empty(), |root| root.child(self.link_profile_modal(cx)))
-            .when(self.history_modal, |root| root.child(self.history_modal(cx)))
-            .when_some(self.ext_logs.clone(), |root, id| root.child(self.ext_logs_modal(&id, cx)))
-            .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
-            .when(self.passwords.edit.is_some(), |root| root.child(self.login_editor(cx)))
     }
 }
 
@@ -5476,50 +5452,32 @@ impl BrowserWindow {
     }
 
     /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
-    fn permission_prompt(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let Some((request, origin, kind)) = self.permission.clone() else {
-            return div();
-        };
-        let paint = paint(cx);
+    /// A page asking for the camera or microphone.
+    fn permission_sheet(&self, pop: &mut crate::native::Pop) -> Option<(String, crate::native::Node)> {
+        use crate::native::{button, sheet, Key, Style};
+        let (request, origin, kind) = self.permission.clone()?;
         let what = match kind.as_str() {
             "microphone" => "your microphone",
             "camera-microphone" => "your camera and microphone",
             _ => "your camera",
         };
         let host = origin.split("://").nth(1).unwrap_or(&origin).to_string();
-        let answer = move |allow: bool| {
+        let mut answer = |allow: bool| {
             let (origin, kind) = (origin.clone(), kind.clone());
-            move |this: &mut Self, cx: &mut Context<Self>| {
+            pop.act(move |this, _| {
                 let _ = this.model.lock().set_permission(&origin, &kind, if allow { "allow" } else { "deny" });
                 this.sync_permissions();
                 this.engine.answer_permission(request, allow);
                 this.permission = None;
-                cx.notify();
-            }
+            })
         };
-        div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
-            v_stack()
-                .relative()
-                .w(px(340.))
-                .p(px(14.))
-                .gap(px(10.))
-                .rounded(px(10.))
-                .bg(paint.surface)
-                .border_1()
-                .border_color(paint.border)
-                .shadow_md()
-                .text_size(paint.text(13.))
-                .occlude()
-                .child(measure_overlay(10., cx))
-                .child(format!("{host} wants to use {what}."))
-                .child(
-                    h_stack()
-                        .gap(px(8.))
-                        .justify_end()
-                        .child(action_button("deny-permission", "Don't Allow", Kind::Secondary, true, cx, answer(false)))
-                        .child(action_button("allow-permission", "Allow", Kind::Primary, true, cx, answer(true))),
-                ),
-        )
+        let (deny, allow) = (answer(false), answer(true));
+        let content = sheet(
+            format!("{host} wants to use {what}."),
+            Vec::new(),
+            vec![button("Don't Allow", deny, Style::Plain, Key::Escape), button("Allow", allow, Style::Primary, Key::Return)],
+        );
+        Some((format!("permission:{request}"), content))
     }
 
     /// Brings the first waiting dialog's page to the front, with the prompt's preset text and the keys.
@@ -5528,9 +5486,8 @@ impl BrowserWindow {
             return;
         };
         let (tab_id, default) = (dialog.tab_id.clone(), dialog.default.clone());
-        self.dialog_input.update(cx, |input, cx| input.set_content_silent(default, cx));
+        self.popover_texts.insert(crate::native::DIALOG_INPUT, default);
         self.focus_window(&tab_id, cx);
-        self.focus_dialog = true;
     }
 
     /// Answers dialog `request` if it is the one showing: a key and a click can both land on the same one.
@@ -5539,7 +5496,7 @@ impl BrowserWindow {
             return;
         }
         self.dialogs.remove(0);
-        let text = self.dialog_input.read(cx).content().to_string();
+        let text = self.typed(crate::native::DIALOG_INPUT);
         self.engine.answer_dialog(request, ok, &text);
         if self.dialogs.is_empty() {
             self.focus_active_content();
@@ -5550,11 +5507,10 @@ impl BrowserWindow {
     }
 
     /// The page dialog in front, floating at the top of the window while the page waits.
-    fn dialog_card(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let Some(dialog) = self.dialogs.first() else {
-            return div();
-        };
-        let paint = paint(cx);
+    /// The page dialog in front, while the page waits.
+    fn dialog_sheet(&self, pop: &mut crate::native::Pop) -> Option<(String, crate::native::Node)> {
+        use crate::native::{button, field, para, sheet, Key, Node, Style, DIALOG_INPUT};
+        let dialog = self.dialogs.first()?;
         let request = dialog.request;
         let host = dialog.origin.split("://").nth(1).filter(|host| !host.is_empty()).unwrap_or("This page");
         // Browsers stopped showing a page's own beforeunload text, since pages used it to scare people into staying.
@@ -5564,43 +5520,21 @@ impl BrowserWindow {
             DialogKind::Confirm | DialogKind::Prompt => (format!("{host} says"), dialog.message.clone(), Some("Cancel"), "OK"),
             DialogKind::OpenApp => (format!("Open \u{201c}{}\u{201d}?", dialog.message), format!("{host} wants to open this app."), Some("Cancel"), "Open"),
         };
-        let answer = move |ok: bool| move |this: &mut Self, cx: &mut Context<Self>| this.answer_dialog(request, ok, cx);
-        div().absolute().top(px(self.titlebar_h() + 10.)).left_0().right_0().flex().justify_center().child(
-            v_stack()
-                .relative()
-                .w(px(400.))
-                .p(px(14.))
-                .gap(px(10.))
-                .rounded(px(10.))
-                .bg(paint.surface)
-                .border_1()
-                .border_color(paint.border)
-                .shadow_md()
-                .text_size(paint.text(13.))
-                .occlude()
-                .track_focus(&self.dialog_focus)
-                // The prompt's input binds Enter and Escape to its own actions, which run before key-down listeners.
-                .capture_action(cx.listener(move |this, _: &bindings::Enter, _, cx| this.answer_dialog(request, true, cx)))
-                .capture_action(cx.listener(move |this, _: &bindings::Escape, _, cx| this.answer_dialog(request, false, cx)))
-                .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, _, cx| match event.keystroke.key.as_str() {
-                    "enter" => this.answer_dialog(request, true, cx),
-                    "escape" => this.answer_dialog(request, false, cx),
-                    _ => {}
-                }))
-                .child(measure_overlay(10., cx))
-                .child(div().font_weight(gpui::FontWeight::SEMIBOLD).child(title))
-                .when(!message.is_empty(), |card| card.child(div().id("dialog-message").max_h(px(320.)).overflow_y_scroll().child(message)))
-                .when(dialog.kind == DialogKind::Prompt, |card| {
-                    card.child(text_field(&self.dialog_input, cx).full_width(true))
-                })
-                .child(
-                    h_stack()
-                        .gap(px(8.))
-                        .justify_end()
-                        .children(cancel.map(|label| action_button("dialog-cancel", label, Kind::Secondary, true, cx, answer(false))))
-                        .child(action_button("dialog-ok", ok, Kind::Primary, true, cx, answer(true))),
-                ),
-        )
+        let confirm = pop.act(move |this, cx| this.answer_dialog(request, true, cx));
+        let mut body = Vec::new();
+        if !message.is_empty() {
+            body.push(Node::Scroll { max: 320., child: Box::new(para(message, 13., crate::native::Ink::Primary)) });
+        }
+        if dialog.kind == DialogKind::Prompt {
+            body.push(field(DIALOG_INPUT, dialog.default.clone(), "", confirm));
+        }
+        let mut buttons = Vec::new();
+        if let Some(label) = cancel {
+            buttons.push(button(label, pop.act(move |this, cx| this.answer_dialog(request, false, cx)), Style::Plain, Key::Escape));
+        }
+        // An alert has no Cancel, so Esc dismisses it like OK; otherwise Return is OK.
+        buttons.push(button(ok, confirm, Style::Primary, if cancel.is_some() { Key::Return } else { Key::Escape }));
+        Some((format!("dialog:{request}"), sheet(title, body, buttons)))
     }
 
     fn section_label(&self, label: &'static str, paint: Paint) -> gpui::Div {
@@ -5876,6 +5810,9 @@ fn magnet(frame: Frame, edges: Edges, others: &[Frame], sw: f32, sh: f32) -> Fra
     }
     out
 }
+
+/// The save-password offer's popover key, apart from `Popover`'s.
+const SAVE_PASSWORD_KEY: u64 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Popover {
@@ -6568,6 +6505,19 @@ impl Render for RailDragPreview {
 /// The profile's color, or the theme accent when it has none.
 pub(crate) fn profile_tint(profile: &browser_core::Profile, paint: Paint) -> gpui::Hsla {
     if profile.color.is_empty() { paint.accent } else { parse_hex(&profile.color) }
+}
+
+/// `profile_badge` for a native sheet.
+pub(crate) fn profile_badge_node(profile: &browser_core::Profile, active: bool, size: f64, paint: Paint) -> crate::native::Node {
+    use crate::native::{text, Ink, Node, Weight};
+    let [r, g, b] = crate::native::rgb(profile_tint(profile, paint));
+    let glyph = if profile.icon.ends_with(".svg") {
+        crate::native::asset(&profile.icon).map(|data| Node::Svg { data, size: size * 0.5, ink: Ink::Primary })
+    } else {
+        let mark = if profile.icon.is_empty() { rail_mark(&profile.name) } else { profile.icon.clone() };
+        Some(text(mark, size * 0.45, Weight::Medium, Ink::Primary))
+    };
+    Node::Swatch { size, fill: Some([r, g, b, if active { 0.3 } else { 0.12 }]), selected: active, action: None, child: glyph.map(Box::new) }
 }
 
 /// Profile icon (emoji, Radix icon, or initial) on a wash of its color; the active one gets a stronger wash and a ring.

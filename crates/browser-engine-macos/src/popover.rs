@@ -1,4 +1,4 @@
-//! Native popovers (`NSPopover`, Liquid Glass on macOS 26) that the UI describes as a `Node` tree.
+//! Native popovers (`NSPopover`) and sheets that the UI describes as a `Node` tree; on macOS 26 they get Liquid Glass.
 //! Controls report back to the window as `EngineEvent::Popover*` with the action ids the tree gave them.
 
 use std::cell::{Cell, RefCell};
@@ -9,18 +9,19 @@ use std::time::{Duration, Instant};
 use browser_engine::{EngineEvent, LogicalRect};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSControlStateValueOff, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSEvent, NSFont, NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSImage,
-    NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSLayoutAttribute, NSLayoutConstraintOrientation, NSLineBreakMode,
-    NSPopover, NSPopoverBehavior, NSPopoverDelegate, NSProgressIndicator, NSProgressIndicatorStyle, NSResponder,
-    NSScrollView, NSStackView, NSSwitch, NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions,
-    NSUserInterfaceLayoutOrientation, NSView, NSViewController,
+    NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
+    NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSFontWeightMedium, NSFontWeightRegular,
+    NSFontWeightSemibold, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSLayoutAttribute,
+    NSLayoutConstraintOrientation, NSLineBreakMode, NSPanel, NSPopover, NSPopoverBehavior, NSPopoverDelegate,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSResponder, NSScrollView, NSSecureTextField, NSStackView, NSSwitch,
+    NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation,
+    NSView, NSViewController, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSArray, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRectEdge, NSSize, NSString};
+use objc2_foundation::{NSArray, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString};
 
-/// One piece of a popover. Sizes are points; `action`s and `field`s are the UI's ids for its handlers.
+/// One piece of a popover or sheet. Sizes are points; `action`s and `field`s are the UI's ids for its handlers.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     /// Stacked top to bottom, each child full width, `gap` apart and inset by `pad` (horizontal, vertical).
@@ -28,19 +29,21 @@ pub enum Node {
     /// Side by side and vertically centred; a `Spacer` takes the slack.
     Row { gap: f64, children: Vec<Node> },
     Spacer,
-    /// One line, truncated at the tail when `shrink` (before its neighbours); `wrap` instead wraps it at that width, centred.
-    Text { text: String, size: f64, weight: Weight, ink: Ink, wrap: Option<f64>, shrink: bool },
+    /// Text, truncated at the tail when `shrink` (before its neighbours) unless it wraps.
+    Text { text: String, size: f64, weight: Weight, ink: Ink, wrap: Wrap, shrink: bool },
     /// A file's image (a favicon), or a white letter on `rgb` when there is none or it doesn't load.
     Image { path: Option<PathBuf>, letter: String, rgb: [f64; 3], size: f64, radius: f64 },
     /// An SF Symbol.
     Glyph { name: &'static str, size: f64, ink: Ink },
-    Button { title: String, action: u32, primary: bool },
+    /// A monochrome SVG icon, tinted.
+    Svg { data: &'static [u8], size: f64, ink: Ink },
+    Button { title: String, action: u32, style: Style, key: Key },
     Link { title: String, action: u32 },
     /// A borderless SF Symbol button; `on` tints it with the accent.
     Tool { symbol: &'static str, tip: &'static str, action: u32, on: bool },
     Switch { on: bool, action: u32 },
-    /// A text field; edits arrive as `PopoverText`, Return runs `submit`. It starts empty: see `set_field`.
-    Field { field: u32, placeholder: String, submit: u32 },
+    /// A text field showing `value` when created; edits arrive as `PopoverText`, Return runs `submit`.
+    Field { field: u32, value: Initial, placeholder: String, submit: u32, secure: bool },
     Progress(f64),
     Separator,
     /// A list row `height` tall: highlights on hover when it has a `click`, and can drag `drag` out as a file.
@@ -51,8 +54,21 @@ pub enum Node {
     Faded(Box<Node>),
     /// A box with a tinted background and rounded corners around `child`.
     Card { tint: Ink, child: Box<Node> },
+    /// A `size` square with rounded corners, filled with `fill` (RGBA) and ringed when `selected`, `child` centred;
+    /// pressing it runs `action`. A colour or icon choice, or a profile badge.
+    Swatch { size: f64, fill: Option<[f64; 4]>, selected: bool, action: Option<u32>, child: Option<Box<Node>> },
     /// Scrolls `child` once it is taller than `max`.
     Scroll { max: f64, child: Box<Node> },
+}
+
+/// What a field shows when it is created. Later builds leave what was typed alone, so it never counts as a change.
+#[derive(Clone, Debug, Default)]
+pub struct Initial(pub String);
+
+impl PartialEq for Initial {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,6 +76,8 @@ pub enum Weight {
     Regular,
     Medium,
     Semibold,
+    /// The system monospaced font.
+    Mono,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,6 +89,32 @@ pub enum Ink {
     Danger,
 }
 
+/// How text takes the available width.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Wrap {
+    /// One line.
+    Line,
+    /// Wraps, ragged right.
+    Left,
+    /// Wraps, centred.
+    Center,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Style {
+    Plain,
+    Primary,
+    Danger,
+}
+
+/// The key that presses a button, as in any macOS dialog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Key {
+    None,
+    Return,
+    Escape,
+}
+
 /// Which side of the anchor the popover opens on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Edge {
@@ -78,8 +122,15 @@ pub enum Edge {
     Right,
 }
 
-struct Shown {
-    popover: Retained<NSPopover>,
+enum Host {
+    Popover(Retained<NSPopover>),
+    /// The sheet, and the window it hangs from.
+    Sheet(Retained<NSPanel>, Retained<NSWindow>),
+}
+
+/// A popover or sheet on screen.
+struct Surface {
+    host: Host,
     window_no: isize,
     key: u64,
     width: f64,
@@ -91,7 +142,8 @@ struct Shown {
 }
 
 thread_local! {
-    static SHOWN: RefCell<Option<Shown>> = const { RefCell::new(None) };
+    static POPOVER: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static SHEET: RefCell<Option<Surface>> = const { RefCell::new(None) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -100,41 +152,66 @@ thread_local! {
     };
 }
 
-/// Shows `content` anchored to `anchor` (window coordinates, top-left origin) in `content_view`, or updates the
-/// popover already showing under `key` in place.
-pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor: &LogicalRect, edge: Edge, width: f64, content: &Node) {
+/// Rebuilds `surface` with `content` when it changed, keeping its fields and the one being typed in.
+/// Returns false when `surface` shows something else (another key or window) and must be replaced.
+fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, window_no: isize, key: u64, content: &Node) -> bool {
     let mtm = MainThreadMarker::new().expect("popovers live on the main thread");
-    let same = SHOWN.with_borrow(|shown| shown.as_ref().map(|shown| (shown.key == key && shown.window_no == window_no, shown.content == *content)));
-    match same {
-        Some((true, true)) => return,
-        Some((true, false)) => {
-            SHOWN.with_borrow_mut(|shown| {
-                if let Some(shown) = shown {
-                    let editing = shown.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
-                    let view = root(mtm, content, shown.width, &mut shown.submits, &mut shown.fields);
-                    shown.popover.setContentSize(view.fittingSize());
-                    if let Some(controller) = shown.popover.contentViewController() {
-                        controller.setView(&view);
-                    }
-                    shown.content = content.clone();
-                    if let Some(field) = editing.and_then(|id| shown.fields.get(&id)) {
-                        if let Some(window) = field.window() {
-                            window.makeFirstResponder(Some(field));
-                        }
-                    }
-                }
-            });
-            return;
+    slot.with_borrow_mut(|surface| {
+        let Some(surface) = surface.as_mut().filter(|surface| surface.key == key && surface.window_no == window_no) else {
+            return false;
+        };
+        if surface.content == *content {
+            return true;
         }
-        Some((false, _)) => close(),
-        None => {}
+        let editing = surface.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
+        let (view, _) = root(mtm, content, surface.width, &mut surface.submits, &mut surface.fields);
+        let size = view.fittingSize();
+        match &surface.host {
+            Host::Popover(popover) => {
+                popover.setContentSize(size);
+                if let Some(controller) = popover.contentViewController() {
+                    controller.setView(&view);
+                }
+            }
+            Host::Sheet(panel, _) => {
+                panel.setContentView(Some(&view));
+                panel.setContentSize(size);
+            }
+        }
+        surface.content = content.clone();
+        if let Some(field) = editing.and_then(|id| surface.fields.get(&id)) {
+            focus(field);
+        }
+        true
+    })
+}
+
+/// Puts the caret at the end of `field`, rather than selecting all of it as AppKit does.
+fn focus(field: &NSTextField) {
+    if let Some(window) = field.window() {
+        window.makeFirstResponder(Some(field));
     }
+    if let Some(editor) = field.currentEditor() {
+        editor.setSelectedRange(NSRange::new(field.stringValue().length(), 0));
+    }
+}
+
+/// Shows `content` anchored to `anchor` (window coordinates, top-left origin) in `content_view`, or updates the
+/// popover already showing under `key` in place. A `transient` one closes on any press outside it; otherwise
+/// it stays until `close`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor: &LogicalRect, edge: Edge, width: f64, transient: bool, content: &Node) {
+    if refresh(&POPOVER, window_no, key, content) {
+        return;
+    }
+    close();
+    let mtm = MainThreadMarker::new().expect("popovers live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let view = root(mtm, content, width, &mut submits, &mut fields);
+    let (view, _) = root(mtm, content, width, &mut submits, &mut fields);
     let controller = NSViewController::new(mtm);
     controller.setView(&view);
     let popover = NSPopover::new(mtm);
-    popover.setBehavior(NSPopoverBehavior::Transient);
+    popover.setBehavior(if transient { NSPopoverBehavior::Transient } else { NSPopoverBehavior::ApplicationDefined });
     popover.setAnimates(true);
     popover.setContentViewController(Some(&controller));
     popover.setContentSize(view.fittingSize());
@@ -149,19 +226,21 @@ pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor:
         (Edge::Below, false) => NSRectEdge::MinY,
     };
     popover.showRelativeToRect_ofView_preferredEdge(rect, content_view, side);
-    SHOWN.set(Some(Shown { popover, window_no, key, width, content: content.clone(), submits, fields }));
+    POPOVER.set(Some(Surface { host: Host::Popover(popover), window_no, key, width, content: content.clone(), submits, fields }));
 }
 
 pub(crate) fn close() {
-    // Taken first: closing calls the delegate, which looks at `SHOWN`.
-    if let Some(shown) = SHOWN.take() {
-        CLOSED.set(Some((shown.key, Instant::now())));
-        shown.popover.close();
+    // Taken first: closing calls the delegate, which looks at `POPOVER`.
+    if let Some(surface) = POPOVER.take() {
+        CLOSED.set(Some((surface.key, Instant::now())));
+        if let Host::Popover(popover) = surface.host {
+            popover.close();
+        }
     }
 }
 
 pub(crate) fn is_shown() -> bool {
-    SHOWN.with_borrow(|shown| shown.is_some())
+    POPOVER.with_borrow(|surface| surface.is_some())
 }
 
 /// Whether the popover under `key` closed a moment ago: the press that closed it may be on its own button.
@@ -169,16 +248,60 @@ pub(crate) fn just_closed(key: u64) -> bool {
     CLOSED.get().is_some_and(|(closed, at)| closed == key && at.elapsed() < Duration::from_millis(400))
 }
 
+/// Shows `content` as a sheet on `parent`, or updates the sheet already showing under `key` in place.
+pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width: f64, content: &Node) {
+    if refresh(&SHEET, window_no, key, content) {
+        return;
+    }
+    close_sheet();
+    let mtm = MainThreadMarker::new().expect("sheets live on the main thread");
+    let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
+    let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
+    let size = view.fittingSize();
+    let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+        NSPanel::alloc(mtm),
+        NSRect::new(NSPoint::ZERO, size),
+        NSWindowStyleMask::Titled,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    // Held by `SHEET`; AppKit releasing it on close as well would free it twice.
+    unsafe { panel.setReleasedWhenClosed(false) };
+    panel.setContentView(Some(&view));
+    panel.setContentSize(size);
+    if let Some(first) = &first {
+        panel.setInitialFirstResponder(Some(first));
+    }
+    parent.beginSheet_completionHandler(&panel, None);
+    SHEET.set(Some(Surface { host: Host::Sheet(panel, parent.retain()), window_no, key, width, content: content.clone(), submits, fields }));
+}
+
+pub(crate) fn close_sheet() {
+    if let Some(Surface { host: Host::Sheet(panel, parent), .. }) = SHEET.take() {
+        parent.endSheet(&panel);
+        panel.orderOut(None);
+    }
+}
+
+/// Replaces the text in field `field` of the open popover or sheet.
 pub(crate) fn set_field(field: u32, text: &str) {
-    SHOWN.with_borrow(|shown| {
-        if let Some(input) = shown.as_ref().and_then(|shown| shown.fields.get(&field)) {
-            input.setStringValue(&NSString::from_str(text));
-        }
-    });
+    for slot in [&SHEET, &POPOVER] {
+        slot.with_borrow(|surface| {
+            if let Some(input) = surface.as_ref().and_then(|surface| surface.fields.get(&field)) {
+                input.setStringValue(&NSString::from_str(text));
+            }
+        });
+    }
+}
+
+/// Field `field`'s Return action, in whichever surface has it.
+fn submit_action(field: u32) -> Option<u32> {
+    [&SHEET, &POPOVER].into_iter().find_map(|slot| slot.with_borrow(|surface| surface.as_ref().and_then(|surface| surface.submits.get(&field).copied())))
 }
 
 fn send(event: EngineEvent) {
-    if let Some(window_no) = SHOWN.with_borrow(|shown| shown.as_ref().map(|shown| shown.window_no)) {
+    let window_no = [&SHEET, &POPOVER].into_iter().find_map(|slot| slot.with_borrow(|surface| surface.as_ref().map(|surface| surface.window_no)));
+    if let Some(window_no) = window_no {
         crate::webkit::send_event(window_no, event);
     }
 }
@@ -195,15 +318,13 @@ define_class!(
         #[unsafe(method(popoverWillClose:))]
         fn popover_will_close(&self, notification: &NSNotification) {
             // A transient close (a press outside, Esc); `close()` already took its entry.
-            let ours = SHOWN.with_borrow(|shown| {
-                shown.as_ref().is_some_and(|shown| notification.object().is_some_and(|object| std::ptr::eq(&*object as *const _ as *const NSPopover, &*shown.popover)))
+            let ours = POPOVER.with_borrow(|surface| match surface.as_ref().map(|surface| &surface.host) {
+                Some(Host::Popover(popover)) => notification.object().is_some_and(|object| std::ptr::eq(&*object as *const _ as *const NSPopover, &**popover)),
+                _ => false,
             });
-            if ours {
-                let window_no = SHOWN.with_borrow(|shown| shown.as_ref().map(|shown| shown.window_no)).unwrap_or(0);
-                if let Some(shown) = SHOWN.take() {
-                    CLOSED.set(Some((shown.key, Instant::now())));
-                }
-                crate::webkit::send_event(window_no, EngineEvent::PopoverClosed);
+            if let Some(surface) = ours.then(|| POPOVER.take()).flatten() {
+                CLOSED.set(Some((surface.key, Instant::now())));
+                crate::webkit::send_event(surface.window_no, EngineEvent::PopoverClosed);
             }
         }
     }
@@ -224,7 +345,7 @@ define_class!(
         #[unsafe(method(submit:))]
         fn submit(&self, sender: &NSTextField) {
             let field = sender.tag() as u32;
-            if let Some(action) = SHOWN.with_borrow(|shown| shown.as_ref().and_then(|shown| shown.submits.get(&field).copied())) {
+            if let Some(action) = submit_action(field) {
                 send(EngineEvent::PopoverAction(action));
             }
         }
@@ -338,14 +459,21 @@ define_class!(
 );
 
 /// The popover's whole content view, `width` wide.
-fn root(mtm: MainThreadMarker, content: &Node, width: f64, submits: &mut HashMap<u32, u32>, fields: &mut HashMap<u32, Retained<NSTextField>>) -> Retained<NSView> {
+/// The whole content view, `width` wide, and its first text field.
+fn root(
+    mtm: MainThreadMarker,
+    content: &Node,
+    width: f64,
+    submits: &mut HashMap<u32, u32>,
+    fields: &mut HashMap<u32, Retained<NSTextField>>,
+) -> (Retained<NSView>, Option<Retained<NSTextField>>) {
     let mut kept = std::mem::take(fields);
     submits.clear();
-    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width };
+    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width, first: None };
     let view = build.node(content);
     view.widthAnchor().constraintEqualToConstant(width).setActive(true);
     view.layoutSubtreeIfNeeded();
-    view
+    (view, build.first)
 }
 
 struct Build<'a> {
@@ -356,8 +484,10 @@ struct Build<'a> {
     kept: &'a mut HashMap<u32, Retained<NSTextField>>,
     /// `Hover` views met since the innermost `Item` began.
     swaps: Vec<(Retained<NSView>, bool)>,
-    /// The width the node being built gets; a scroll view's document needs it before AppKit lays anything out.
+    /// The width the node being built gets; a scroll view's document and wrapping text need it before layout.
     width: f64,
+    /// The first text field built, which a sheet starts with focus in.
+    first: Option<Retained<NSTextField>>,
 }
 
 impl Build<'_> {
@@ -392,13 +522,16 @@ impl Build<'_> {
             Node::Text { text, size, weight, ink, wrap, shrink } => {
                 let text = NSString::from_str(text);
                 let label = match wrap {
-                    Some(width) => {
+                    Wrap::Left | Wrap::Center => {
                         let label = NSTextField::wrappingLabelWithString(&text, mtm);
-                        label.setPreferredMaxLayoutWidth(*width);
-                        label.setAlignment(NSTextAlignment::Center);
+                        label.setPreferredMaxLayoutWidth(self.width);
+                        label.setSelectable(false);
+                        if *wrap == Wrap::Center {
+                            label.setAlignment(NSTextAlignment::Center);
+                        }
                         label
                     }
-                    None => {
+                    Wrap::Line => {
                         let label = NSTextField::labelWithString(&text, mtm);
                         label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
                         label.setMaximumNumberOfLines(1);
@@ -443,13 +576,54 @@ impl Build<'_> {
                 view.setContentTintColor(Some(&color(*ink)));
                 Retained::into_super(Retained::into_super(view))
             }
-            Node::Button { title, action, primary } => {
+            Node::Button { title, action, style, key } => {
                 let button = TARGET.with(|target| unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(target), Some(sel!(act:)), mtm) });
                 button.setTag(*action as isize);
-                if *primary {
-                    button.setBezelColor(Some(&NSColor::controlAccentColor()));
+                match style {
+                    Style::Plain => {}
+                    Style::Primary => button.setBezelColor(Some(&NSColor::controlAccentColor())),
+                    Style::Danger => button.setBezelColor(Some(&NSColor::systemRedColor())),
+                }
+                match key {
+                    Key::None => {}
+                    Key::Return => button.setKeyEquivalent(&NSString::from_str("\r")),
+                    Key::Escape => button.setKeyEquivalent(&NSString::from_str("\u{1b}")),
                 }
                 Retained::into_super(Retained::into_super(button))
+            }
+            Node::Svg { data, size, ink } => {
+                let view = NSImageView::new(mtm);
+                if let Some(image) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(data)) {
+                    image.setTemplate(true);
+                    view.setImage(Some(&image));
+                }
+                view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                view.setContentTintColor(Some(&color(*ink)));
+                fixed(&view, *size, *size);
+                Retained::into_super(Retained::into_super(view))
+            }
+            Node::Swatch { size, fill, selected, action, child } => {
+                let item = NxPopoverItem::new(mtm, *action, None);
+                let tile = NSBox::new(mtm);
+                tile.setBoxType(NSBoxType::Custom);
+                tile.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+                tile.setCornerRadius(size * 0.27);
+                tile.setBorderWidth(if *selected { 2. } else { 0. });
+                tile.setBorderColor(&NSColor::labelColor());
+                let [r, g, b, a] = fill.unwrap_or([0., 0., 0., 0.]);
+                tile.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a));
+                tile.setContentViewMargins(NSSize::ZERO);
+                pin(&item, &tile, 0.);
+                if let Some(child) = child {
+                    let inner = self.node(child);
+                    if let Some(content) = tile.contentView() {
+                        content.addSubview(&inner);
+                        inner.centerXAnchor().constraintEqualToAnchor(&content.centerXAnchor()).setActive(true);
+                        inner.centerYAnchor().constraintEqualToAnchor(&content.centerYAnchor()).setActive(true);
+                    }
+                }
+                fixed(&item, *size, *size);
+                Retained::into_super(item)
             }
             Node::Link { title, action } => {
                 let button = TARGET.with(|target| unsafe { NSButton::buttonWithTitle_target_action(&NSString::from_str(title), Some(target), Some(sel!(act:)), mtm) });
@@ -480,9 +654,10 @@ impl Build<'_> {
                 });
                 Retained::into_super(Retained::into_super(switch))
             }
-            Node::Field { field, placeholder, submit } => {
+            Node::Field { field, value, placeholder, submit, secure } => {
                 let input = self.kept.remove(field).unwrap_or_else(|| {
-                    let input = NSTextField::textFieldWithString(&NSString::new(), mtm);
+                    let input = if *secure { Retained::into_super(NSSecureTextField::new(mtm)) } else { NSTextField::new(mtm) };
+                    input.setStringValue(&NSString::from_str(&value.0));
                     input.setTag(*field as isize);
                     TARGET.with(|target| unsafe {
                         input.setDelegate(Some(ProtocolObject::from_ref(&**target)));
@@ -494,6 +669,7 @@ impl Build<'_> {
                 input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
                 self.submits.insert(*field, *submit);
                 self.fields.insert(*field, input.clone());
+                self.first.get_or_insert_with(|| input.clone());
                 input.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
                 Retained::into_super(Retained::into_super(input))
             }
@@ -603,6 +779,7 @@ fn font(size: f64, weight: Weight) -> Retained<NSFont> {
             Weight::Regular => NSFontWeightRegular,
             Weight::Medium => NSFontWeightMedium,
             Weight::Semibold => NSFontWeightSemibold,
+            Weight::Mono => return NSFont::monospacedSystemFontOfSize_weight(size, NSFontWeightRegular),
         }
     };
     NSFont::systemFontOfSize_weight(size, weight)

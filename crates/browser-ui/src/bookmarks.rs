@@ -1,11 +1,7 @@
-use crate::history::POPOVER_W;
-use crate::native::{empty, header, title, Ink, Node, Pop, Weight};
-use crate::ui::{action_button, Kind};
-use crate::window::{paint, site_host, site_image, BrowserWindow};
+use crate::native::{button, empty, field, header, label, sheet, title, Ink, Key, Node, Pop, Style, Weight, BOOKMARK_TITLE, BOOKMARK_URL};
+use crate::window::{site_host, site_image, BrowserWindow};
 use browser_core::{normalize_url, Bookmark};
-use gpui::{div, prelude::*, px, Context, FontWeight};
-use gpuikit::elements::text_field::text_field;
-use gpuikit::layout::{h_stack, v_stack};
+use gpui::Context;
 
 const ROW_H: f32 = 30.;
 
@@ -14,7 +10,7 @@ impl BrowserWindow {
     pub(crate) fn bookmarks_popover(&self, pop: &mut Pop) -> Node {
         let bookmarks = self.model.lock().bookmarks().unwrap_or_default();
         let list = if bookmarks.is_empty() {
-            empty(None, "No bookmarks yet. Press ⌘D on a page.", POPOVER_W)
+            empty(None, "No bookmarks yet. Press ⌘D on a page.")
         } else {
             let rows = bookmarks.iter().map(|bookmark| bookmark_row(bookmark, pop)).collect();
             Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (6., 6.), children: rows }) }
@@ -25,8 +21,8 @@ impl BrowserWindow {
     /// `None` adds a new pinned site; otherwise edits that bookmark.
     pub(crate) fn open_bookmark_editor(&mut self, bookmark: Option<&Bookmark>, cx: &mut Context<Self>) {
         let (title, url) = bookmark.map(|b| (b.title.clone(), b.url.clone())).unwrap_or_default();
-        self.bookmark_title.update(cx, |input, cx| input.set_content_silent(title, cx));
-        self.bookmark_url.update(cx, |input, cx| input.set_content_silent(url, cx));
+        self.popover_texts.insert(BOOKMARK_TITLE, title);
+        self.popover_texts.insert(BOOKMARK_URL, url);
         self.bookmark_edit = Some(bookmark.map_or((None, true), |b| (Some(b.id.clone()), b.pinned)));
         cx.notify();
     }
@@ -35,11 +31,11 @@ impl BrowserWindow {
         let Some((id, pinned)) = self.bookmark_edit.clone() else {
             return;
         };
-        let raw = self.bookmark_url.read(cx).content().trim().to_string();
+        let raw = self.typed(BOOKMARK_URL).trim().to_string();
         if raw.is_empty() {
             return;
         }
-        let title = self.bookmark_title.read(cx).content().trim().to_string();
+        let title = self.typed(BOOKMARK_TITLE).trim().to_string();
         let url = {
             let model = self.model.lock();
             normalize_url(&raw, model.settings.search_template(), model.settings.https_only)
@@ -50,42 +46,36 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    pub(crate) fn bookmark_editor(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let paint = paint(cx);
+    pub(crate) fn bookmark_sheet(&self, pop: &mut Pop) -> Node {
         let id = self.bookmark_edit.clone().and_then(|(id, _)| id);
-        let label = |text: &'static str| div().text_size(paint.text(12.)).text_color(paint.muted).child(text);
-        let card = v_stack()
-            .w(px(400.))
-            .max_w_full()
-            .gap(px(8.))
-            .p(px(24.))
-            .child(div().pb(px(6.)).text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child(if id.is_some() { "Edit site" } else { "Pin a site" }))
-            .child(label("Name"))
-            .child(text_field(&self.bookmark_title, cx).placeholder("Name").full_width(true))
-            .child(label("Address"))
-            .child(text_field(&self.bookmark_url, cx).placeholder("example.com").full_width(true))
-            .child(
-                h_stack()
-                    .pt(px(16.))
-                    .gap(px(10.))
-                    .when_some(id, |row, id| {
-                        row.child(action_button("bookmark-delete", "Remove", Kind::Danger, true, cx, move |this, cx| {
-                            let _ = this.model.lock().delete_bookmark(&id);
-                            this.bookmark_edit = None;
-                            cx.notify();
-                        }))
-                    })
-                    .child(div().flex_1())
-                    .child(action_button("bookmark-cancel", "Cancel", Kind::Secondary, true, cx, |this, cx| {
-                        this.bookmark_edit = None;
-                        cx.notify();
-                    }))
-                    .child(action_button("bookmark-save", "Save", Kind::Primary, true, cx, |this, cx| this.save_bookmark_edit(cx))),
-            );
-        self.modal_shell("bookmark-editor", card, |this, cx| {
-            this.bookmark_edit = None;
-            cx.notify();
-        }, cx)
+        let save = pop.act(|this, cx| this.save_bookmark_edit(cx));
+        let cancel = pop.act(|this, _| this.bookmark_edit = None);
+        let mut buttons = Vec::new();
+        if let Some(id) = &id {
+            let id = id.clone();
+            buttons.push(button(
+                "Remove",
+                pop.act(move |this, _| {
+                    let _ = this.model.lock().delete_bookmark(&id);
+                    this.bookmark_edit = None;
+                }),
+                Style::Danger,
+                Key::None,
+            ));
+            buttons.push(Node::Spacer);
+        }
+        buttons.push(button("Cancel", cancel, Style::Plain, Key::Escape));
+        buttons.push(button("Save", save, Style::Primary, Key::Return));
+        sheet(
+            if id.is_some() { "Edit site" } else { "Pin a site" },
+            vec![
+                label("Name"),
+                field(BOOKMARK_TITLE, self.typed(BOOKMARK_TITLE), "Name", save),
+                label("Address"),
+                field(BOOKMARK_URL, self.typed(BOOKMARK_URL), "example.com", save),
+            ],
+            buttons,
+        )
     }
 }
 

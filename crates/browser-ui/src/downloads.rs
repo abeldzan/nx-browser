@@ -1,4 +1,3 @@
-use crate::history::POPOVER_W;
 use crate::native::{empty, header, text, title, Ink, Node, Pop, Weight};
 use crate::window::BrowserWindow;
 use std::path::Path;
@@ -65,7 +64,7 @@ impl BrowserWindow {
         });
         let actions = if empty_list { Vec::new() } else { vec![Node::Link { title: "Clear".into(), action: clear }] };
         let list = if empty_list {
-            empty(Some("arrow.down.circle"), "No downloads yet", POPOVER_W)
+            empty(Some("arrow.down.circle"), "No downloads yet")
         } else {
             Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: rows }) }
         };

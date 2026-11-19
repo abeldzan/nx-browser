@@ -989,9 +989,10 @@ impl MacEngine {
     }
 
     /// Shows a native popover of `content` by `anchor` (window coordinates), or updates the one open under `key`.
-    pub fn present_popover(&self, key: u64, anchor: &LogicalRect, edge: crate::Edge, width: f64, content: &crate::Node) {
+    /// A `transient` one closes on any press outside it.
+    pub fn present_popover(&self, key: u64, anchor: &LogicalRect, edge: crate::Edge, width: f64, transient: bool, content: &crate::Node) {
         if let Some(view) = &self.content {
-            crate::popover::present(self.window_no, view, key, anchor, edge, width, content);
+            crate::popover::present(self.window_no, view, key, anchor, edge, width, transient, content);
         }
     }
 
@@ -1008,7 +1009,18 @@ impl MacEngine {
         crate::popover::just_closed(key)
     }
 
-    /// Replaces the text in the open popover's field `field`.
+    /// Shows a native sheet of `content` on this window, or updates the one open under `key`.
+    pub fn present_sheet(&self, key: u64, width: f64, content: &crate::Node) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::present_sheet(self.window_no, &window, key, width, content);
+        }
+    }
+
+    pub fn close_sheet(&self) {
+        crate::popover::close_sheet();
+    }
+
+    /// Replaces the text in the open popover's or sheet's field `field`.
     pub fn set_popover_field(&self, field: u32, text: &str) {
         crate::popover::set_field(field, text);
     }

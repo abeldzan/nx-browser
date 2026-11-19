@@ -1,72 +1,22 @@
-use crate::native::{empty, header, section, text, title, Ink, Node, Pop, Weight};
-use crate::window::{paint, site_host, site_icon, site_image, BrowserWindow, Paint};
+use crate::native::{button, empty, field, header, section, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, HISTORY_QUERY};
+use crate::window::{site_host, site_image, BrowserWindow};
 use browser_core::{now_secs, HistoryEntry};
-use gpui::{div, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::elements::text_field::text_field;
-use gpuikit::icons::Icons;
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::traits::control_sized::ControlSized;
+use gpui::Context;
 
 const POPUP_LIMIT: usize = 12;
 /// Width of the native popovers.
 pub(crate) const POPOVER_W: f64 = 340.;
 const MODAL_LIMIT: usize = 200;
-/// Shared by the history and downloads popovers so their edges line up.
-pub(crate) const INSET: f32 = 12.;
-pub(crate) const HEADER_H: f32 = 36.;
 const ROW_H: f32 = 30.;
-const LABEL_H: f32 = 24.;
-
-/// Title on the left, actions on the right, one hairline under it.
-pub(crate) fn popover_header(title: impl Into<SharedString>, actions: gpui::Div, paint: Paint) -> gpui::Div {
-    h_stack()
-        .flex_none()
-        .w_full()
-        .h(px(HEADER_H))
-        .pl(px(INSET))
-        .pr(px(6.))
-        .items_center()
-        .justify_between()
-        .border_b_1()
-        .border_color(paint.border)
-        .child(div().text_size(paint.text(13.)).font_weight(FontWeight::SEMIBOLD).truncate().child(title.into()))
-        .child(actions.flex_none().items_center().gap(px(2.)))
-}
 
 impl BrowserWindow {
     /// Recent visits, dropped from the title bar's history button.
     pub(crate) fn history_popover(&self, pop: &mut Pop) -> Node {
         let entries = self.model.lock().search_history("", POPUP_LIMIT).unwrap_or_default();
         let list = if entries.is_empty() {
-            empty(None, "No history yet", POPOVER_W)
+            empty(None, "No history yet")
         } else {
-            let mut rows = Vec::new();
-            let mut last = String::new();
-            for entry in &entries {
-                let label = day_label(entry.visited_at, now_secs());
-                if label != last {
-                    rows.push(section(&label));
-                    last = label;
-                }
-                let url = entry.url.clone();
-                let host = site_host(&entry.url);
-                let name = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
-                rows.push(Node::Item {
-                    height: f64::from(ROW_H),
-                    click: Some(pop.act(move |this, cx| this.open_history_url(&url, cx))),
-                    drag: None,
-                    children: vec![
-                        site_image(&entry.url, 16.),
-                        title(name, 12.5, Weight::Regular, Ink::Primary),
-                        Node::Spacer,
-                        title(host, 11., Weight::Regular, Ink::Secondary),
-                        text(clock_label(entry.visited_at), 11., Weight::Regular, Ink::Secondary),
-                    ],
-                });
-            }
-            Node::Scroll { max: 340., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: rows }) }
+            Node::Scroll { max: 340., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: history_rows(&entries, pop) }) }
         };
         let all = pop.act(|this, cx| this.open_history_modal(cx));
         Node::Column {
@@ -83,43 +33,24 @@ impl BrowserWindow {
     }
 
     /// Full history with a live title and URL search.
-    pub(crate) fn history_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
-        let query = self.history_query.read(cx).content().to_string();
+    pub(crate) fn history_sheet(&self, pop: &mut Pop) -> Node {
+        let query = self.typed(HISTORY_QUERY);
         let entries = self.model.lock().search_history(&query, MODAL_LIMIT).unwrap_or_default();
-        let empty = if query.trim().is_empty() { "No history yet" } else { "No matches" };
-        let card = v_stack()
-            .w(px(560.))
-            .h(px(520.))
-            .max_w_full()
-            .max_h_full()
-            .child(popover_header(
-                "History",
-                h_stack().child(icon_button("history-modal-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.close_history_modal(cx);
-                }))),
-                paint,
-            ))
-            .child(
-                div().flex_none().w_full().px(px(INSET)).py(px(8.)).child(
-                    text_field(&self.history_query, cx).placeholder("Search history").full_width(true),
-                ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_hidden()
-                    .child(scroll_area("history-modal-list").vertical().full_height(true).child(self.history_groups(&entries, empty, cx))),
-            );
-        self.modal_shell("history-modal", card, Self::close_history_modal, cx)
+        let list = if entries.is_empty() {
+            empty(None, if query.trim().is_empty() { "No history yet" } else { "No matches" })
+        } else {
+            Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (0., 0.), children: history_rows(&entries, pop) }) }
+        };
+        let done = pop.act(|this, cx| this.close_history_modal(cx));
+        // Return in the search box opens nothing; the list is clicked.
+        let search = pop.act(|_, _| {});
+        sheet("History", vec![field(HISTORY_QUERY, "", "Search history", search), list], vec![button("Done", done, Style::Primary, Key::Escape)])
     }
 
     pub(crate) fn open_history_modal(&mut self, cx: &mut Context<Self>) {
-        self.history_query.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+        self.popover_texts.remove(&HISTORY_QUERY);
         self.popover = None;
         self.history_modal = true;
-        self.focus_history = true;
         cx.notify();
     }
 
@@ -128,57 +59,35 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn history_groups(&self, entries: &[HistoryEntry], empty: &'static str, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        if entries.is_empty() {
-            return div().w_full().h(px(56.)).flex().items_center().justify_center().text_size(paint.text(12.)).text_color(paint.muted).child(empty);
-        }
-        // Rows are inset by 6px so their hover fill sits inside the popover's edges, with text still on the 12px line.
-        let mut column = v_stack().w_full().px(px(6.)).pb(px(8.));
-        let mut last = String::new();
-        for entry in entries {
-            let label = day_label(entry.visited_at, now_secs());
-            if label != last {
-                column = column.child(
-                    div()
-                        .h(px(LABEL_H))
-                        .px(px(INSET - 6.))
-                        .flex()
-                        .items_end()
-                        .pb(px(4.))
-                        .text_size(paint.text(11.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(paint.muted)
-                        .child(label.clone()),
-                );
-                last = label;
-            }
-            column = column.child(self.history_row(entry, paint, cx));
-        }
-        column
-    }
+}
 
-    fn history_row(&self, entry: &HistoryEntry, paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
+/// History rows under day labels, each opening its page.
+fn history_rows(entries: &[HistoryEntry], pop: &mut Pop) -> Vec<Node> {
+    let mut rows = Vec::new();
+    let mut last = String::new();
+    for entry in entries {
+        let label = day_label(entry.visited_at, now_secs());
+        if label != last {
+            rows.push(section(&label));
+            last = label;
+        }
         let url = entry.url.clone();
         let host = site_host(&entry.url);
-        let title = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
-        h_stack()
-            .id(SharedString::from(format!("history-row-{}", entry.id)))
-            .w_full()
-            .h(px(ROW_H))
-            .gap(px(8.))
-            .px(px(INSET - 6.))
-            .rounded(px(6.))
-            .items_center()
-            .text_size(paint.text(12.5))
-            .cursor_pointer()
-            .hover(|style| style.bg(paint.secondary))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_history_url(&url, cx)))
-            .child(div().flex_none().child(site_icon(&entry.url, 16., false)))
-            .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-            .child(div().flex_none().max_w(px(110.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).child(host))
-            .child(h_stack().flex_none().w(px(52.)).justify_end().text_size(paint.text(11.)).text_color(paint.muted).child(clock_label(entry.visited_at)))
+        let name = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
+        rows.push(Node::Item {
+            height: f64::from(ROW_H),
+            click: Some(pop.act(move |this, cx| this.open_history_url(&url, cx))),
+            drag: None,
+            children: vec![
+                site_image(&entry.url, 16.),
+                title(name, 12.5, Weight::Regular, Ink::Primary),
+                Node::Spacer,
+                title(host, 11., Weight::Regular, Ink::Secondary),
+                text(clock_label(entry.visited_at), 11., Weight::Regular, Ink::Secondary),
+            ],
+        });
     }
+    rows
 }
 
 fn day_label(visited: i64, now: i64) -> String {

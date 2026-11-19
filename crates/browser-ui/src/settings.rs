@@ -1,4 +1,5 @@
-use crate::window::{paint, profile_badge, BrowserWindow, Paint};
+use crate::native::{button, field, para, sheet, text, Ink, Key, Node, Pop, Style, Weight, PROFILE_NAME};
+use crate::window::{profile_badge_node, paint, profile_badge, BrowserWindow, Paint};
 use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
 use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
 use crate::terminal::is_terminal;
@@ -146,7 +147,7 @@ impl BrowserWindow {
     }
 
     pub(crate) fn open_new_profile(&mut self, cx: &mut Context<Self>) {
-        self.new_profile_input.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+        self.popover_texts.remove(&PROFILE_NAME);
         self.new_profile = Some((String::new(), String::new()));
         cx.notify();
     }
@@ -155,7 +156,7 @@ impl BrowserWindow {
         let Some((icon, color)) = self.new_profile.take() else {
             return;
         };
-        let typed = self.new_profile_input.read(cx).content().trim().to_string();
+        let typed = self.typed(PROFILE_NAME).trim().to_string();
         let name = if typed.is_empty() {
             // First free number, so a deleted "Profile 2" doesn't make the next one a duplicate.
             let taken = self.model.lock().profiles.iter().map(|profile| profile.name.clone()).collect::<Vec<_>>();
@@ -176,10 +177,10 @@ impl BrowserWindow {
     }
 
     /// Name, icon and color for a profile before it is created.
-    pub(crate) fn new_profile_modal(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn profile_sheet(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
         let paint = paint(cx);
         let (icon, color) = self.new_profile.clone().unwrap_or_default();
-        let typed = self.new_profile_input.read(cx).content().trim().to_string();
+        let typed = self.typed(PROFILE_NAME).trim().to_string();
         let preview = browser_core::Profile {
             id: String::new(),
             name: if typed.is_empty() { "Profile".into() } else { typed },
@@ -189,44 +190,44 @@ impl BrowserWindow {
             icon: icon.clone(),
             color: color.clone(),
         };
-        let (icons, colors) = appearance_pickers("new", &preview.name, &icon, &color, |this, icon, color| {
-            this.new_profile = Some((icon, color));
-        }, paint, cx);
-        let card = v_stack()
-            .w(px(440.))
-            .max_w_full()
-            .gap(px(14.))
-            .p(px(24.))
-            .child(title("New profile", paint))
-            .child(div().text_color(paint.muted).child("Each profile keeps its own tabs, history, cookies and site data."))
-            .child(
-                h_stack()
-                    .gap(px(12.))
-                    .items_center()
-                    .child(profile_badge(&preview, false, 44., paint))
-                    .child(div().flex_1().child(text_field(&self.new_profile_input, cx).placeholder("Profile name").full_width(true))),
-            )
-            .child(heading("Icon", paint))
-            .child(icons)
-            .child(heading("Color", paint))
-            .child(colors)
-            .child(
-                h_stack()
-                    .pt(px(12.))
-                    .gap(px(10.))
-                    .justify_end()
-                    .child(action_button("new-profile-cancel", "Cancel", Kind::Secondary, true, cx, |this, cx| {
-                        this.new_profile = None;
-                        cx.notify();
-                    }))
-                    .child(action_button("new-profile-create", "Create profile", Kind::Primary, true, cx, |this, cx| {
-                        this.create_new_profile(cx);
-                    })),
-            );
-        self.modal_shell("new-profile-modal", card, |this, cx| {
-            this.new_profile = None;
-            cx.notify();
-        }, cx)
+        let create = pop.act(|this, cx| this.create_new_profile(cx));
+        let cancel = pop.act(|this, _| this.new_profile = None);
+        let mut icons = Vec::new();
+        for option in PROFILE_ICONS.into_iter().chain(PROFILE_SVG_ICONS) {
+            let glyph = if option.ends_with(".svg") {
+                crate::native::asset(option).map(|data| Node::Svg { data, size: 15., ink: Ink::Primary })
+            } else {
+                Some(text(if option.is_empty() { crate::window::rail_mark(&preview.name) } else { option.to_string() }, 15., Weight::Regular, Ink::Primary))
+            };
+            let color = color.clone();
+            let pick = pop.act(move |this, _| this.new_profile = Some((option.to_string(), color.clone())));
+            icons.push(Node::Swatch { size: 30., fill: Some(rgba(paint.secondary)), selected: icon == option, action: Some(pick), child: glyph.map(Box::new) });
+        }
+        let mut colors = Vec::new();
+        for option in PROFILE_COLORS {
+            let icon = icon.clone();
+            let pick = pop.act(move |this, _| this.new_profile = Some((icon.clone(), option.to_string())));
+            let fill = if option.is_empty() { paint.accent } else { parse_hex(option) };
+            colors.push(Node::Swatch { size: 30., fill: Some(rgba(fill)), selected: color == option, action: Some(pick), child: None });
+        }
+        // 11 to a row fills the 400pt of a 440pt sheet.
+        let rows = |swatches: Vec<Node>| -> Vec<Node> {
+            let mut swatches = swatches.into_iter().peekable();
+            let mut rows = Vec::new();
+            while swatches.peek().is_some() {
+                rows.push(Node::Row { gap: 6., children: swatches.by_ref().take(11).collect() });
+            }
+            rows
+        };
+        let mut body = vec![
+            para("Each profile keeps its own tabs, history, cookies and site data.", 13., Ink::Secondary),
+            Node::Row { gap: 12., children: vec![profile_badge_node(&preview, false, 44., paint), field(PROFILE_NAME, "", "Profile name", create)] },
+            text("Icon", 13., Weight::Semibold, Ink::Primary),
+        ];
+        body.extend(rows(icons));
+        body.push(text("Color", 13., Weight::Semibold, Ink::Primary));
+        body.extend(rows(colors));
+        sheet("New profile", body, vec![button("Cancel", cancel, Style::Plain, Key::Escape), button("Create profile", create, Style::Primary, Key::Return)])
     }
 
     pub(crate) fn delete_profile_now(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -244,39 +245,20 @@ impl BrowserWindow {
     }
 
     /// Confirmation for deleting a profile, stacked above everything else.
-    pub(crate) fn delete_modal(&self, id: &str, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let paint = paint(cx);
+    pub(crate) fn delete_sheet(&self, id: &str, pop: &mut Pop) -> Node {
         let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
         let id = id.to_string();
-        let card = v_stack()
-            .w(px(380.))
-            .max_w_full()
-            .gap(px(10.))
-            .p(px(24.))
-            .child(title(format!("Delete “{name}”?"), paint))
-            .child(div().text_color(paint.muted).child(
-                "Its tabs, sessions, history, bookmarks, cookies and site data will be removed. This can't be undone.",
-            ))
-            .child(
-                h_stack()
-                    .pt(px(12.))
-                    .gap(px(10.))
-                    .justify_end()
-                    .child(action_button("delete-cancel", "Cancel", Kind::Secondary, true, cx, |this, cx| {
-                        this.delete_prompt = None;
-                        cx.notify();
-                    }))
-                    .child(action_button("delete-confirm", "Delete profile", Kind::Danger, true, cx, move |this, cx| this.delete_profile_now(&id, cx),
-                    )),
-            );
-        self.modal_shell("delete-modal", card, |this, cx| {
-            this.delete_prompt = None;
-            cx.notify();
-        }, cx)
+        let cancel = pop.act(|this, _| this.delete_prompt = None);
+        let delete = pop.act(move |this, cx| this.delete_profile_now(&id, cx));
+        sheet(
+            format!("Delete “{name}”?"),
+            vec![para("Its tabs, sessions, history, bookmarks, cookies and site data will be removed. This can't be undone.", 13., Ink::Secondary)],
+            vec![button("Cancel", cancel, Style::Plain, Key::Escape), button("Delete profile", delete, Style::Danger, Key::Return)],
+        )
     }
 
     /// Which profile links from other apps open in.
-    pub(crate) fn link_profile_modal(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub(crate) fn link_sheet(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
         let paint = paint(cx);
         let (profiles, active) = {
             let model = self.model.lock();
@@ -286,40 +268,23 @@ impl BrowserWindow {
             1 => "Open link in".to_string(),
             n => format!("Open {n} links in"),
         };
-        let mut list = v_stack().gap(px(2.));
+        let mut body = vec![crate::native::title(self.pending_links.first().cloned().unwrap_or_default(), 13., Weight::Regular, Ink::Secondary)];
+        let mut rows = Vec::new();
         for profile in profiles {
             let id = profile.id.clone();
-            list = list.child(
-                h_stack()
-                    .id(SharedString::from(format!("link-profile-{id}")))
-                    .gap(px(10.))
-                    .items_center()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .rounded(px(7.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(paint.secondary))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        let urls = std::mem::take(&mut this.pending_links);
-                        this.open_links_in(&id, urls, cx);
-                    }))
-                    .child(profile_badge(&profile, profile.id == active, 28., paint))
-                    .child(div().flex_1().child(profile.name.clone()))
-                    .when(profile.id == active, |row| row.child(div().text_color(paint.muted).child("Active"))),
-            );
+            let open = pop.act(move |this, cx| {
+                let urls = std::mem::take(&mut this.pending_links);
+                this.open_links_in(&id, urls, cx);
+            });
+            let mut children = vec![profile_badge_node(&profile, profile.id == active, 28., paint), crate::native::title(profile.name.clone(), 13., Weight::Regular, Ink::Primary), Node::Spacer];
+            if profile.id == active {
+                children.push(text("Active", 13., Weight::Regular, Ink::Secondary));
+            }
+            rows.push(Node::Item { height: 40., click: Some(open), drag: None, children });
         }
-        let card = v_stack()
-            .w(px(380.))
-            .max_w_full()
-            .gap(px(10.))
-            .p(px(24.))
-            .child(title(heading, paint))
-            .child(div().text_color(paint.muted).truncate().child(self.pending_links.first().cloned().unwrap_or_default()))
-            .child(list);
-        self.modal_shell("link-profile-modal", card, |this, cx| {
-            this.pending_links.clear();
-            cx.notify();
-        }, cx)
+        body.push(Node::Column { gap: 2., pad: (0., 0.), children: rows });
+        let cancel = pop.act(|this, _| this.pending_links.clear());
+        sheet(heading, body, vec![button("Cancel", cancel, Style::Plain, Key::Escape)])
     }
 
     /// Dimmed backdrop + centred card. Reports the card's bounds so web pages under it are cut out.
@@ -1348,6 +1313,12 @@ fn font_field(picker: Option<gpui::Entity<gpuikit::elements::combobox::ComboboxS
         .left_0()
         .size_full(),
     )
+}
+
+/// A colour as RGBA for a native swatch.
+fn rgba(color: gpui::Hsla) -> [f64; 4] {
+    let [r, g, b] = crate::native::rgb(color);
+    [r, g, b, f64::from(color.a)]
 }
 
 pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
