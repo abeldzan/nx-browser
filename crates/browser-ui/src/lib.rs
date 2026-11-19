@@ -2,6 +2,7 @@ mod bookmarks;
 mod downloads;
 mod extensions;
 mod history;
+mod native;
 mod palette;
 mod passwords;
 mod settings;

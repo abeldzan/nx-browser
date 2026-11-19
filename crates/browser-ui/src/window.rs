@@ -59,7 +59,6 @@ pub struct BrowserWindow {
     close_window: bool,
     pub(crate) engine: MacEngine,
     /// Store URL or extension id typed in the extensions panel.
-    pub(crate) ext_input: Entity<InputState>,
     /// What each installed extension's manifest says, by id.
     pub(crate) ext_meta: HashMap<String, Manifest>,
     /// Permission requests from extensions: (prompt, extension id, what it asks for).
@@ -92,8 +91,12 @@ pub struct BrowserWindow {
     pub(crate) overlay_rects: Vec<(LogicalRect, f64)>,
     /// The open title-bar or rail popover; at most one at a time.
     pub(crate) popover: Option<Popover>,
-    /// The popover a press outside it just closed, and where; that press's click on its own button keeps it closed.
-    popover_dismissed: Option<(Popover, gpui::Point<Pixels>)>,
+    /// What each control in the open native popover runs, by its action id.
+    popover_actions: Vec<crate::settings::MenuAction>,
+    /// What is typed in the open popover's text fields, by field id.
+    pub(crate) popover_texts: HashMap<u32, String>,
+    /// Where each popover's button was last drawn, for the popover to point at.
+    pub(crate) popover_anchors: HashMap<Popover, gpui::Bounds<Pixels>>,
     pub(crate) history_modal: bool,
     /// The extension whose logs are open in a modal.
     pub(crate) ext_logs: Option<String>,
@@ -110,16 +113,8 @@ pub struct BrowserWindow {
     pub(crate) new_profile_input: Entity<InputState>,
     /// Live (received, total) bytes per download id, fed by the download threads.
     pub(crate) download_progress: HashMap<String, (u64, Option<u64>)>,
-    /// A finished download pressed in the downloads popover: (path, press position), until it moves far enough to drag.
-    pub(crate) download_drag: Option<(String, gpui::Point<Pixels>)>,
-    /// Right-click menu on a rail profile: (profile id, index, click position).
-    pub(crate) rail_menu: Option<(String, usize, gpui::Point<Pixels>)>,
-    /// Right-click menu on a tab pill: (tab id, click position).
-    pub(crate) tab_menu: Option<(String, gpui::Point<Pixels>)>,
-    /// Right-click menu on a terminal: (tab id, click position).
-    pub(crate) term_menu: Option<(String, gpui::Point<Pixels>)>,
-    /// The screenshot button's menu: (tab id, where it was clicked).
-    pub(crate) shot_menu: Option<(String, gpui::Point<Pixels>)>,
+    /// What each row of the native menu last shown runs, by index; `None` for separators.
+    pub(crate) menu_actions: Vec<Option<crate::settings::MenuAction>>,
     address_focused: bool,
     focus_address: bool,
     /// The active window shows the editable field (focus requested or held); otherwise a plain pill.
@@ -311,7 +306,6 @@ struct SelfTest {
 impl BrowserWindow {
     pub fn new(model: SharedModel, handoff: Option<Handoff>, self_test: bool, started: Instant, cx: &mut Context<Self>) -> Self {
         let (installs_tx, installs_rx) = mpsc::channel();
-        let ext_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
@@ -402,14 +396,6 @@ impl BrowserWindow {
                 // Keeps the badge preview in step with the typed name.
                 _ => cx.notify(),
             }),
-            cx.subscribe(&ext_input, |this, input, event, cx| match event {
-                InputStateEvent::Focus => this.engine.focus_chrome(),
-                InputStateEvent::Submit => {
-                    let raw = input.read(cx).content().to_string();
-                    this.install_from_input(&raw, cx);
-                }
-                _ => {}
-            }),
             cx.subscribe(&history_query, |this, _, event, cx| match event {
                 InputStateEvent::Focus => this.engine.focus_chrome(),
                 InputStateEvent::TextChanged => cx.notify(),
@@ -454,7 +440,6 @@ impl BrowserWindow {
             tab_window,
             close_window: false,
             engine: MacEngine::new(extensions),
-            ext_input,
             ext_meta: HashMap::new(),
             ext_prompts: Vec::new(),
             installing: Vec::new(),
@@ -476,12 +461,11 @@ impl BrowserWindow {
             settings_profile: None,
             delete_prompt: None,
             overlay_rects: Vec::new(),
-            rail_menu: None,
-            tab_menu: None,
-            term_menu: None,
-            shot_menu: None,
+            menu_actions: Vec::new(),
             popover: None,
-            popover_dismissed: None,
+            popover_actions: Vec::new(),
+            popover_texts: HashMap::new(),
+            popover_anchors: HashMap::new(),
             history_modal: false,
             ext_logs: None,
             pending_links: Vec::new(),
@@ -493,7 +477,6 @@ impl BrowserWindow {
             new_profile: None,
             new_profile_input,
             download_progress: HashMap::new(),
-            download_drag: None,
             address_focused: false,
             focus_address: false,
             address_in_page: false,
@@ -644,7 +627,6 @@ impl BrowserWindow {
             self.blur_address = true;
             cx.notify();
             self.close_palette(cx);
-            self.close_menus();
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
             if !already {
@@ -880,6 +862,31 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
+            EngineEvent::PopoverAction(action) => {
+                // Taken while it runs, as it gets `self` mutably.
+                let actions = std::mem::take(&mut self.popover_actions);
+                if let Some(run) = actions.get(action as usize) {
+                    run(self, cx);
+                    cx.notify();
+                }
+                self.popover_actions = actions;
+            }
+            EngineEvent::PopoverText { field, text } => {
+                self.popover_texts.insert(field, text);
+            }
+            EngineEvent::PopoverClosed => {
+                if !self.engine.popover_shown() {
+                    self.popover = None;
+                    self.popover_texts.clear();
+                    cx.notify();
+                }
+            }
+            EngineEvent::MenuPick(index) => {
+                if let Some(Some(run)) = std::mem::take(&mut self.menu_actions).get(index) {
+                    run(self, cx);
+                    cx.notify();
+                }
+            }
             // Torn-off windows share the main window's extensions but not its event channel; repaint their badges too.
             EngineEvent::ExtensionChanged { .. } => cx.refresh_windows(),
             EngineEvent::ExtensionPrompt { prompt, id, request } => {
@@ -1194,7 +1201,8 @@ impl BrowserWindow {
             cx.notify();
             return;
         };
-        self.ext_input.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+        self.popover_texts.remove(&crate::extensions::EXT_FIELD);
+        self.engine.set_popover_field(crate::extensions::EXT_FIELD, "");
         self.install_from_store(id);
         cx.notify();
     }
@@ -1594,19 +1602,47 @@ impl BrowserWindow {
     }
 
     /// A popover button: opens its popover, or closes it if open.
-    fn toggle_popover(&mut self, popover: Popover, event: &ClickEvent, cx: &mut Context<Self>) {
-        let press = match event {
-            ClickEvent::Mouse(click) => Some(click.down.position),
-            _ => None,
-        };
-        self.popover = toggled(self.popover, self.popover_dismissed.take(), popover, press);
+    fn toggle_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
+        // A press on its own button closed it a moment ago (popovers close on any press outside them): keep it closed.
+        let closing = self.popover == Some(popover) || self.engine.popover_just_closed(popover as u64);
+        self.popover = (!closing).then_some(popover);
         cx.notify();
     }
 
-    /// Closes the open popover on a press outside it.
-    pub(crate) fn dismiss_popover(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        self.popover_dismissed = self.popover.take().map(|kind| (kind, event.position));
-        cx.notify();
+    /// Shows the open popover natively, or updates it from the model; closes it once `popover` is `None`.
+    fn sync_popover(&mut self, window: &Window) {
+        let Some(kind) = self.popover else {
+            if self.engine.popover_shown() {
+                self.engine.close_popover();
+            }
+            return;
+        };
+        // It closed itself and the event saying so hasn't been handled yet: don't open it again.
+        if !self.engine.popover_shown() && self.engine.popover_just_closed(kind as u64) {
+            self.popover = None;
+            return;
+        }
+        let mut pop = crate::native::Pop::default();
+        let (content, width) = match kind {
+            Popover::History => (self.history_popover(&mut pop), crate::history::POPOVER_W),
+            Popover::Bookmarks => (self.bookmarks_popover(&mut pop), crate::history::POPOVER_W),
+            Popover::Downloads => (self.downloads_popover(&mut pop), crate::history::POPOVER_W),
+            Popover::Extensions => (self.extensions_popover(&mut pop), 400.),
+        };
+        let edge = if kind == Popover::Downloads { browser_engine_macos::Edge::Right } else { browser_engine_macos::Edge::Below };
+        // Opened from the keyboard before its button was drawn: under the title bar's right end, or by the rail.
+        let anchor = self.popover_anchors.get(&kind).map(|bounds| logical(*bounds)).unwrap_or_else(|| match kind {
+            Popover::Downloads => LogicalRect { x: 8., y: f64::from(window.viewport_size().height) - 40., width: 28., height: 28. },
+            _ => LogicalRect { x: f64::from(window.viewport_size().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) },
+        });
+        self.engine.present_popover(kind as u64, &anchor, edge, width, &content);
+        self.popover_actions = pop.actions;
+    }
+
+    /// Records where `popover`'s button is drawn; goes inside the button.
+    pub(crate) fn popover_anchor(&self, popover: Popover, cx: &mut Context<Self>) -> impl IntoElement {
+        let watch = cx.entity();
+        canvas(move |bounds, _, cx| watch.update(cx, |view, _| view.popover_anchors.insert(popover, bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full()
     }
 
     pub(crate) fn open_history_url(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -2238,6 +2274,7 @@ impl Render for BrowserWindow {
         // Only rows drawn this frame count as drop targets.
         self.slots.clear();
         self.apply_theme(window, cx);
+        self.sync_popover(window);
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
         self.request_palette_focus(window, cx);
@@ -2387,21 +2424,10 @@ impl Render for BrowserWindow {
             .when(self.new_profile.is_some(), |root| root.child(self.new_profile_modal(cx)))
             .when_some(self.delete_prompt.clone(), |root, id| root.child(self.delete_modal(&id, cx)))
             .when(!self.pending_links.is_empty(), |root| root.child(self.link_profile_modal(cx)))
-            .map(|root| match self.popover {
-                Some(Popover::Downloads) => root.child(self.downloads_popover(cx)),
-                Some(Popover::Extensions) => root.child(self.extensions_popover(cx)),
-                Some(Popover::History) => root.child(self.history_popover(cx)),
-                Some(Popover::Bookmarks) => root.child(self.bookmarks_popover(cx)),
-                None => root,
-            })
             .when(self.history_modal, |root| root.child(self.history_modal(cx)))
             .when_some(self.ext_logs.clone(), |root, id| root.child(self.ext_logs_modal(&id, cx)))
             .when(self.bookmark_edit.is_some(), |root| root.child(self.bookmark_editor(cx)))
             .when(self.passwords.edit.is_some(), |root| root.child(self.login_editor(cx)))
-            .when_some(self.rail_menu.clone(), |root, menu| root.child(self.rail_menu_view(menu, cx)))
-            .when_some(self.tab_menu.clone(), |root, menu| root.child(self.tab_menu_view(menu, cx)))
-            .when_some(self.term_menu.clone(), |root, menu| root.child(self.term_menu_view(menu, cx)))
-            .when_some(self.shot_menu.clone(), |root, menu| root.child(self.shot_menu_view(menu, cx)))
     }
 }
 
@@ -2594,11 +2620,7 @@ impl BrowserWindow {
                 .on_drop(cx.listener(|this, drag: &RailDrag, window, cx| this.drop_profile(&drag.0.id, window.mouse_position(), cx)));
             let badge = badge.on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.close_menus();
-                    this.rail_menu = Some((id.clone(), index, event.position));
-                    cx.notify();
-                }),
+                cx.listener(move |this, event: &MouseDownEvent, _, _| this.open_rail_menu(id.clone(), index, event.position)),
             );
             profile_list = profile_list.child(badge);
         }
@@ -2628,9 +2650,10 @@ impl BrowserWindow {
                     .child(
                         div()
                             .relative()
-                            .child(rail_button("downloads-list", Icons::download()).selected(self.popover == Some(Popover::Downloads)).on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                                this.toggle_popover(Popover::Downloads, event, cx);
+                            .child(rail_button("downloads-list", Icons::download()).selected(self.popover == Some(Popover::Downloads)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.toggle_popover(Popover::Downloads, cx);
                             })))
+                            .child(self.popover_anchor(Popover::Downloads, cx))
                             // web_downloads holds exactly the downloads still being written.
                             .when(!self.web_downloads.is_empty(), |button| {
                                 button.child(div().absolute().top(px(4.)).right(px(4.)).size(px(6.)).rounded_full().bg(paint.accent))
@@ -3640,11 +3663,7 @@ impl BrowserWindow {
                         // Only right clicks the program didn't take reach here; see TerminalView's handler.
                         .on_mouse_down(MouseButton::Right, {
                             let id = tab.id.clone();
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                this.close_menus();
-                                this.term_menu = Some((id.clone(), event.position));
-                                cx.notify();
-                            })
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| this.open_term_menu(id.clone(), event.position, cx))
                         })
                         .flex_1()
                         .min_h(px(0.))
@@ -3827,11 +3846,7 @@ impl BrowserWindow {
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener({
                         let id = id.clone();
-                        move |this, event: &MouseDownEvent, _, cx| {
-                            this.close_menus();
-                            this.tab_menu = Some((id.clone(), event.position));
-                            cx.notify();
-                        }
+                        move |this, event: &MouseDownEvent, _, _| this.open_tab_menu(id.clone(), event.position)
                     }))
                     .on_drag(TabDrag((*tab).clone()), {
                         let grab = self.tab_grab.clone();
@@ -4242,7 +4257,7 @@ impl BrowserWindow {
             .child(self.tool_button(format!("shot-{shot_id}"), Icons::camera(), false, cx, move |this, event, cx| {
                 this.focus_window(&shot_id, cx);
                 if let ClickEvent::Mouse(click) = event {
-                    this.shot_menu = Some((shot_id.clone(), click.down.position));
+                    this.open_shot_menu(shot_id.clone(), click.down.position);
                 }
             }))
             .child(div().w(px(1.)).h(px(16.)).mx(px(4.)).bg(paint(cx).border))
@@ -4498,25 +4513,31 @@ impl BrowserWindow {
                         cx.notify();
                     })))
                     .child(
-                        icon_button("history-toggle", Icons::file_text())
+                        div().relative().child(
+                            icon_button("history-toggle", Icons::file_text())
                             .box_size(rems(1.375))
                             .icon_size(rems(1.0))
                             .selected(self.popover == Some(Popover::History) || self.history_modal)
-                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::History, event, cx))),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_popover(Popover::History, cx))),
+                        ).child(self.popover_anchor(Popover::History, cx)),
                     )
                     .child(
-                        icon_button("bookmarks-toggle", Icons::bookmark())
+                        div().relative().child(
+                            icon_button("bookmarks-toggle", Icons::bookmark())
                             .box_size(rems(1.375))
                             .icon_size(rems(0.875))
                             .selected(self.popover == Some(Popover::Bookmarks))
-                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::Bookmarks, event, cx))),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_popover(Popover::Bookmarks, cx))),
+                        ).child(self.popover_anchor(Popover::Bookmarks, cx)),
                     )
                     .child(
-                        icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
+                        div().relative().child(
+                            icon_button("extensions-toggle", gpui::svg().path(crate::PUZZLE_ICON))
                             .box_size(rems(1.375))
                             .icon_size(rems(1.0))
                             .selected(self.popover == Some(Popover::Extensions))
-                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| this.toggle_popover(Popover::Extensions, event, cx))),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_popover(Popover::Extensions, cx))),
+                        ).child(self.popover_anchor(Popover::Extensions, cx)),
                     ),
             )
     }
@@ -5856,19 +5877,12 @@ fn magnet(frame: Frame, edges: Edges, others: &[Frame], sw: f32, sh: f32) -> Fra
     out
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Popover {
     Downloads,
     Extensions,
     History,
     Bookmarks,
-}
-
-/// What a click on `popover`'s button leaves open. Its press landed outside the popover and so
-/// already closed it (`dismissed` there); that click must not reopen it.
-fn toggled(open: Option<Popover>, dismissed: Option<(Popover, gpui::Point<Pixels>)>, popover: Popover, press: Option<gpui::Point<Pixels>>) -> Option<Popover> {
-    let just_closed = dismissed.is_some_and(|(kind, at)| kind == popover && Some(at) == press);
-    (open != Some(popover) && !just_closed).then_some(popover)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -6327,6 +6341,14 @@ pub(crate) fn site_icon(url: &str, size: f32, round: bool) -> gpui::AnyElement {
     }
 }
 
+/// `site_icon` for a native popover.
+pub(crate) fn site_image(url: &str, size: f64) -> crate::native::Node {
+    let (letter, host) = site_glyph(url);
+    let path = favicon_path(&host);
+    let path = (is_web(url) && path.exists()).then_some(path);
+    crate::native::Node::Image { path, letter, rgb: crate::native::rgb(site_color(&host)), size, radius: (size / 4.).max(4.) }
+}
+
 /// A white initial on a coloured square: the icon for a site without a favicon, or an agent without a logo.
 fn letter_tile(glyph: String, color: gpui::Hsla, size: f32, radius: f32) -> gpui::AnyElement {
     div()
@@ -6671,22 +6693,6 @@ mod tests {
         assert!(hit(248., 150.));
         // A maximized (non-resizable) window has no rim.
         assert!(grab_zones(&stack, &[]).is_empty());
-    }
-
-    #[test]
-    fn popover_button_toggles() {
-        use Popover::{Bookmarks, History};
-        let (here, there) = (Some(gpui::point(px(5.), px(5.))), Some(gpui::point(px(9.), px(5.))));
-        // Closed: opens.
-        assert_eq!(toggled(None, None, History, here), Some(History));
-        // Open: its press closed it, and the click keeps it closed.
-        assert_eq!(toggled(None, Some((History, here.unwrap())), History, here), None);
-        // Another popover's press closed it: this one opens.
-        assert_eq!(toggled(None, Some((History, here.unwrap())), Bookmarks, here), Some(Bookmarks));
-        // An older outside press doesn't block opening later.
-        assert_eq!(toggled(None, Some((History, there.unwrap())), History, here), Some(History));
-        // Keyboard: plain toggle.
-        assert_eq!(toggled(Some(History), None, History, None), None);
     }
 
     #[test]

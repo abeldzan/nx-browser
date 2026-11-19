@@ -78,6 +78,17 @@ pub enum EngineEvent {
         value: String,
     },
     Shortcut(Shortcut),
+    /// The item at this index in the last `show_menu` was picked.
+    MenuPick(usize),
+    /// A control in the open popover ran the action with this id.
+    PopoverAction(u32),
+    /// The text in the open popover's field `field` changed.
+    PopoverText {
+        field: u32,
+        text: String,
+    },
+    /// The popover closed on its own (a press outside it, or Esc).
+    PopoverClosed,
     /// An extension finished loading, failed, or changed its toolbar button (badge, icon).
     ExtensionChanged {
         id: String,

@@ -1,5 +1,5 @@
-use crate::settings::measure_overlay;
-use crate::window::{paint, site_host, site_icon, BrowserWindow, Paint};
+use crate::native::{empty, header, section, text, title, Ink, Node, Pop, Weight};
+use crate::window::{paint, site_host, site_icon, site_image, BrowserWindow, Paint};
 use browser_core::{now_secs, HistoryEntry};
 use gpui::{div, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
 use gpuikit::elements::icon_button::icon_button;
@@ -10,13 +10,14 @@ use gpuikit::layout::{h_stack, v_stack};
 use gpuikit::traits::control_sized::ControlSized;
 
 const POPUP_LIMIT: usize = 12;
+/// Width of the native popovers.
+pub(crate) const POPOVER_W: f64 = 340.;
 const MODAL_LIMIT: usize = 200;
 /// Shared by the history and downloads popovers so their edges line up.
 pub(crate) const INSET: f32 = 12.;
 pub(crate) const HEADER_H: f32 = 36.;
 const ROW_H: f32 = 30.;
 const LABEL_H: f32 = 24.;
-const FOOTER_H: f32 = 32.;
 
 /// Title on the left, actions on the right, one hairline under it.
 pub(crate) fn popover_header(title: impl Into<SharedString>, actions: gpui::Div, paint: Paint) -> gpui::Div {
@@ -34,70 +35,51 @@ pub(crate) fn popover_header(title: impl Into<SharedString>, actions: gpui::Div,
         .child(actions.flex_none().items_center().gap(px(2.)))
 }
 
-/// A small text action for popover headers and footers.
-pub(crate) fn text_action(id: &'static str, label: &'static str, paint: Paint) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .px(px(6.))
-        .py(px(2.))
-        .rounded(px(5.))
-        .text_size(paint.text(12.))
-        .text_color(paint.muted)
-        .cursor_pointer()
-        .hover(|style| style.bg(paint.secondary).text_color(paint.fg))
-        .child(label)
-}
-
 impl BrowserWindow {
     /// Recent visits, dropped from the title bar's history button.
-    pub(crate) fn history_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
+    pub(crate) fn history_popover(&self, pop: &mut Pop) -> Node {
         let entries = self.model.lock().search_history("", POPUP_LIMIT).unwrap_or_default();
-        let groups = group_entries(&entries).len() as f32;
-        let body = if entries.is_empty() { 56. } else { entries.len() as f32 * ROW_H + groups * LABEL_H + 8. };
-        let height = (HEADER_H + body + FOOTER_H + 2.).min(420.);
-        v_stack()
-            .id("history-popover")
-            .absolute()
-            .top(px(self.titlebar_h() + 6.))
-            .right(px(8.))
-            .w(px(340.))
-            .h(px(height))
-            .rounded(px(10.))
-            .overflow_hidden()
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
-            .child(measure_overlay(10., cx))
-            .child(popover_header(
-                "History",
-                h_stack().child(icon_button("history-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.popover = None;
-                    cx.notify();
-                }))),
-                paint,
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_hidden()
-                    .child(scroll_area("history-list").vertical().full_height(true).child(self.history_groups(&entries, "No history yet", cx))),
-            )
-            .child(
-                h_stack()
-                    .flex_none()
-                    .w_full()
-                    .h(px(FOOTER_H))
-                    .px(px(INSET - 6.))
-                    .items_center()
-                    .border_t_1()
-                    .border_color(paint.border)
-                    .child(text_action("history-view-all", "Show all history", paint).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.open_history_modal(cx)))),
-            )
+        let list = if entries.is_empty() {
+            empty(None, "No history yet", POPOVER_W)
+        } else {
+            let mut rows = Vec::new();
+            let mut last = String::new();
+            for entry in &entries {
+                let label = day_label(entry.visited_at, now_secs());
+                if label != last {
+                    rows.push(section(&label));
+                    last = label;
+                }
+                let url = entry.url.clone();
+                let host = site_host(&entry.url);
+                let name = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
+                rows.push(Node::Item {
+                    height: f64::from(ROW_H),
+                    click: Some(pop.act(move |this, cx| this.open_history_url(&url, cx))),
+                    drag: None,
+                    children: vec![
+                        site_image(&entry.url, 16.),
+                        title(name, 12.5, Weight::Regular, Ink::Primary),
+                        Node::Spacer,
+                        title(host, 11., Weight::Regular, Ink::Secondary),
+                        text(clock_label(entry.visited_at), 11., Weight::Regular, Ink::Secondary),
+                    ],
+                });
+            }
+            Node::Scroll { max: 340., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: rows }) }
+        };
+        let all = pop.act(|this, cx| this.open_history_modal(cx));
+        Node::Column {
+            gap: 0.,
+            pad: (0., 0.),
+            children: vec![
+                header("History", Vec::new()),
+                Node::Separator,
+                list,
+                Node::Separator,
+                Node::Column { gap: 0., pad: (8., 8.), children: vec![Node::Row { gap: 0., children: vec![Node::Link { title: "Show all history".into(), action: all }, Node::Spacer] }] },
+            ],
+        }
     }
 
     /// Full history with a live title and URL search.
@@ -197,20 +179,6 @@ impl BrowserWindow {
             .child(div().flex_none().max_w(px(110.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).child(host))
             .child(h_stack().flex_none().w(px(52.)).justify_end().text_size(paint.text(11.)).text_color(paint.muted).child(clock_label(entry.visited_at)))
     }
-}
-
-fn group_entries(entries: &[HistoryEntry]) -> Vec<&str> {
-    let mut labels = Vec::new();
-    let mut last = String::new();
-    let now = now_secs();
-    for entry in entries {
-        let label = day_label(entry.visited_at, now);
-        if label != last {
-            labels.push("day");
-            last = label;
-        }
-    }
-    labels
 }
 
 fn day_label(visited: i64, now: i64) -> String {

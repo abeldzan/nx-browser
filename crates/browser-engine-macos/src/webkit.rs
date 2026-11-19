@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -15,13 +15,13 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSResponder, NSView, NSWindowOrderingMode};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
-    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLProtectionSpace, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
+    NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSRunLoop, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLProtectionSpace, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
 };
 use objc2_web_kit::{
     WKContentWorld, WKFindConfiguration, WKMediaCaptureType, WKNavigation, WKNavigationAction,
@@ -954,6 +954,63 @@ impl MacEngine {
     pub fn set_muted(&mut self, tab_id: &str, mute: bool) {
         mute_tab(tab_id, self.tabs.get(tab_id).map(|live| &*live.view), mute);
         self.extensions.handle().changed(tab_id);
+    }
+
+    /// Pops up a native menu at `at`, in window coordinates (top-left origin): `None` is a separator,
+    /// `Some((title, enabled))` an item. A pick comes back as `EngineEvent::MenuPick` with its index in `items`.
+    pub fn show_menu(&self, items: &[Option<(&str, bool)>], at: (f64, f64)) {
+        let Some(content) = self.content.clone() else {
+            return;
+        };
+        let mtm = MainThreadMarker::new().expect("menus are shown on the main thread");
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
+        menu.setAutoenablesItems(false);
+        // The 13pt the chrome uses, not AppKit's larger default menu font.
+        unsafe { menu.setFont(Some(&NSFont::menuFontOfSize(13.0))) };
+        for (index, item) in items.iter().enumerate() {
+            let Some((title, enabled)) = item else {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                continue;
+            };
+            let entry = menu_item(mtm, title, sel!(pickContextItem:), "", false);
+            entry.setTag(index as isize);
+            entry.setEnabled(*enabled);
+            MENU_TARGET.with(|target| unsafe { entry.setTarget(Some(target)) });
+            menu.addItem(&entry);
+        }
+        let y = if content.isFlipped() { at.1 } else { content.bounds().size.height - at.1 };
+        let window_no = self.window_no;
+        // Off the run loop: a menu's tracking loop inside GPUI's event dispatch lets its timers re-enter and abort.
+        let show = RcBlock::new(move || {
+            CONTEXT_MENU_WINDOW.set(window_no);
+            menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(at.0, y), Some(&content));
+        });
+        unsafe { NSRunLoop::mainRunLoop().performBlock(&show) };
+    }
+
+    /// Shows a native popover of `content` by `anchor` (window coordinates), or updates the one open under `key`.
+    pub fn present_popover(&self, key: u64, anchor: &LogicalRect, edge: crate::Edge, width: f64, content: &crate::Node) {
+        if let Some(view) = &self.content {
+            crate::popover::present(self.window_no, view, key, anchor, edge, width, content);
+        }
+    }
+
+    pub fn close_popover(&self) {
+        crate::popover::close();
+    }
+
+    pub fn popover_shown(&self) -> bool {
+        crate::popover::is_shown()
+    }
+
+    /// Whether the popover under `key` just closed, so the click that closed it doesn't reopen it.
+    pub fn popover_just_closed(&self, key: u64) -> bool {
+        crate::popover::just_closed(key)
+    }
+
+    /// Replaces the text in the open popover's field `field`.
+    pub fn set_popover_field(&self, field: u32, text: &str) {
+        crate::popover::set_field(field, text);
     }
 
     /// Load progress in 0..=1 while the tab's page is loading.
@@ -2019,7 +2076,7 @@ struct WindowState {
 }
 
 /// Queues `event` for window `window_no`'s UI and wakes it.
-fn send_event(window_no: isize, event: EngineEvent) {
+pub(crate) fn send_event(window_no: isize, event: EngineEvent) {
     with_window(window_no, |state| {
         if let Some(events) = &state.events {
             let _ = events.send(event);
@@ -2396,10 +2453,20 @@ define_class!(
                 send_event(window_no, EngineEvent::Shortcut(binding.action));
             }
         }
+
+        /// A `show_menu` item, whose tag is its index there.
+        #[unsafe(method(pickContextItem:))]
+        fn pick_context_item(&self, item: &NSMenuItem) {
+            if let Ok(index) = usize::try_from(item.tag()) {
+                send_event(CONTEXT_MENU_WINDOW.get(), EngineEvent::MenuPick(index));
+            }
+        }
     }
 );
 
 thread_local! {
+    /// The window whose `show_menu` menu is up.
+    static CONTEXT_MENU_WINDOW: Cell<isize> = const { Cell::new(0) };
     /// Menu items hold their target weakly.
     static MENU_TARGET: Retained<NxShortcutMenuTarget> = {
         let this = NxShortcutMenuTarget::alloc(MainThreadMarker::new().expect("menus are built on the main thread")).set_ivars(());

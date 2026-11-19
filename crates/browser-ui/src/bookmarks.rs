@@ -1,125 +1,25 @@
-use crate::history::{popover_header, HEADER_H, INSET};
-use crate::settings::measure_overlay;
+use crate::history::POPOVER_W;
+use crate::native::{empty, header, title, Ink, Node, Pop, Weight};
 use crate::ui::{action_button, Kind};
-use crate::window::{paint, site_host, site_icon, BrowserWindow};
+use crate::window::{paint, site_host, site_image, BrowserWindow};
 use browser_core::{normalize_url, Bookmark};
-use gpui::{div, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::scroll_area::scroll_area;
+use gpui::{div, prelude::*, px, Context, FontWeight};
 use gpuikit::elements::text_field::text_field;
-use gpuikit::icons::Icons;
 use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::traits::control_sized::ControlSized;
 
 const ROW_H: f32 = 30.;
 
 impl BrowserWindow {
     /// Every bookmark, dropped from the title bar's bookmark button; hover a row to pin, edit or remove it.
-    pub(crate) fn bookmarks_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
+    pub(crate) fn bookmarks_popover(&self, pop: &mut Pop) -> Node {
         let bookmarks = self.model.lock().bookmarks().unwrap_or_default();
-        let body = if bookmarks.is_empty() { 56. } else { bookmarks.len() as f32 * ROW_H + 12. };
-        let mut list = v_stack().w_full().p(px(6.));
-        for bookmark in &bookmarks {
-            list = list.child(self.bookmark_row(bookmark, cx));
-        }
         let list = if bookmarks.is_empty() {
-            div()
-                .w_full()
-                .h(px(56.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(paint.text(12.))
-                .text_color(paint.muted)
-                .child("No bookmarks yet. Press ⌘D on a page.")
+            empty(None, "No bookmarks yet. Press ⌘D on a page.", POPOVER_W)
         } else {
-            list
+            let rows = bookmarks.iter().map(|bookmark| bookmark_row(bookmark, pop)).collect();
+            Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (6., 6.), children: rows }) }
         };
-        v_stack()
-            .id("bookmarks-popover")
-            .absolute()
-            .top(px(self.titlebar_h() + 6.))
-            .right(px(8.))
-            .w(px(340.))
-            .h(px((HEADER_H + body + 2.).min(420.)))
-            .rounded(px(10.))
-            .overflow_hidden()
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
-            .child(measure_overlay(10., cx))
-            .child(popover_header(
-                "Bookmarks",
-                h_stack().child(icon_button("bookmarks-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.popover = None;
-                    cx.notify();
-                }))),
-                paint,
-            ))
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(scroll_area("bookmarks-list").vertical().full_height(true).child(list)))
-    }
-
-    fn bookmark_row(&self, bookmark: &Bookmark, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
-        let group = SharedString::from(format!("bookmark-{}", bookmark.id));
-        let host = site_host(&bookmark.url);
-        let title = if bookmark.title.is_empty() { host.clone() } else { bookmark.title.clone() };
-        let open = bookmark.url.clone();
-        let (pin, edit, remove) = (bookmark.clone(), bookmark.clone(), bookmark.id.clone());
-        let pin_icon = if bookmark.pinned { Icons::drawing_pin_filled() } else { Icons::drawing_pin() };
-        h_stack()
-            .id(group.clone())
-            .group(group.clone())
-            .relative()
-            .w_full()
-            .h(px(ROW_H))
-            .gap(px(8.))
-            .px(px(INSET - 6.))
-            .rounded(px(6.))
-            .items_center()
-            .text_size(paint.text(12.5))
-            .cursor_pointer()
-            .hover(|style| style.bg(paint.secondary))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.popover = None;
-                this.open_history_url(&open, cx);
-            }))
-            .child(div().flex_none().child(site_icon(&bookmark.url, 16., false)))
-            .child(div().flex_1().min_w(px(0.)).truncate().child(title))
-            .child(div().flex_none().max_w(px(110.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).group_hover(group.clone(), |style| style.opacity(0.)).child(host))
-            // The actions take the host's place on hover.
-            .child(
-                h_stack()
-                    .absolute()
-                    .right(px(4.))
-                    .opacity(0.)
-                    .group_hover(group, |style| style.opacity(1.))
-                    .child(icon_button(SharedString::from(format!("bookmark-pin-{}", bookmark.id)), pin_icon).small().on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            let _ = this.model.lock().save_bookmark(Some(&pin.id), &pin.url, &pin.title, !pin.pinned);
-                            cx.notify();
-                        },
-                    )))
-                    .child(icon_button(SharedString::from(format!("bookmark-edit-{}", bookmark.id)), Icons::pencil_1()).small().on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.popover = None;
-                            this.open_bookmark_editor(Some(&edit), cx);
-                        },
-                    )))
-                    .child(icon_button(SharedString::from(format!("bookmark-remove-{}", bookmark.id)), Icons::cross_2()).small().on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            let _ = this.model.lock().delete_bookmark(&remove);
-                            cx.notify();
-                        },
-                    ))),
-            )
+        Node::Column { gap: 0., pad: (0., 0.), children: vec![header("Bookmarks", Vec::new()), Node::Separator, list] }
     }
 
     /// `None` adds a new pinned site; otherwise edits that bookmark.
@@ -186,5 +86,54 @@ impl BrowserWindow {
             this.bookmark_edit = None;
             cx.notify();
         }, cx)
+    }
+}
+
+fn bookmark_row(bookmark: &Bookmark, pop: &mut Pop) -> Node {
+    let host = site_host(&bookmark.url);
+    let name = if bookmark.title.is_empty() { host.clone() } else { bookmark.title.clone() };
+    let (open, pin, edit, remove) = (bookmark.url.clone(), bookmark.clone(), bookmark.clone(), bookmark.id.clone());
+    let actions = vec![
+        Node::Tool {
+            symbol: if bookmark.pinned { "pin.fill" } else { "pin" },
+            tip: if bookmark.pinned { "Unpin from Start Page" } else { "Pin to Start Page" },
+            action: pop.act(move |this, _| {
+                let _ = this.model.lock().save_bookmark(Some(&pin.id), &pin.url, &pin.title, !pin.pinned);
+            }),
+            on: bookmark.pinned,
+        },
+        Node::Tool {
+            symbol: "pencil",
+            tip: "Edit",
+            action: pop.act(move |this, cx| {
+                this.popover = None;
+                this.open_bookmark_editor(Some(&edit), cx);
+            }),
+            on: false,
+        },
+        Node::Tool {
+            symbol: "xmark",
+            tip: "Remove",
+            action: pop.act(move |this, _| {
+                let _ = this.model.lock().delete_bookmark(&remove);
+            }),
+            on: false,
+        },
+    ];
+    Node::Item {
+        height: f64::from(ROW_H),
+        click: Some(pop.act(move |this, cx| {
+            this.popover = None;
+            this.open_history_url(&open, cx);
+        })),
+        drag: None,
+        children: vec![
+            site_image(&bookmark.url, 16.),
+            title(name, 12.5, Weight::Regular, Ink::Primary),
+            Node::Spacer,
+            // The actions take the host's place on hover.
+            Node::Hover(false, Box::new(title(host, 11., Weight::Regular, Ink::Secondary))),
+            Node::Hover(true, Box::new(Node::Row { gap: 0., children: actions })),
+        ],
     }
 }

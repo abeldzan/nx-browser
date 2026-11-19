@@ -1,151 +1,161 @@
 use crate::history::{popover_header, INSET};
-use crate::settings::{measure_overlay, toggle};
+use crate::native::{rgb, text, title, Ink, Node, Pop, Weight};
+use crate::window::Popover;
 use crate::ui::{action_button, Kind};
-use crate::window::{paint, site_color, BrowserWindow, Paint};
+use crate::window::{paint, site_color, BrowserWindow};
 use browser_extensions::store_id;
 use gpui::{div, img, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::elements::text_field::text_field;
 use gpuikit::icons::Icons;
 use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::theme::{ActiveTheme, Themeable};
 use gpuikit::traits::control_sized::ControlSized;
+
+/// The install field in the extensions popover.
+pub(crate) const EXT_FIELD: u32 = 0;
 
 const STORE_URL: &str = "https://chromewebstore.google.com/category/extensions";
 
 impl BrowserWindow {
     /// Extension manager, dropped from the title bar's puzzle button.
-    pub(crate) fn extensions_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
+    pub(crate) fn extensions_popover(&self, pop: &mut Pop) -> Node {
         let extensions = self.model.lock().extensions.clone();
         let on = extensions.iter().filter(|extension| extension.enabled).count();
         let summary = match extensions.len() {
             0 => "Nothing installed".to_string(),
             total => format!("{total} installed · {on} on"),
         };
-        let mut list = v_stack().w_full().gap(px(2.));
-        for id in &self.installing {
-            list = list.child(
-                h_stack()
-                    .gap(px(12.))
-                    .px(px(10.))
-                    .py(px(8.))
-                    .items_center()
-                    .child(div().size(px(28.)).flex_none().rounded(px(7.)).bg(paint.secondary))
-                    .child(v_stack().gap(px(2.)).child("Installing…").child(div().text_size(paint.text(11.)).text_color(paint.muted).child(id.clone()))),
-            );
+        let mut children = vec![Node::Column {
+            gap: 2.,
+            pad: (16., 12.),
+            children: vec![text("Extensions", 15., Weight::Semibold, Ink::Primary), text(summary, 12., Weight::Regular, Ink::Secondary)],
+        }];
+        if let Some(id) = self.store_page_id() {
+            let add = pop.act(move |this, _| this.install_from_store(id.clone()));
+            children.push(Node::Column {
+                gap: 0.,
+                pad: (12., 0.),
+                children: vec![Node::Card {
+                    tint: Ink::Accent,
+                    child: Box::new(Node::Column {
+                        gap: 0.,
+                        pad: (10., 10.),
+                        children: vec![Node::Row {
+                            gap: 10.,
+                            children: vec![
+                                Node::Glyph { name: "puzzlepiece.extension", size: 14., ink: Ink::Accent },
+                                title("This page is a Chrome Web Store listing.", 12., Weight::Regular, Ink::Primary),
+                                Node::Spacer,
+                                Node::Button { title: "Add to NxBrowser".into(), action: add, primary: true },
+                            ],
+                        }],
+                    }),
+                }],
+            });
         }
-        if extensions.is_empty() && self.installing.is_empty() {
-            list = list.child(
-                v_stack()
-                    .items_center()
-                    .gap(px(6.))
-                    .py(px(28.))
-                    .px(px(24.))
-                    .child(gpui::svg().path(crate::PUZZLE_ICON).size(px(28.)).text_color(paint.muted))
-                    .child(div().mt(px(4.)).font_weight(FontWeight::MEDIUM).child("No extensions yet"))
-                    .child(div().text_size(paint.text(12.)).text_color(paint.muted).text_center().child("Add one from the Chrome Web Store, or load an unpacked folder.")),
-            );
+        for (prompt, id, request) in self.ext_prompts.clone() {
+            let name = extensions.iter().find(|extension| extension.id == id).map_or(id.clone(), |extension| extension.name.clone());
+            let icon = self.ext_meta.get(&id).and_then(|meta| meta.icon.clone());
+            let (deny, allow) = (pop.act(move |this, _| this.answer_prompt(prompt, false)), pop.act(move |this, _| this.answer_prompt(prompt, true)));
+            children.push(Node::Column {
+                gap: 0.,
+                pad: (12., 4.),
+                children: vec![Node::Card {
+                    tint: Ink::Secondary,
+                    child: Box::new(Node::Column {
+                        gap: 10.,
+                        pad: (12., 12.),
+                        children: vec![
+                            Node::Row { gap: 10., children: vec![extension_image(&name, icon, 20.), title(format!("{name} wants {request}"), 12., Weight::Regular, Ink::Primary)] },
+                            Node::Row {
+                                gap: 8.,
+                                children: vec![
+                                    Node::Spacer,
+                                    Node::Button { title: "Deny".into(), action: deny, primary: false },
+                                    Node::Button { title: "Allow".into(), action: allow, primary: true },
+                                ],
+                            },
+                        ],
+                    }),
+                }],
+            });
+        }
+        let mut rows = Vec::new();
+        for id in &self.installing {
+            rows.push(Node::Item {
+                height: 44.,
+                click: None,
+                drag: None,
+                children: vec![
+                    Node::Faded(Box::new(extension_image(id, None, 28.))),
+                    Node::Column { gap: 2., pad: (0., 0.), children: vec![text("Installing…", 13., Weight::Regular, Ink::Primary), title(id.clone(), 11., Weight::Regular, Ink::Secondary)] },
+                ],
+            });
         }
         for extension in &extensions {
-            list = list.child(self.extension_row(extension, paint, cx));
+            rows.push(self.extension_row(extension, pop));
         }
-        // The scroll area needs a definite height; size it to the rows, capped so long lists scroll.
-        let rows = extensions.len().max(1) + self.installing.len();
-        let extra = if self.store_page_id().is_some() { 60. } else { 0. } + self.ext_prompts.len() as f32 * 104.;
-        let empty = if extensions.is_empty() && self.installing.is_empty() { 120. } else { 0. };
-        let height = (172. + rows as f32 * 54. + extra + empty).min(600.);
-        v_stack()
-            .id("extensions-popover")
-            .absolute()
-            .top(px(self.titlebar_h() + 6.))
-            .right(px(8.))
-            .w(px(400.))
-            .h(px(height))
-            .rounded(px(12.))
-            .overflow_hidden()
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
-            .child(measure_overlay(12., cx))
-            .child(
-                h_stack()
-                    .w_full()
-                    .px(px(16.))
-                    .pt(px(14.))
-                    .pb(px(10.))
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        v_stack()
-                            .gap(px(2.))
-                            .child(div().text_size(paint.text(15.)).font_weight(FontWeight::SEMIBOLD).child("Extensions"))
-                            .child(div().text_size(paint.text(12.)).text_color(paint.muted).child(summary)),
-                    )
-                    .child(icon_button("extensions-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.popover = None;
-                        cx.notify();
-                    }))),
-            )
-            .when_some(self.store_page_id(), |popover, id| popover.child(self.store_banner(id, paint, cx)))
-            .children(self.ext_prompts.clone().into_iter().map(|prompt| self.prompt_row(prompt, &extensions, paint, cx)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_hidden()
-                    .px(px(6.))
-                    .pb(px(6.))
-                    .child(scroll_area("extensions-list").vertical().child(list)),
-            )
-            .child(
-                v_stack()
-                    .w_full()
-                    .gap(px(10.))
-                    .px(px(12.))
-                    .py(px(12.))
-                    .border_t_1()
-                    .border_color(paint.border)
-                    .child(
-                        h_stack()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(div().flex_1().child(text_field(&self.ext_input, cx).placeholder("Chrome Web Store link or extension ID").full_width(true)))
-                            .child(action_button("install-extension", "Install", Kind::Primary, true, cx, |this, cx| {
-                                let raw = this.ext_input.read(cx).content().to_string();
-                                this.install_from_input(&raw, cx);
-                            })),
-                    )
-                    .child(
-                        h_stack()
-                            .gap(px(16.))
-                            .items_center()
-                            .child(link("browse-store", "Browse the store", paint, cx, |this, cx| {
-                                this.popover = None;
-                                this.with_model(|model| { let _ = model.create_tab(STORE_URL); });
-                                cx.notify();
-                            }))
-                            .child(link("load-unpacked", "Load unpacked…", paint, cx, |this, cx| {
-                                this.load_unpacked(cx);
-                                cx.notify();
-                            }))
-                            .child(div().flex_1())
-                            .child(link("reload-extensions", "Reload all", paint, cx, |this, cx| {
-                                this.reload_extensions();
-                                this.status = "Extensions reloaded".into();
-                                cx.notify();
-                            })),
-                    ),
-            )
+        if rows.is_empty() {
+            children.push(Node::Column {
+                gap: 6.,
+                pad: (24., 20.),
+                children: vec![
+                    Node::Glyph { name: "puzzlepiece.extension", size: 26., ink: Ink::Secondary },
+                    Node::Text { text: "No extensions yet".into(), size: 13., weight: Weight::Medium, ink: Ink::Primary, wrap: Some(352.), shrink: false },
+                    Node::Text {
+                        text: "Add one from the Chrome Web Store, or load an unpacked folder.".into(),
+                        size: 12.,
+                        weight: Weight::Regular,
+                        ink: Ink::Secondary,
+                        wrap: Some(352.),
+                        shrink: false,
+                    },
+                ],
+            });
+        } else {
+            children.push(Node::Scroll { max: 360., child: Box::new(Node::Column { gap: 2., pad: (6., 0.), children: rows }) });
+        }
+        let install = pop.act(|this, cx| {
+            let raw = this.popover_texts.get(&EXT_FIELD).cloned().unwrap_or_default();
+            this.install_from_input(&raw, cx);
+        });
+        let browse = pop.act(|this, _| {
+            this.popover = None;
+            this.with_model(|model| { let _ = model.create_tab(STORE_URL); });
+        });
+        let unpacked = pop.act(|this, cx| this.load_unpacked(cx));
+        let reload = pop.act(|this, _| {
+            this.reload_extensions();
+            this.status = "Extensions reloaded".into();
+        });
+        children.push(Node::Separator);
+        children.push(Node::Column {
+            gap: 10.,
+            pad: (12., 12.),
+            children: vec![
+                Node::Row {
+                    gap: 8.,
+                    children: vec![
+                        Node::Field { field: EXT_FIELD, placeholder: "Chrome Web Store link or extension ID".into(), submit: install },
+                        Node::Button { title: "Install".into(), action: install, primary: true },
+                    ],
+                },
+                Node::Row {
+                    gap: 16.,
+                    children: vec![
+                        Node::Link { title: "Browse the store".into(), action: browse },
+                        Node::Link { title: "Load unpacked…".into(), action: unpacked },
+                        Node::Spacer,
+                        Node::Link { title: "Reload all".into(), action: reload },
+                    ],
+                },
+            ],
+        });
+        Node::Column { gap: 0., pad: (0., 0.), children }
     }
 
-    /// One installed extension: click to open it; pin, options, remove and on/off at the end.
-    fn extension_row(&self, extension: &browser_core::ExtensionRecord, paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
-        let danger = cx.theme().danger();
+    /// One installed extension: click to open it; pin, options, logs, remove and on/off at the end.
+    fn extension_row(&self, extension: &browser_core::ExtensionRecord, pop: &mut Pop) -> Node {
         let id = extension.id.clone();
         let (enabled, pinned) = (extension.enabled, extension.pinned);
         let meta = self.ext_meta.get(&id).cloned().unwrap_or_default();
@@ -159,107 +169,75 @@ impl BrowserWindow {
         // The manifest is current; the stored name can predate an update.
         let name = if meta.name.is_empty() { extension.name.clone() } else { meta.name.clone() };
         let detail = if meta.version.is_empty() { source.to_string() } else { format!("{} · {source}", meta.version) };
-        let hover = SharedString::from(format!("ext-row-{id}"));
-        h_stack()
-            .id(SharedString::from(format!("ext-{id}")))
-            .group(hover.clone())
-            .w_full()
-            .gap(px(12.))
-            .px(px(10.))
-            .py(px(8.))
-            .rounded(px(8.))
-            .items_center()
-            .when(enabled, |row| {
-                row.cursor_pointer().hover(|style| style.bg(paint.secondary)).on_click(cx.listener({
-                    let id = id.clone();
-                    move |this, event: &ClickEvent, _, cx| {
-                        this.popover = None;
-                        this.open_extension(&id, f32::from(event.position().x), cx);
-                    }
-                }))
-            })
-            .child(div().flex_none().when(!enabled, |icon| icon.opacity(0.4)).child(extension_icon(&name, meta.icon, 28.)))
-            .child(
-                v_stack()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(2.))
-                    .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(if enabled { paint.fg } else { paint.muted }).child(name.clone()))
-                    .child(match errors.first() {
-                        Some(first) => div()
-                            .truncate()
-                            .text_size(paint.text(11.))
-                            .text_color(danger)
-                            .child(if errors.len() > 1 { format!("{} issues · {first}", errors.len()) } else { first.clone() }),
-                        None => div().truncate().text_size(paint.text(11.)).text_color(paint.muted).child(detail),
-                    }),
-            )
-            .child(
-                h_stack()
-                    .flex_none()
-                    .gap(px(2.))
-                    .items_center()
-                    // Secondary actions stay out of the way until the row is hovered; a pinned pin always shows.
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(2.))
-                            .opacity(0.)
-                            .group_hover(hover.clone(), |style| style.opacity(1.))
-                            .when(has_options, |actions| {
-                                actions.child(icon_button(SharedString::from(format!("ext-options-{id}")), Icons::gear()).small().on_click(cx.listener({
-                                    let id = id.clone();
-                                    move |this, _: &ClickEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.popover = None;
-                                        this.open_extension_options(&id, cx);
-                                    }
-                                })))
-                            })
-                            .child(icon_button(SharedString::from(format!("ext-logs-{id}")), Icons::activity_log()).small().on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.popover = None;
-                                    this.ext_logs = Some(id.clone());
-                                    cx.notify();
-                                }
-                            })))
-                            .child(icon_button(SharedString::from(format!("ext-remove-{id}")), Icons::trash()).small().on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.remove_extension(&id);
-                                    cx.notify();
-                                }
-                            }))),
-                    )
-                    .when(enabled, |actions| {
-                        actions.child(
-                            div().when(!pinned, |pin| pin.opacity(0.).group_hover(hover.clone(), |style| style.opacity(1.))).child(
-                                icon_button(SharedString::from(format!("ext-pin-{id}")), if pinned { Icons::drawing_pin_filled() } else { Icons::drawing_pin() })
-                                    .small()
-                                    .selected(pinned)
-                                    .on_click(cx.listener({
-                                        let id = id.clone();
-                                        move |this, _: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            let _ = this.model.lock().set_extension_pinned(&id, !pinned);
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
-                        )
-                    })
-                    .child(div().ml(px(6.)).child(toggle(SharedString::from(format!("ext-toggle-{id}")), enabled, paint).on_click(cx.listener({
-                        move |this, _: &ClickEvent, _, cx| {
-                            cx.stop_propagation();
-                            let _ = this.model.lock().set_extension_enabled(&id, !enabled);
-                            this.sync_extension(&id);
-                            cx.notify();
-                        }
-                    })))),
-            )
+        let detail = match errors.first() {
+            Some(first) => title(if errors.len() > 1 { format!("{} issues · {first}", errors.len()) } else { first.clone() }, 11., Weight::Regular, Ink::Danger),
+            None => title(detail, 11., Weight::Regular, Ink::Secondary),
+        };
+        let icon = extension_image(&name, meta.icon, 28.);
+        // Secondary actions stay out of the way until the row is hovered; a pinned pin always shows.
+        let mut actions = Vec::new();
+        if has_options {
+            let id = id.clone();
+            actions.push(Node::Tool {
+                symbol: "gearshape",
+                tip: "Options",
+                action: pop.act(move |this, cx| {
+                    this.popover = None;
+                    this.open_extension_options(&id, cx);
+                }),
+                on: false,
+            });
+        }
+        let logs = id.clone();
+        actions.push(Node::Tool {
+            symbol: "list.bullet.rectangle",
+            tip: "Logs",
+            action: pop.act(move |this, _| {
+                this.popover = None;
+                this.ext_logs = Some(logs.clone());
+            }),
+            on: false,
+        });
+        let remove = id.clone();
+        actions.push(Node::Tool { symbol: "trash", tip: "Remove", action: pop.act(move |this, _| this.remove_extension(&remove)), on: false });
+        let mut children = vec![
+            if enabled { icon } else { Node::Faded(Box::new(icon)) },
+            Node::Column { gap: 2., pad: (0., 0.), children: vec![title(name, 13., Weight::Medium, if enabled { Ink::Primary } else { Ink::Secondary }), detail] },
+            Node::Hover(true, Box::new(Node::Row { gap: 0., children: actions })),
+        ];
+        if enabled {
+            let pin_id = id.clone();
+            let pin = Node::Tool {
+                symbol: if pinned { "pin.fill" } else { "pin" },
+                tip: if pinned { "Unpin from the title bar" } else { "Pin to the title bar" },
+                action: pop.act(move |this, _| {
+                    let _ = this.model.lock().set_extension_pinned(&pin_id, !pinned);
+                }),
+                on: pinned,
+            };
+            children.push(if pinned { pin } else { Node::Hover(true, Box::new(pin)) });
+        }
+        let toggle_id = id.clone();
+        children.push(Node::Switch {
+            on: enabled,
+            action: pop.act(move |this, _| {
+                let _ = this.model.lock().set_extension_enabled(&toggle_id, !enabled);
+                this.sync_extension(&toggle_id);
+            }),
+        });
+        let open = id.clone();
+        Node::Item {
+            height: 44.,
+            click: enabled.then(|| {
+                pop.act(move |this, cx| {
+                    this.popover = None;
+                    let at = this.popover_anchors.get(&Popover::Extensions).map_or(0., |bounds| f32::from(bounds.center().x));
+                    this.open_extension(&open, at, cx);
+                })
+            }),
+            drag: None,
+            children,
+        }
     }
 
     /// An extension's errors, one per line, with a button that copies them all.
@@ -301,58 +279,6 @@ impl BrowserWindow {
     fn close_ext_logs(&mut self, cx: &mut Context<Self>) {
         self.ext_logs = None;
         cx.notify();
-    }
-
-    fn store_banner(&self, id: String, paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
-        h_stack()
-            .mx(px(12.))
-            .mb(px(8.))
-            .p(px(10.))
-            .gap(px(10.))
-            .items_center()
-            .rounded(px(8.))
-            .bg(paint.accent.opacity(0.12))
-            .child(gpui::svg().path(crate::PUZZLE_ICON).size(px(16.)).flex_none().text_color(paint.accent))
-            .child(div().flex_1().text_size(paint.text(12.)).child("This page is a Chrome Web Store listing."))
-            .child(action_button("add-from-store", "Add to NxBrowser", Kind::Primary, true, cx, move |this, cx| {
-                this.install_from_store(id.clone());
-                cx.notify();
-            }))
-    }
-
-    fn prompt_row(&self, (prompt, id, request): (u64, String, String), extensions: &[browser_core::ExtensionRecord], paint: Paint, cx: &mut Context<Self>) -> impl IntoElement {
-        let extension = extensions.iter().find(|extension| extension.id == id);
-        let name = extension.map_or(id.clone(), |extension| extension.name.clone());
-        let icon = self.ext_meta.get(&id).and_then(|meta| meta.icon.clone());
-        v_stack()
-            .mx(px(12.))
-            .mb(px(8.))
-            .p(px(12.))
-            .gap(px(10.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(paint.border)
-            .bg(paint.secondary.opacity(0.5))
-            .child(
-                h_stack()
-                    .gap(px(10.))
-                    .items_center()
-                    .child(extension_icon(&name, icon, 20.))
-                    .child(div().flex_1().min_w(px(0.)).text_size(paint.text(12.)).child(format!("{name} wants {request}"))),
-            )
-            .child(
-                h_stack()
-                    .gap(px(8.))
-                    .justify_end()
-                    .child(action_button(SharedString::from(format!("prompt-deny-{prompt}")), "Deny", Kind::Secondary, true, cx, move |this, cx| {
-                        this.answer_prompt(prompt, false);
-                        cx.notify();
-                    }))
-                    .child(action_button(SharedString::from(format!("prompt-allow-{prompt}")), "Allow", Kind::Primary, true, cx, move |this, cx| {
-                        this.answer_prompt(prompt, true);
-                        cx.notify();
-                    })),
-            )
     }
 
     fn answer_prompt(&mut self, prompt: u64, allow: bool) {
@@ -435,22 +361,10 @@ impl BrowserWindow {
     }
 }
 
-/// Quiet text button for the popover footer.
-fn link(
-    id: &'static str,
-    label: &'static str,
-    paint: Paint,
-    cx: &mut Context<BrowserWindow>,
-    on_click: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .text_size(paint.text(12.))
-        .text_color(paint.muted)
-        .cursor_pointer()
-        .hover(|style| style.text_color(paint.fg))
-        .child(label)
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| on_click(this, cx)))
+/// `extension_icon` for a native popover.
+fn extension_image(name: &str, icon: Option<std::path::PathBuf>, size: f64) -> Node {
+    let letter = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+    Node::Image { path: icon, letter, rgb: rgb(site_color(name)), size, radius: size / 4. }
 }
 
 /// An extension's manifest icon, or a lettered tile when it has none.

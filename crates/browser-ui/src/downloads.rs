@@ -1,25 +1,15 @@
-use crate::settings::measure_overlay;
-use crate::window::{paint, BrowserWindow};
-use gpui::{div, prelude::*, px, relative, ClickEvent, Context, MouseButton, MouseDownEvent, MouseMoveEvent, SharedString};
-use crate::history::{popover_header, text_action, INSET};
-use gpuikit::elements::icon_button::icon_button;
-use gpuikit::elements::scroll_area::scroll_area;
-use gpuikit::icons::Icons;
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::theme::{ActiveTheme, Themeable};
-use gpuikit::traits::control_sized::ControlSized;
+use crate::history::POPOVER_W;
+use crate::native::{empty, header, text, title, Ink, Node, Pop, Weight};
+use crate::window::BrowserWindow;
 use std::path::Path;
 
 const ROW_H: f32 = 36.;
 
 impl BrowserWindow {
-    pub(crate) fn downloads_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
-        let danger = cx.theme().danger();
+    pub(crate) fn downloads_popover(&self, pop: &mut Pop) -> Node {
         let downloads = self.model.lock().downloads().unwrap_or_default();
-        let empty = downloads.is_empty();
-        // Rows are inset by 6px so their hover fill sits inside the popover, with text on the 12px line.
-        let mut list = v_stack().w_full().px(px(6.)).py(px(4.));
+        let empty_list = downloads.is_empty();
+        let mut rows = Vec::new();
         for entry in downloads {
             let name = Path::new(&entry.path)
                 .file_name()
@@ -37,152 +27,49 @@ impl BrowserWindow {
                 match total {
                     Some(total) if total > 0 => (
                         format!("{} / {}", human_bytes(received), human_bytes(total)),
-                        Some((received as f32 / total as f32).clamp(0., 1.)),
+                        Some((received as f64 / total as f64).clamp(0., 1.)),
                     ),
                     _ => (human_bytes(received), Some(0.)),
                 }
             } else {
                 ("Interrupted".into(), None)
             };
+            let mut label = vec![title(name, 12.5, Weight::Regular, if failed { Ink::Secondary } else { Ink::Primary })];
+            label.extend(fraction.map(Node::Progress));
+            let detail = text(detail, 11., Weight::Regular, if failed { Ink::Danger } else { Ink::Secondary });
+            let mut children = vec![
+                Node::Glyph { name: "doc", size: 14., ink: if failed { Ink::Danger } else { Ink::Secondary } },
+                Node::Column { gap: 3., pad: (0., 0.), children: label },
+                // The reveal button takes the size's place on hover.
+                if done { Node::Hover(false, Box::new(detail)) } else { detail },
+            ];
+            if fraction.is_some() {
+                let id = entry.id.clone();
+                children.push(Node::Tool { symbol: "xmark", tip: "Stop", action: pop.act(move |this, _| this.cancel_download(&id)), on: false });
+            }
+            if done {
+                let reveal = entry.path.clone();
+                children.push(Node::Hover(true, Box::new(Node::Tool { symbol: "magnifyingglass", tip: "Show in Finder", action: pop.act(move |_, _| open_path(&reveal, true)), on: false })));
+            }
             let path = entry.path.clone();
-            let drag = entry.path.clone();
-            let reveal = entry.path.clone();
-            let group = SharedString::from(format!("download-{}", entry.id));
-            list = list.child(
-                h_stack()
-                    .id(group.clone())
-                    .group(group.clone())
-                    .relative()
-                    .w_full()
-                    .h(px(ROW_H))
-                    .gap(px(8.))
-                    .px(px(INSET - 6.))
-                    .rounded(px(6.))
-                    .items_center()
-                    .text_size(paint.text(12.5))
-                    .when(done, |row| {
-                        row.cursor_pointer()
-                            .hover(|style| style.bg(paint.secondary))
-                            .on_click(move |_: &ClickEvent, _, _| open_path(&path, false))
-                            // Dragging the row out drops the file on a page (or anywhere) as from Finder.
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, _| {
-                                this.download_drag = Some((drag.clone(), event.position));
-                            }))
-                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
-                                let Some((_, start)) = &this.download_drag else {
-                                    return;
-                                };
-                                if event.pressed_button != Some(MouseButton::Left) {
-                                    this.download_drag = None;
-                                } else if (event.position.x - start.x).abs() + (event.position.y - start.y).abs() > px(4.) {
-                                    if let Some((path, _)) = this.download_drag.take() {
-                                        browser_engine_macos::drag_file(Path::new(&path));
-                                    }
-                                }
-                            }))
-                    })
-                    .child(Icons::file().flex_none().size(px(16.)).text_color(if failed { danger } else { paint.muted }))
-                    .child(
-                        v_stack()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap(px(3.))
-                            .child(div().truncate().when(failed, |name| name.text_color(paint.muted)).child(name))
-                            .when_some(fraction, |column, fraction| {
-                                column.child(
-                                    div()
-                                        .w_full()
-                                        .h(px(3.))
-                                        .rounded_full()
-                                        .bg(paint.border)
-                                        .child(div().h_full().w(relative(fraction)).rounded_full().bg(paint.accent)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(150.))
-                            .truncate()
-                            .text_size(paint.text(11.))
-                            .text_color(if failed { danger } else { paint.muted })
-                            // The reveal button takes the size's place on hover.
-                            .when(done, |detail| detail.group_hover(group.clone(), |style| style.opacity(0.)))
-                            .child(detail),
-                    )
-                    .when(fraction.is_some(), |row| {
-                        let id = entry.id.clone();
-                        row.child(
-                            icon_button(SharedString::from(format!("stop-{}", entry.id)), Icons::cross_2())
-                                .small()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.cancel_download(&id);
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(done, |row| {
-                        row.child(
-                            div().absolute().right(px(INSET - 10.)).opacity(0.).group_hover(group, |style| style.opacity(1.)).child(
-                                icon_button(SharedString::from(format!("reveal-{}", entry.id)), Icons::magnifying_glass())
-                                    .small()
-                                    .on_click(move |_: &ClickEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        open_path(&reveal, true);
-                                    }),
-                            ),
-                        )
-                    }),
-            );
+            rows.push(Node::Item {
+                height: f64::from(ROW_H),
+                click: done.then(|| pop.act(move |_, _| open_path(&path, false))),
+                // Dragging the row out drops the file on a page (or anywhere) as from Finder.
+                drag: done.then(|| entry.path.clone().into()),
+                children,
+            });
         }
-        v_stack()
-            .id("downloads-popover")
-            .absolute()
-            .left(px(64.))
-            .bottom(px(12.))
-            .w(px(340.))
-            .max_h(px(420.))
-            .rounded(px(10.))
-            .overflow_hidden()
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, event, _, cx| this.dismiss_popover(event, cx)))
-            .child(measure_overlay(10., cx))
-            .child(popover_header(
-                "Downloads",
-                h_stack()
-                    .when(!empty, |actions| {
-                        actions.child(text_action("downloads-clear", "Clear", paint).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            let _ = this.model.lock().clear_finished_downloads();
-                            cx.notify();
-                        })))
-                    })
-                    .child(icon_button("downloads-close", Icons::cross_2()).small().on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.popover = None;
-                        cx.notify();
-                    }))),
-                paint,
-            ))
-            .when(empty, |popover| {
-                popover.child(
-                    v_stack()
-                        .h(px(88.))
-                        .gap(px(6.))
-                        .items_center()
-                        .justify_center()
-                        .text_size(paint.text(12.))
-                        .text_color(paint.muted)
-                        .child(Icons::download().size(px(18.)).text_color(paint.muted))
-                        .child("No downloads yet"),
-                )
-            })
-            .when(!empty, |popover| {
-                popover.child(div().flex_1().min_h(px(0.)).overflow_hidden().child(scroll_area("downloads-list").vertical().child(list)))
-            })
+        let clear = pop.act(|this, _| {
+            let _ = this.model.lock().clear_finished_downloads();
+        });
+        let actions = if empty_list { Vec::new() } else { vec![Node::Link { title: "Clear".into(), action: clear }] };
+        let list = if empty_list {
+            empty(Some("arrow.down.circle"), "No downloads yet", POPOVER_W)
+        } else {
+            Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: rows }) }
+        };
+        Node::Column { gap: 0., pad: (0., 0.), children: vec![header("Downloads", actions), Node::Separator, list] }
     }
 }
 

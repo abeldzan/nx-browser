@@ -3,7 +3,7 @@ use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
 use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
 use crate::terminal::is_terminal;
 use browser_engine::LogicalRect;
-use gpui::{FontWeight, anchored, canvas, deferred, div, prelude::*, px, ClickEvent, Context, KeyDownEvent, MouseButton, SharedString};
+use gpui::{FontWeight, canvas, div, prelude::*, px, ClickEvent, Context, KeyDownEvent, MouseButton, SharedString};
 use crate::ui::{action_button, Kind};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
@@ -148,7 +148,6 @@ impl BrowserWindow {
     pub(crate) fn open_new_profile(&mut self, cx: &mut Context<Self>) {
         self.new_profile_input.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
         self.new_profile = Some((String::new(), String::new()));
-        self.rail_menu = None;
         cx.notify();
     }
 
@@ -376,20 +375,20 @@ impl BrowserWindow {
             .child(card)
     }
 
-    pub(crate) fn rail_menu_view(&self, (id, index, position): (String, usize, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn open_rail_menu(&mut self, id: String, index: usize, position: gpui::Point<gpui::Pixels>) {
         let count = self.model.lock().profiles.len().max(1);
         let rows = vec![
-            menu_item("Move up", index > 0, false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index - 1); }) }, cx),
-            menu_item("Move down", index + 1 < count, false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index + 1); }) }, cx),
-            menu_divider(cx),
-            menu_item("Edit profile…", true, false, { let id = id.clone(); move |this, cx| this.open_profile_settings(id.clone(), cx) }, cx),
-            menu_item("Delete profile…", count > 1, true, move |this, _| this.delete_prompt = Some(id.clone()), cx),
+            menu_item("Move up", index > 0, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index - 1); }) }),
+            menu_item("Move down", index + 1 < count, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index + 1); }) }),
+            None,
+            menu_item("Edit profile…", true, { let id = id.clone(); move |this, cx| this.open_profile_settings(id.clone(), cx) }),
+            menu_item("Delete profile…", count > 1, move |this, _| this.delete_prompt = Some(id.clone())),
         ];
-        menu_card("rail-menu", position, rows, cx)
+        self.show_menu(rows, position);
     }
 
     /// Right-click menu on a terminal's screen.
-    pub(crate) fn term_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn open_term_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         let view = crate::terminal::get(&id, cx);
         let selected = view.as_ref().is_some_and(|view| view.read(cx).has_selection());
         let on = |run: fn(&mut crate::terminal::TerminalView, &mut Context<crate::terminal::TerminalView>)| {
@@ -401,27 +400,27 @@ impl BrowserWindow {
             }
         };
         let rows = vec![
-            menu_item("Copy", selected, false, on(|view, cx| view.copy(cx)), cx),
-            menu_item("Paste", true, false, on(|view, cx| view.paste(cx)), cx),
-            menu_divider(cx),
-            menu_item("Clear", true, false, on(|view, cx| view.clear(cx)), cx),
+            menu_item("Copy", selected, on(|view, cx| view.copy(cx))),
+            menu_item("Paste", true, on(|view, cx| view.paste(cx))),
+            None,
+            menu_item("Clear", true, on(|view, cx| view.clear(cx))),
         ];
-        menu_card("term-menu", position, rows, cx)
+        self.show_menu(rows, position);
     }
 
     /// The title bar's screenshot button menu.
-    pub(crate) fn shot_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn open_shot_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>) {
         let url = self.model.lock().session_tabs().into_iter().find(|tab| tab.id == id).map(|tab| tab.url.clone()).unwrap_or_default();
         let web = !url.is_empty() && !is_terminal(&url);
         let rows = vec![
-            menu_item("Whole Page", web, false, |this, cx| this.on_shortcut(Shortcut::Screenshot, cx), cx),
-            menu_item("Select Element", web, false, |this, cx| this.on_shortcut(Shortcut::ScreenshotElement, cx), cx),
+            menu_item("Whole Page", web, |this, cx| this.on_shortcut(Shortcut::Screenshot, cx)),
+            menu_item("Select Element", web, |this, cx| this.on_shortcut(Shortcut::ScreenshotElement, cx)),
         ];
-        menu_card("shot-menu", position, rows, cx)
+        self.show_menu(rows, position);
     }
 
     /// Right-click menu on a tab pill; "other" and "to the right" stay within the tab's window.
-    pub(crate) fn tab_menu_view(&self, (id, position): (String, gpui::Point<gpui::Pixels>), cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn open_tab_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>) {
         let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
         let at = row.iter().position(|other| *other == id).unwrap_or(0);
         let (others, right) = (row.iter().filter(|other| **other != id).cloned().collect::<Vec<_>>(), row[(at + 1).min(row.len())..].to_vec());
@@ -436,16 +435,16 @@ impl BrowserWindow {
         let pinned = bookmark.as_ref().is_some_and(|bookmark| bookmark.pinned);
         let muted = self.engine.is_muted(&id);
         let rows = vec![
-            menu_item("New Tab", true, false, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, None, cx) }, cx),
-            menu_item("Duplicate Tab", true, false, { let (id, url) = (id.clone(), url.clone()); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }, cx),
-            menu_item("Reload Tab", true, false, { let id = id.clone(); move |this, _| this.engine.reload(&id) }, cx),
-            menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, false, { let id = id.clone(); move |this, _| this.engine.set_muted(&id, !muted) }, cx),
-            menu_divider(cx),
-            menu_item("Copy Link", web, false, { let url = url.clone(); move |this, cx| {
+            menu_item("New Tab", true, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, None, cx) }),
+            menu_item("Duplicate Tab", true, { let (id, url) = (id.clone(), url.clone()); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }),
+            menu_item("Reload Tab", true, { let id = id.clone(); move |this, _| this.engine.reload(&id) }),
+            menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, { let id = id.clone(); move |this, _| this.engine.set_muted(&id, !muted) }),
+            None,
+            menu_item("Copy Link", web, { let url = url.clone(); move |this, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
                 this.status = "Copied page address".into();
-            } }, cx),
-            menu_item(if bookmark.is_some() { "Remove Bookmark" } else { "Add Bookmark" }, web, false, {
+            } }),
+            menu_item(if bookmark.is_some() { "Remove Bookmark" } else { "Add Bookmark" }, web, {
                 let (url, title, bookmark) = (url.clone(), title.clone(), bookmark.as_ref().map(|bookmark| bookmark.id.clone()));
                 move |this, _| this.with_model(|model| {
                     let _ = match &bookmark {
@@ -453,29 +452,29 @@ impl BrowserWindow {
                         None => model.save_bookmark(None, &url, &title, false),
                     };
                 })
-            }, cx),
-            menu_item(if pinned { "Unpin from Start Page" } else { "Pin to Start Page" }, web, false, {
+            }),
+            menu_item(if pinned { "Unpin from Start Page" } else { "Pin to Start Page" }, web, {
                 let bookmark = bookmark.as_ref().map(|bookmark| bookmark.id.clone());
                 move |this, _| this.with_model(|model| { let _ = model.save_bookmark(bookmark.as_deref(), &url, &title, !pinned); })
-            }, cx),
-            menu_divider(cx),
-            menu_item("Move to New Window", self.group_len(&id) > 1, false, { let id = id.clone(); move |this, cx| this.detach_tab(&id, position, cx) }, cx),
+            }),
+            None,
+            menu_item("Move to New Window", self.group_len(&id) > 1, { let id = id.clone(); move |this, cx| this.detach_tab(&id, position, cx) }),
             // A tab its window shows would go blank; only ones hidden behind another tab can sleep.
-            menu_item("Suspend Tab", web && !suspended && !self.is_front(&id), false, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.mark_suspended(&id); }) }, cx),
-            menu_divider(cx),
-            menu_item("Close Tab", true, false, move |this, cx| this.close_tabs(vec![id.clone()], cx), cx),
-            menu_item("Close Other Tabs", !others.is_empty(), false, move |this, cx| this.close_tabs(others.clone(), cx), cx),
-            menu_item("Close Tabs to the Right", !right.is_empty(), false, move |this, cx| this.close_tabs(right.clone(), cx), cx),
-            menu_item("Reopen Closed Tab", reopenable, false, |this, cx| this.on_shortcut(Shortcut::ReopenTab, cx), cx),
+            menu_item("Suspend Tab", web && !suspended && !self.is_front(&id), { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.mark_suspended(&id); }) }),
+            None,
+            menu_item("Close Tab", true, move |this, cx| this.close_tabs(vec![id.clone()], cx)),
+            menu_item("Close Other Tabs", !others.is_empty(), move |this, cx| this.close_tabs(others.clone(), cx)),
+            menu_item("Close Tabs to the Right", !right.is_empty(), move |this, cx| this.close_tabs(right.clone(), cx)),
+            menu_item("Reopen Closed Tab", reopenable, |this, cx| this.on_shortcut(Shortcut::ReopenTab, cx)),
         ];
-        menu_card("tab-menu", position, rows, cx)
+        self.show_menu(rows, position);
     }
 
-    pub(crate) fn close_menus(&mut self) {
-        self.rail_menu = None;
-        self.tab_menu = None;
-        self.term_menu = None;
-        self.shot_menu = None;
+    /// Shows `rows` as a native menu at `position`; `EngineEvent::MenuPick` runs the picked row.
+    fn show_menu(&mut self, rows: Vec<MenuRow>, position: gpui::Point<gpui::Pixels>) {
+        let items = rows.iter().map(|row| row.as_ref().map(|(label, enabled, _)| (*label, *enabled))).collect::<Vec<_>>();
+        self.engine.show_menu(&items, (f64::from(position.x), f64::from(position.y)));
+        self.menu_actions = rows.into_iter().map(|row| row.map(|(_, _, run)| run)).collect();
     }
 
     pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
@@ -1360,31 +1359,12 @@ pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
     }
 }
 
-/// A right-click menu row; clicking it closes the menu, then runs `run`.
-fn menu_item(
-    label: &'static str,
-    enabled: bool,
-    destructive: bool,
-    run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static,
-    cx: &mut Context<BrowserWindow>,
-) -> gpui::AnyElement {
-    let paint = paint(cx);
-    let danger = cx.theme().danger();
-    div()
-        .id(label)
-        .px(px(10.))
-        .py(px(5.))
-        .rounded(px(5.))
-        .text_color(if !enabled { paint.muted } else if destructive { danger } else { paint.fg })
-        .when(enabled, |row| {
-            row.cursor_pointer().hover(|style| style.bg(paint.secondary)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.close_menus();
-                run(this, cx);
-                cx.notify();
-            }))
-        })
-        .child(label)
-        .into_any_element()
+/// A native menu row: (label, enabled, what picking it runs); `None` is a separator.
+pub(crate) type MenuRow = Option<(&'static str, bool, MenuAction)>;
+pub(crate) type MenuAction = Box<dyn Fn(&mut BrowserWindow, &mut Context<BrowserWindow>)>;
+
+fn menu_item(label: &'static str, enabled: bool, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> MenuRow {
+    Some((label, enabled, Box::new(run)))
 }
 
 /// Asks for a folder, then stores it with `set`.
@@ -1397,43 +1377,6 @@ fn pick_folder(cx: &mut Context<BrowserWindow>, set: fn(&mut Settings, String)) 
         let _ = this.update(cx, |this, cx| this.set_pref(cx, |s| set(s, path.display().to_string())));
     })
     .detach();
-}
-
-fn menu_divider(cx: &mut Context<BrowserWindow>) -> gpui::AnyElement {
-    div().my(px(4.)).h(px(1.)).bg(paint(cx).border).into_any_element()
-}
-
-/// The floating card a right-click menu sits in, cut out of the page beneath and closed by clicking elsewhere.
-fn menu_card(id: &'static str, position: gpui::Point<gpui::Pixels>, rows: Vec<gpui::AnyElement>, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
-    let paint = paint(cx);
-    let watch = cx.entity();
-    let menu = v_stack()
-        .id(id)
-        .relative()
-        .min_w(px(170.))
-        .p(px(4.))
-        .rounded(px(8.))
-        .bg(paint.surface)
-        .border_1()
-        .border_color(paint.border)
-        .shadow_lg()
-        .occlude()
-        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-            this.close_menus();
-            cx.notify();
-        }))
-        .child(
-            canvas(
-                move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), 8.))),
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full(),
-        )
-        .children(rows);
-    deferred(anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu)).with_priority(1)
 }
 
 #[cfg(test)]
