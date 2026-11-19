@@ -1,15 +1,12 @@
 //! Cmd+K command palette: actions, settings, tabs, spaces, extensions, history, bangs and a calculator,
 //! modelled on Arc's command bar, Vivaldi's Quick Commands and Zen's command bar.
-use crate::settings::measure_overlay;
+use crate::native::{section, text, title, Ink, Node, Pop, Weight, PALETTE_QUERY};
 use crate::tabs::tab_label;
-use crate::window::{favicon_path, paint, site_host, site_icon, BrowserWindow, Popover};
+use crate::window::{favicon_path, site_host, site_image, BrowserWindow, Popover};
 use browser_core::{bang_home, calc, find_bang, normalize_url, spawn_favicon, Settings, BANGS};
 use crate::shortcuts::{keys, label};
 use browser_engine::{Shortcut, SHORTCUTS};
-use gpui::{div, prelude::*, px, ClickEvent, Context, MouseDownEvent, SharedString};
-use gpuikit::elements::input::input;
-use gpuikit::input::bindings;
-use gpuikit::layout::{h_stack, v_stack};
+use gpui::Context;
 
 /// A settings switch the palette flips in place.
 type Toggle = fn(&mut Settings);
@@ -107,9 +104,8 @@ impl BrowserWindow {
         self.palette_open = !self.palette_open;
         self.palette_index = 0;
         self.palette_bang = None;
-        self.palette_input.update(cx, |input, cx| input.set_content_silent(String::new(), cx));
+        self.popover_texts.remove(&PALETTE_QUERY);
         if self.palette_open {
-            self.focus_palette = true;
             // shortcut: /favicon.ico only; sites without one keep the coloured-initial tile.
             for (_, _, template) in BANGS {
                 let path = favicon_path(&site_host(template));
@@ -128,7 +124,7 @@ impl BrowserWindow {
         if self.palette_bang.is_some() {
             return;
         }
-        let raw = self.palette_input.read(cx).content().to_string();
+        let raw = self.typed(PALETTE_QUERY);
         let Some((bang, query)) = find_bang(&raw) else {
             return;
         };
@@ -138,10 +134,7 @@ impl BrowserWindow {
             return;
         }
         self.palette_bang = Some(bang);
-        self.palette_input.update(cx, |input, cx| {
-            input.set_content_silent(query.clone(), cx);
-            input.set_selected_range(query.len()..query.len());
-        });
+        self.set_typed(PALETTE_QUERY, query);
         cx.notify();
     }
 
@@ -153,7 +146,7 @@ impl BrowserWindow {
     }
 
     fn palette_items(&self, cx: &Context<Self>) -> Vec<Item> {
-        let typed = self.palette_input.read(cx).content().trim().to_string();
+        let typed = self.typed(PALETTE_QUERY).trim().to_string();
         let (only, query) = scope(&typed);
         let wants = |section: &str| only.is_none_or(|only| only == section);
         let model = self.model.lock();
@@ -357,10 +350,7 @@ impl BrowserWindow {
             Run::Fill(text) => {
                 self.palette_open = true;
                 self.palette_index = 0;
-                self.palette_input.update(cx, |input, cx| {
-                    input.set_content_silent(text.clone(), cx);
-                    input.set_selected_range(text.len()..text.len());
-                });
+                self.set_typed(PALETTE_QUERY, text);
                 self.absorb_bang(cx);
                 cx.notify();
                 return;
@@ -373,15 +363,11 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    /// Handles a list key; anything it doesn't use (→ mid-text) goes on to the input.
-    fn palette_key(&mut self, key: &str, cx: &mut Context<Self>) {
+    /// A list key from the search field (`EngineEvent::PopoverKey`); → arrives only with the caret at the end.
+    pub(crate) fn palette_key(&mut self, key: &str, cx: &mut Context<Self>) {
         let items = self.palette_items(cx);
         let count = items.len();
         let at = self.palette_index.min(count.saturating_sub(1));
-        let caret_at_end = {
-            let input = self.palette_input.read(cx);
-            input.selected_range().start == input.content().len()
-        };
         match key {
             "down" if count > 0 => self.palette_index = (at + 1) % count,
             "up" if count > 0 => self.palette_index = (at + count - 1) % count,
@@ -392,7 +378,7 @@ impl BrowserWindow {
             }
             "escape" => self.open_palette(cx),
             // Vivaldi-style autocomplete: Tab (or → at the end) copies the selected row into the input.
-            "tab" | "right" if count > 0 && (key == "tab" || caret_at_end) => {
+            "tab" | "right" if count > 0 => {
                 let entry = &items[at];
                 let text = match &entry.run {
                     Run::Fill(text) => text.clone(),
@@ -400,109 +386,54 @@ impl BrowserWindow {
                     _ => entry.label.clone(),
                 };
                 self.palette_index = 0;
-                self.palette_input.update(cx, |input, cx| {
-                    input.set_content_silent(text.clone(), cx);
-                    input.set_selected_range(text.len()..text.len());
-                });
+                self.set_typed(PALETTE_QUERY, text);
                 self.absorb_bang(cx);
             }
             // Backspace in an empty input drops the pill, as in Arc and Kagi.
-            "backspace" if self.palette_bang.is_some() && self.palette_input.read(cx).content().is_empty() => self.palette_bang = None,
-            "up" | "down" | "tab" => {}
-            _ => return cx.propagate(),
+            "backspace" => self.palette_bang = None,
+            _ => {}
         }
-        // Capture-phase actions keep going unless stopped; otherwise the input also inserts `\t`, etc.
-        cx.stop_propagation();
         cx.notify();
     }
 
-    pub(crate) fn palette_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paint = paint(cx);
+    /// The palette's glass panel: the search field (with an active bang's pill), then the ranked rows.
+    pub(crate) fn palette_node(&self, pop: &mut Pop, cx: &Context<Self>) -> Node {
         let items = self.palette_items(cx);
         let bang = self.palette_bang;
         let selected = self.palette_index.min(items.len().saturating_sub(1));
-        let mut list = v_stack().w_full().p(px(6.)).gap(px(1.));
-        let mut last_section = "";
-        for (index, entry) in items.iter().cloned().enumerate() {
-            if entry.section != last_section {
-                last_section = entry.section;
-                list = list.child(div().px(px(10.)).pt(px(if index == 0 { 2. } else { 8. })).pb(px(2.)).text_size(paint.text(11.)).text_color(paint.muted).child(entry.section));
-            }
-            let (label, hint, icon) = (entry.label.clone(), entry.hint.clone(), entry.icon);
-            list = list.child(
-                h_stack()
-                    .id(SharedString::from(format!("palette-{index}")))
-                    .gap(px(10.))
-                    .px(px(10.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .when(index == selected, |row| row.bg(paint.accent_bg))
-                    .hover(|row| row.bg(paint.secondary))
-                    .items_center()
-                    .children(icon.map(|url| site_icon(url, 16., false)))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(div().flex_none().max_w(px(220.)).truncate().text_size(paint.text(11.)).text_color(paint.muted).child(hint))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        let new_tab = event.modifiers().platform;
-                        this.run_palette(entry.clone(), new_tab, cx);
-                    })),
-            );
+        let mut search = Vec::new();
+        if let Some((_, site, template)) = bang {
+            let pill = Node::Row { gap: 6., children: vec![site_image(template, 14.), text(*site, 12., Weight::Regular, Ink::Accent)] };
+            search.push(Node::Card { tint: Ink::Accent, child: Box::new(Node::Column { gap: 0., pad: (8., 3.), children: vec![pill] }) });
         }
-        let card = v_stack()
-            .id("command-palette")
-            .relative()
-            .w(px(560.))
-            .max_w_full()
-            .rounded(px(12.))
-            .overflow_hidden()
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_lg()
-            .occlude()
-            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| this.close_palette(cx)))
-            // The input binds these keys to its own actions, and gpui runs bindings before any key-down
-            // listener, so the list has to catch the actions in the capture phase, ahead of the input.
-            .capture_action(cx.listener(|this, _: &bindings::Down, _, cx| this.palette_key("down", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Up, _, cx| this.palette_key("up", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Enter, _, cx| this.palette_key("enter", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Submit, _, cx| this.palette_key("cmd-enter", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Tab, _, cx| this.palette_key("tab", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Right, _, cx| this.palette_key("right", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Escape, _, cx| this.palette_key("escape", cx)))
-            .capture_action(cx.listener(|this, _: &bindings::Backspace, _, cx| this.palette_key("backspace", cx)))
-            .child(measure_overlay(12., cx))
-            .child(
-                div().h(px(44.)).px(px(14.)).gap(px(8.)).flex().items_center().border_b_1().border_color(paint.border)
-                    .children(bang.map(|(_, site, template)| {
-                        h_stack()
-                            .flex_none()
-                            .gap(px(6.))
-                            .items_center()
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(6.))
-                            .bg(paint.accent_bg)
-                            .text_color(paint.accent)
-                            .text_size(paint.text(12.))
-                            .child(site_icon(template, 14., false))
-                            .child(*site)
-                    }))
-                    .child(
-                    input(&self.palette_input, cx)
-                        .placeholder(match bang {
-                            Some((_, site, _)) => format!("Search {site}"),
-                            None => "Search tabs, actions, history, or type !bang, @scope, 2+2".into(),
-                        })
-                        .cursor_color(paint.accent)
-                        .flex_1()
-                        .text_size(paint.text(14.))
-                        .text_color(paint.fg),
-                ),
-            )
-            .when(!items.is_empty(), |card| card.child(list));
-        div().absolute().top(px(72.)).left_0().right_0().flex().justify_center().px(px(16.)).child(card)
+        let placeholder = match bang {
+            Some((_, site, _)) => format!("Search {site}"),
+            None => "Search tabs, actions, history, or type !bang, @scope, 2+2".into(),
+        };
+        search.push(Node::Search { field: PALETTE_QUERY, placeholder });
+        let mut children = vec![Node::Column { gap: 0., pad: (8., 0.), children: vec![Node::Item { height: 44., click: None, drag: None, children: search }] }];
+        if !items.is_empty() {
+            let mut rows = Vec::new();
+            let mut last_section = "";
+            for (index, entry) in items.into_iter().enumerate() {
+                if entry.section != last_section {
+                    last_section = entry.section;
+                    rows.push(section(entry.section));
+                }
+                let mut row = Vec::new();
+                row.extend(entry.icon.map(|url| site_image(url, 16.)));
+                row.extend([title(entry.label.clone(), 13., Weight::Regular, Ink::Primary), Node::Spacer, title(entry.hint.clone(), 11., Weight::Regular, Ink::Secondary)]);
+                let run = pop.act(move |this, cx| {
+                    let new_tab = this.engine.command_held();
+                    this.run_palette(entry.clone(), new_tab, cx);
+                });
+                let row = Node::Item { height: 30., click: Some(run), drag: None, children: row };
+                rows.push(if index == selected { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
+            }
+            children.push(Node::Separator);
+            children.push(Node::Column { gap: 1., pad: (6., 6.), children: rows });
+        }
+        Node::Column { gap: 0., pad: (0., 0.), children }
     }
 }
 

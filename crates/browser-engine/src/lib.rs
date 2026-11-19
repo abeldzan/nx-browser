@@ -89,6 +89,11 @@ pub enum EngineEvent {
     },
     /// The popover closed on its own (a press outside it, or Esc).
     PopoverClosed,
+    /// A list key in the command palette's search field: `up`, `down`, `enter`, `cmd-enter`, `tab`, `escape`,
+    /// `right` (caret at the end) or `backspace` (field empty).
+    PopoverKey(String),
+    /// The floating panel (the command palette) closed because it lost key: a click outside it.
+    PanelClosed,
     /// The native window (settings) was closed: its close button, Esc or ⌘W.
     NativeWindowClosed,
     /// Keys pressed while recording a shortcut, in gpui keystroke form: `escape`, `backspace`, or a combination

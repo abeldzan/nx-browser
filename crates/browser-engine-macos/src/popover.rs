@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use browser_engine::{EngineEvent, LogicalRect};
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
@@ -18,7 +18,8 @@ use objc2_app_kit::{
     NSProgressIndicator, NSProgressIndicatorStyle, NSResponder, NSScrollView, NSSecureTextField, NSStackView, NSSwitch,
     NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation,
     NSView, NSViewController, NSWindow, NSWindowStyleMask, NSComboBox, NSPopUpButton, NSStepper, NSVisualEffectView,
-    NSVisualEffectMaterial, NSVisualEffectBlendingMode, NSWindowDelegate,
+    NSVisualEffectMaterial, NSVisualEffectBlendingMode, NSWindowDelegate, NSApplication, NSControl, NSEventModifierFlags,
+    NSFocusRingType, NSGlassEffectView, NSTextView, NSWindowOrderingMode, NSAnimationContext,
 };
 use objc2_foundation::{NSArray, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -46,6 +47,8 @@ pub enum Node {
     /// A text field showing `value` when created; edits arrive as `PopoverText`, Return runs `submit` (and so
     /// does leaving the field, when `blur`).
     Field { field: u32, value: Initial, placeholder: String, submit: u32, secure: bool, blur: bool },
+    /// The command palette's borderless, larger search field; list keys arrive as `EngineEvent::PopoverKey`.
+    Search { field: u32, placeholder: String },
     /// A text field with a list to pick from (`NSComboBox`); a pick or Return runs `submit`, as does leaving it.
     Combo { field: u32, value: Initial, items: Vec<String>, submit: u32 },
     /// A pop-up menu of `items` showing `selected`; picking item `i` runs action `first + i`.
@@ -140,6 +143,8 @@ enum Host {
     /// The sheet, and the window it hangs from.
     Sheet(Retained<NSPanel>, Retained<NSWindow>),
     Window(Retained<NSWindow>),
+    /// A floating glass panel, the window it is a child of, and the glass holding the content.
+    Panel(Retained<NxPanel>, Retained<NSWindow>, Retained<NSGlassEffectView>),
 }
 
 impl Host {
@@ -149,6 +154,7 @@ impl Host {
             Host::Popover(popover) => popover.contentViewController().map(|controller| controller.view()),
             Host::Sheet(panel, _) => panel.contentView(),
             Host::Window(window) => window.contentView(),
+            Host::Panel(_, _, glass) => glass.contentView(),
         }
     }
 }
@@ -170,6 +176,7 @@ thread_local! {
     static POPOVER: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static SHEET: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static WINDOW: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static PANEL: RefCell<Option<Surface>> = const { RefCell::new(None) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -211,6 +218,24 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
             Host::Window(window) => {
                 window.setContentView(Some(&view));
                 window.setContentSize(size);
+            }
+            Host::Panel(panel, _, glass) => {
+                // Grows and shrinks downward: its top edge stays put under the title bar.
+                let frame = panel.frame();
+                let top = frame.origin.y + frame.size.height;
+                let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
+                // Resized, refilled and laid out as one unanimated step: otherwise the glass showed a frame at its
+                // old height, poking the field's text up above the panel, and faded it out.
+                NSAnimationContext::beginGrouping();
+                NSAnimationContext::currentContext().setDuration(0.);
+                NSAnimationContext::currentContext().setAllowsImplicitAnimation(false);
+                panel.setFrame_display(NSRect::new(NSPoint::new(frame.origin.x, top - size.height), size), false);
+                glass.setContentView(Some(&view));
+                if let Some(clear) = panel.contentView() {
+                    clear.layoutSubtreeIfNeeded();
+                }
+                panel.display();
+                NSAnimationContext::endGrouping();
             }
         }
         view.layoutSubtreeIfNeeded();
@@ -424,12 +449,89 @@ fn restore_offsets(view: &NSView, offsets: &mut impl Iterator<Item = NSPoint>) {
     }
 }
 
-/// Replaces the text in field `field` of the open popover, sheet or window.
+/// Shows `content` on a floating glass panel `width` wide, centred `top` points below the top of `parent`, or
+/// updates the one open under `key`. It closes, with `EngineEvent::PanelClosed`, once it loses key (a click outside).
+pub(crate) fn present_panel(window_no: isize, parent: &NSWindow, key: u64, width: f64, top: f64, content: &Node) {
+    if refresh(&PANEL, window_no, key, content) {
+        return;
+    }
+    close_panel(None);
+    let mtm = MainThreadMarker::new().expect("panels live on the main thread");
+    let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
+    let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
+    let size = view.fittingSize();
+    let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
+    let outer = parent.frame();
+    let frame = NSRect::new(
+        NSPoint::new(outer.origin.x + (outer.size.width - size.width) / 2., outer.origin.y + outer.size.height - top - size.height + GLASS_MARGIN),
+        size,
+    );
+    let panel: Retained<NxPanel> = unsafe {
+        msg_send![super(NxPanel::alloc(mtm).set_ivars(())), initWithContentRect: frame, styleMask: NSWindowStyleMask::Borderless, backing: NSBackingStoreType::Buffered, defer: false]
+    };
+    // Held by `PANEL`; AppKit releasing it on close as well would free it twice.
+    unsafe { panel.setReleasedWhenClosed(false) };
+    panel.setOpaque(false);
+    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    panel.setHasShadow(false);
+    let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+    glass.setCornerRadius(12.);
+    glass.setContentView(Some(&view));
+    // Inset in a clear view: the glass's own shadow spills past its edge, and the panel's square edge cut it off
+    // into a dark outline.
+    let clear = NSView::new(mtm);
+    clear.addSubview(&glass);
+    glass.setTranslatesAutoresizingMaskIntoConstraints(false);
+    for edge in [
+        glass.leadingAnchor().constraintEqualToAnchor_constant(&clear.leadingAnchor(), GLASS_MARGIN),
+        glass.trailingAnchor().constraintEqualToAnchor_constant(&clear.trailingAnchor(), -GLASS_MARGIN),
+        glass.topAnchor().constraintEqualToAnchor_constant(&clear.topAnchor(), GLASS_MARGIN),
+        glass.bottomAnchor().constraintEqualToAnchor_constant(&clear.bottomAnchor(), -GLASS_MARGIN),
+    ] {
+        edge.setActive(true);
+    }
+    panel.setContentView(Some(&clear));
+    TARGET.with(|target| panel.setDelegate(Some(ProtocolObject::from_ref(&**target))));
+    unsafe { parent.addChildWindow_ordered(&panel, NSWindowOrderingMode::Above) };
+    panel.makeKeyAndOrderFront(None);
+    if let Some(field) = &first {
+        focus(field);
+    }
+    PANEL.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields }));
+}
+
+/// Clear room around the panel's glass for its shadow to fade out in.
+const GLASS_MARGIN: f64 = 48.;
+
+/// Closes the panel if browser window `owner` opened it, or whichever is open for None.
+pub(crate) fn close_panel(owner: Option<isize>) {
+    // Taken first: losing key calls the delegate, which looks at `PANEL`.
+    let surface = match owner {
+        Some(window_no) => take_owned(&PANEL, window_no),
+        None => PANEL.take(),
+    };
+    if let Some(Surface { host: Host::Panel(panel, parent, _), .. }) = surface {
+        parent.removeChildWindow(&panel);
+        panel.orderOut(None);
+    }
+}
+
+/// The browser window that opened `window`, when it is the open panel: keys pressed there run that window's shortcuts.
+pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
+    PANEL.with_borrow(|surface| {
+        surface.as_ref().filter(|surface| matches!(&surface.host, Host::Panel(panel, _, _) if std::ptr::eq(Retained::as_ptr(panel).cast::<NSWindow>(), window))).map(|surface| surface.window_no)
+    })
+}
+
+/// Replaces the text in field `field` of the open popover, sheet, window or panel, caret at the end.
 pub(crate) fn set_field(field: u32, text: &str) {
-    for slot in [&WINDOW, &SHEET, &POPOVER] {
+    for slot in [&PANEL, &WINDOW, &SHEET, &POPOVER] {
         slot.with_borrow(|surface| {
             if let Some(input) = surface.as_ref().and_then(|surface| surface.fields.get(&field)) {
                 input.setStringValue(&NSString::from_str(text));
+                if let Some(editor) = input.currentEditor() {
+                    editor.setSelectedRange(NSRange::new(input.stringValue().length(), 0));
+                }
             }
         });
     }
@@ -437,7 +539,7 @@ pub(crate) fn set_field(field: u32, text: &str) {
 
 /// Field `field`'s Return action, in whichever surface has it.
 fn submit_action(field: u32) -> Option<u32> {
-    [&WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+    [&PANEL, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
 }
 
 /// `read` of the surface in `slot`, skipping one being rebuilt: moving its focused field ends editing, which calls
@@ -447,7 +549,7 @@ fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read:
 }
 
 fn send(event: EngineEvent) {
-    let window_no = [&WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
+    let window_no = [&PANEL, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
     if let Some(window_no) = window_no {
         crate::webkit::send_event(window_no, event);
     }
@@ -477,6 +579,22 @@ define_class!(
     }
 
     unsafe impl NSWindowDelegate for NxPopoverTarget {
+        #[unsafe(method(windowDidResignKey:))]
+        fn window_did_resign_key(&self, notification: &NSNotification) {
+            // A click outside the panel; `close_panel()` already took the entry when the app closed it.
+            let object = notification.object();
+            let window_no = PANEL.with_borrow(|surface| {
+                surface
+                    .as_ref()
+                    .filter(|surface| matches!(&surface.host, Host::Panel(panel, _, _) if object.as_ref().is_some_and(|object| std::ptr::eq(Retained::as_ptr(object), Retained::as_ptr(panel).cast()))))
+                    .map(|surface| surface.window_no)
+            });
+            if let Some(window_no) = window_no {
+                close_panel(Some(window_no));
+                crate::webkit::send_event(window_no, EngineEvent::PanelClosed);
+            }
+        }
+
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
             // Its close button; `close_window()` already took the entry when the app closed it.
@@ -486,7 +604,33 @@ define_class!(
         }
     }
 
-    unsafe impl NSControlTextEditingDelegate for NxPopoverTarget {}
+    unsafe impl NSControlTextEditingDelegate for NxPopoverTarget {
+        /// The palette's list keys: arrows, Return, Tab, Esc, and → or ⌫ at the field's ends. Other fields keep theirs.
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn do_command(&self, control: &NSControl, text_view: &NSTextView, command: Sel) -> Bool {
+            if peek(&PANEL, |surface| surface.fields.values().any(|field| std::ptr::eq(Retained::as_ptr(field).cast::<NSControl>(), control)).then_some(())).is_none() {
+                return Bool::NO;
+            }
+            let length = text_view.string().length();
+            let at_end = text_view.selectedRange() == NSRange::new(length, 0);
+            let command_held = NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Command);
+            let key = match command.name().to_str().unwrap_or_default() {
+                "moveUp:" => "up",
+                "moveDown:" => "down",
+                "insertNewline:" if command_held => "cmd-enter",
+                "insertNewline:" => "enter",
+                // ⌘↩ arrives as no command at all.
+                "noop:" if command_held && NSApplication::sharedApplication(self.mtm()).currentEvent().is_some_and(|event| event.keyCode() == 36) => "cmd-enter",
+                "insertTab:" => "tab",
+                "cancelOperation:" => "escape",
+                "moveRight:" if at_end => "right",
+                "deleteBackward:" if length == 0 => "backspace",
+                _ => return Bool::NO,
+            };
+            send(EngineEvent::PopoverKey(key.into()));
+            Bool::YES
+        }
+    }
 
     unsafe impl NSTextFieldDelegate for NxPopoverTarget {}
 
@@ -618,6 +762,21 @@ impl NxPopoverItem {
         self.setNeedsDisplay(true);
     }
 }
+
+define_class!(
+    /// Borderless, so it would never take key (and its search field typing) without saying it can.
+    #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NxPanel"]
+    pub(crate) struct NxPanel;
+
+    impl NxPanel {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool {
+            true
+        }
+    }
+);
 
 define_class!(
     /// Scroll views lay their document out from the bottom unless it is flipped.
@@ -830,6 +989,22 @@ impl Build<'_> {
                     switch.setAction(Some(sel!(act:)));
                 });
                 Retained::into_super(Retained::into_super(switch))
+            }
+            Node::Search { field, placeholder } => {
+                let input = self.kept.remove(field).unwrap_or_else(|| {
+                    let input = NSTextField::new(mtm);
+                    input.setBordered(false);
+                    input.setDrawsBackground(false);
+                    input.setFocusRingType(NSFocusRingType::None);
+                    input.setFont(Some(&font(15., Weight::Regular)));
+                    self.wire_field(&input, *field, false);
+                    input
+                });
+                input.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+                self.fields.insert(*field, input.clone());
+                self.first.get_or_insert_with(|| input.clone());
+                input.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
+                Retained::into_super(Retained::into_super(input))
             }
             Node::Combo { field, value, items, submit } => {
                 let input = self.kept.remove(field).unwrap_or_else(|| {

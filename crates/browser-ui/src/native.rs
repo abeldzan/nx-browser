@@ -26,9 +26,12 @@ pub(crate) const SETTINGS_QUERY: u32 = 14;
 pub(crate) const PASSWORD_SEARCH: u32 = 15;
 pub(crate) const UI_FONT: u32 = 16;
 pub(crate) const TERM_FONT: u32 = 17;
+pub(crate) const PALETTE_QUERY: u32 = 18;
 
 /// Action ids from here up belong to the open native window (settings).
 pub(crate) const WINDOW_BASE: u32 = 2 << 20;
+/// And from here up, to the floating panel (the command palette).
+pub(crate) const PANEL_BASE: u32 = 3 << 20;
 
 /// Collects a popover's or sheet's handlers while its content is built; a control carries the id `act` returns.
 #[derive(Default)]
@@ -44,6 +47,10 @@ impl Pop {
 
     pub(crate) fn window() -> Self {
         Self { actions: Vec::new(), base: WINDOW_BASE }
+    }
+
+    pub(crate) fn panel() -> Self {
+        Self { actions: Vec::new(), base: PANEL_BASE }
     }
 
     pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {

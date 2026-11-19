@@ -85,6 +85,8 @@ pub struct BrowserWindow {
     popover_actions: Vec<crate::settings::MenuAction>,
     /// The same for the open native sheet, whose ids start at `native::SHEET_BASE`.
     sheet_actions: Vec<crate::settings::MenuAction>,
+    /// The command palette's handlers, from `native::PANEL_BASE` up.
+    panel_actions: Vec<crate::settings::MenuAction>,
     /// The settings window's handlers, from `native::WINDOW_BASE` up.
     window_actions: Vec<crate::settings::MenuAction>,
     /// What is typed in the open popover's text fields, by field id.
@@ -123,11 +125,9 @@ pub struct BrowserWindow {
     /// Give keys to the active terminal on the next render.
     focus_terminal: bool,
     pub(crate) palette_open: bool,
-    pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_index: usize,
     /// The bang shown as a pill in the palette; the input then holds only the query.
     pub(crate) palette_bang: Option<&'static (&'static str, &'static str, &'static str)>,
-    pub(crate) focus_palette: bool,
     chrome: HashMap<String, TabChrome>,
     gesture: Option<Gesture>,
     suppress_window_drag: bool,
@@ -293,7 +293,6 @@ impl BrowserWindow {
         let (installs_tx, installs_rx) = mpsc::channel();
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let palette_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let mut subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
@@ -307,13 +306,6 @@ impl BrowserWindow {
                     this.update_suggestions(typed, cx);
                 }
                 _ => {}
-            }),
-            cx.subscribe(&palette_input, |this, _, event, cx| {
-                if let InputStateEvent::TextChanged = event {
-                    this.palette_index = 0;
-                    this.absorb_bang(cx);
-                    cx.notify();
-                }
             }),
             cx.subscribe(&find_input, |this, input, event, cx| match event {
                 InputStateEvent::Submit => this.find_step(false, cx),
@@ -372,6 +364,7 @@ impl BrowserWindow {
             popover_actions: Vec::new(),
             sheet_actions: Vec::new(),
             window_actions: Vec::new(),
+            panel_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
             history_modal: false,
@@ -392,10 +385,8 @@ impl BrowserWindow {
             focus_find: false,
             focus_terminal: false,
             palette_open: false,
-            palette_input,
             palette_index: 0,
             palette_bang: None,
-            focus_palette: false,
             chrome,
             gesture: None,
             suppress_window_drag: false,
@@ -763,8 +754,9 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
-                use crate::native::{SHEET_BASE, WINDOW_BASE};
+                use crate::native::{PANEL_BASE, SHEET_BASE, WINDOW_BASE};
                 let (slot, base) = match action {
+                    PANEL_BASE.. => (&mut self.panel_actions, PANEL_BASE),
                     WINDOW_BASE.. => (&mut self.window_actions, WINDOW_BASE),
                     SHEET_BASE.. => (&mut self.sheet_actions, SHEET_BASE),
                     _ => (&mut self.popover_actions, 0),
@@ -776,6 +768,7 @@ impl BrowserWindow {
                     cx.notify();
                 }
                 let slot = match action {
+                    PANEL_BASE.. => &mut self.panel_actions,
                     WINDOW_BASE.. => &mut self.window_actions,
                     SHEET_BASE.. => &mut self.sheet_actions,
                     _ => &mut self.popover_actions,
@@ -791,8 +784,20 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::RecordedKey(keys) => self.record_key(&keys, cx),
+            EngineEvent::PopoverKey(key) => self.palette_key(&key, cx),
+            EngineEvent::PanelClosed => {
+                if self.palette_open {
+                    self.palette_open = false;
+                    self.focus_active_content();
+                    cx.notify();
+                }
+            }
             EngineEvent::PopoverText { field, text } => {
                 self.popover_texts.insert(field, text);
+                if field == crate::native::PALETTE_QUERY {
+                    self.palette_index = 0;
+                    self.absorb_bang(cx);
+                }
                 // Sheets that show what is typed (the new profile's badge, history's matches) follow it.
                 cx.notify();
             }
@@ -1619,6 +1624,23 @@ impl BrowserWindow {
         self.window_actions = pop.actions;
     }
 
+    /// Shows the command palette's panel while it is open, or updates it; closes it once it's not.
+    fn sync_palette(&mut self, cx: &mut Context<Self>) {
+        if !self.palette_open {
+            return self.engine.close_panel();
+        }
+        let mut pop = crate::native::Pop::panel();
+        let content = self.palette_node(&mut pop, cx);
+        self.engine.present_panel(1, 560., 72., &content);
+        self.panel_actions = pop.actions;
+    }
+
+    /// Puts `text` in native field `field`, as if typed there.
+    pub(crate) fn set_typed(&mut self, field: u32, text: String) {
+        self.engine.set_popover_field(field, &text);
+        self.popover_texts.insert(field, text);
+    }
+
     /// What is typed in native field `field`.
     pub(crate) fn typed(&self, field: u32) -> String {
         self.popover_texts.get(&field).cloned().unwrap_or_default()
@@ -1963,15 +1985,6 @@ impl BrowserWindow {
         cx.notify();
     }
 
-    fn request_palette_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.focus_palette) {
-            return;
-        }
-        let palette = self.palette_input.clone();
-        self.engine.focus_chrome();
-        window.defer(cx, move |window, cx| window.focus(&palette.focus_handle(cx), cx));
-    }
-
     fn request_terminal_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.focus_terminal) {
             return;
@@ -2187,9 +2200,9 @@ impl Render for BrowserWindow {
         self.sync_popover(window);
         self.sync_sheet(cx);
         self.sync_settings(cx);
+        self.sync_palette(cx);
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
-        self.request_palette_focus(window, cx);
         self.request_find_focus(window, cx);
         self.request_terminal_focus(window, cx);
         let _subscriptions = &self.subscriptions;
@@ -2325,7 +2338,6 @@ impl Render for BrowserWindow {
             }))
             .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
             .child(self.toast_view(cx))
-            .when(self.palette_open, |root| root.child(self.palette_view(cx)))
     }
 }
 

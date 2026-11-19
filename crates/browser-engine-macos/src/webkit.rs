@@ -1032,6 +1032,22 @@ impl MacEngine {
         crate::popover::close_window(Some(self.window_no));
     }
 
+    /// Shows `content` on a floating glass panel centred `top` points below this window's top, or updates it.
+    pub fn present_panel(&self, key: u64, width: f64, top: f64, content: &crate::Node) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::present_panel(self.window_no, &window, key, width, top, content);
+        }
+    }
+
+    pub fn close_panel(&self) {
+        crate::popover::close_panel(Some(self.window_no));
+    }
+
+    /// Whether ⌘ is held now, for a click that opens in a new tab with it.
+    pub fn command_held(&self) -> bool {
+        NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Command)
+    }
+
     /// While on, every key press goes to this window as `EngineEvent::RecordedKey` instead of running anything.
     pub fn record_keys(&self, on: bool) {
         RECORDING.set(on.then_some(self.window_no));
@@ -2052,10 +2068,13 @@ fn install_shortcuts() -> Option<Retained<AnyObject>> {
             crate::popover::dismiss_window();
             return std::ptr::null_mut();
         }
-        let Some(window_no) = window.map(|window| window.windowNumber()).filter(|&no| with_window(no, |state| state.events.is_some()) == Some(true)) else {
+        // Keys in the command palette run its browser window's shortcuts, as they did when it was drawn inside it.
+        let in_panel = window.as_ref().and_then(|window| crate::popover::panel_owner(window));
+        let Some(window_no) = in_panel.or_else(|| window.map(|window| window.windowNumber())).filter(|&no| with_window(no, |state| state.events.is_some()) == Some(true)) else {
             return event.as_ptr();
         };
-        if event_ref.keyCode() == ESCAPE {
+        // The palette's own field takes Esc.
+        if event_ref.keyCode() == ESCAPE && in_panel.is_none() {
             send_event(window_no, EngineEvent::Shortcut(Shortcut::Dismiss));
         }
         let shortcut = bound(event_ref);
