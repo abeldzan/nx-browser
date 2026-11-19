@@ -29,6 +29,8 @@ pub(crate) const TERM_FONT: u32 = 17;
 pub(crate) const PALETTE_QUERY: u32 = 18;
 pub(crate) const FIND_QUERY: u32 = 19;
 pub(crate) const HOME_QUERY: u32 = 20;
+pub(crate) const ADDRESS_QUERY: u32 = 21;
+pub(crate) const SPACE_NAME: u32 = 22;
 
 /// Action ids from here up belong to the open native window (settings).
 pub(crate) const WINDOW_BASE: u32 = 2 << 20;
@@ -40,6 +42,8 @@ pub(crate) const LIST_BASE: u32 = 4 << 20;
 pub(crate) const FIND_BASE: u32 = 5 << 20;
 /// And from here up, to the new tab pages.
 pub(crate) const HOME_BASE: u32 = 6 << 20;
+/// And from here up, to the native chrome (the rail, …).
+pub(crate) const BAR_BASE: u32 = 7 << 20;
 
 /// Collects a popover's or sheet's handlers while its content is built; a control carries the id `act` returns.
 #[derive(Default)]
@@ -71,6 +75,10 @@ impl Pop {
 
     pub(crate) fn home() -> Self {
         Self { actions: Vec::new(), base: HOME_BASE }
+    }
+
+    pub(crate) fn bar() -> Self {
+        Self { actions: Vec::new(), base: BAR_BASE }
     }
 
     pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {

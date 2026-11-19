@@ -698,10 +698,12 @@ fn present_popup(shared: &Rc<RefCell<State>>, action: &WKWebExtensionAction, con
     popover.setDelegate(Some(ProtocolObject::from_ref(&*ui)));
     let [x, y, w, h] = shared.borrow().anchor;
     shared.borrow_mut().popup_ui = Some(ui);
+    // Under its button, or over it when the button sits low in the window, as in the dock.
+    let above = y > content.bounds().size.height / 2.;
     let (rect, edge) = if content.isFlipped() {
-        (NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)), NSRectEdge::MaxY)
+        (NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)), if above { NSRectEdge::MinY } else { NSRectEdge::MaxY })
     } else {
-        (NSRect::new(NSPoint::new(x, content.bounds().size.height - y - h), NSSize::new(w, h)), NSRectEdge::MinY)
+        (NSRect::new(NSPoint::new(x, content.bounds().size.height - y - h), NSSize::new(w, h)), if above { NSRectEdge::MaxY } else { NSRectEdge::MinY })
     };
     popover.showRelativeToRect_ofView_preferredEdge(rect, &content, edge);
     true

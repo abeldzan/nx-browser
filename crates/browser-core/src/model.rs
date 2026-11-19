@@ -386,6 +386,23 @@ impl Model {
         Ok(())
     }
 
+    /// Moves a space to `index` among the active profile's spaces.
+    pub fn move_session(&mut self, id: &str, index: usize) -> anyhow::Result<()> {
+        let mut ids: Vec<String> = self.profile_sessions().iter().map(|session| session.id.clone()).collect();
+        let Some(from) = ids.iter().position(|existing| existing == id) else {
+            return Ok(());
+        };
+        let moved = ids.remove(from);
+        ids.insert(index.min(ids.len()), moved);
+        let tx = self.storage.conn().unchecked_transaction()?;
+        for (position, id) in ids.iter().enumerate() {
+            self.storage.execute("UPDATE sessions SET position = ?1 WHERE id = ?2", params![position as i64, id])?;
+        }
+        tx.commit()?;
+        self.reload()?;
+        Ok(())
+    }
+
     /// Moves a tab to `index` in its space's tab order.
     pub fn move_tab(&mut self, id: &str, index: usize) -> anyhow::Result<()> {
         let mut ids: Vec<String> = self.session_tabs().iter().map(|tab| tab.id.clone()).collect();
@@ -1481,7 +1498,7 @@ impl Model {
             params![profile_id],
         )?;
         self.storage.execute(
-            "INSERT INTO sessions (id, profile_id, name, active) VALUES (?1, ?2, ?3, 1)",
+            "INSERT INTO sessions (id, profile_id, name, active, position) VALUES (?1, ?2, ?3, 1, (SELECT COALESCE(MAX(position), -1) + 1 FROM sessions))",
             params![id, profile_id, name],
         )?;
         Ok(id)
@@ -1644,7 +1661,7 @@ fn query_profiles(storage: &Storage) -> anyhow::Result<Vec<Profile>> {
 fn query_sessions(storage: &Storage) -> anyhow::Result<Vec<Session>> {
     let mut stmt = storage
         .conn()
-        .prepare_cached("SELECT id, profile_id, name, active, free FROM sessions")?;
+        .prepare_cached("SELECT id, profile_id, name, active, free FROM sessions ORDER BY position, rowid")?;
     let rows = stmt.query_map([], |row| {
         Ok(Session {
             id: row.get(0)?,
@@ -1786,6 +1803,20 @@ mod tests {
         model.move_tab(&ids[0], 2).unwrap();
         let order = model.session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         assert_eq!(order, vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]);
+    }
+
+    #[test]
+    fn moved_space_keeps_its_place_and_new_ones_go_last() {
+        let mut model = Model::open(Storage::open_in_memory().unwrap()).unwrap();
+        model.create_session().unwrap();
+        model.create_session().unwrap();
+        let ids = |model: &Model| model.profile_sessions().iter().map(|session| session.id.clone()).collect::<Vec<_>>();
+        let before = ids(&model);
+        assert_eq!(before.len(), 3);
+        model.move_session(&before[2], 0).unwrap();
+        assert_eq!(ids(&model), vec![before[2].clone(), before[0].clone(), before[1].clone()]);
+        model.create_session().unwrap();
+        assert_eq!(ids(&model)[..3], [before[2].clone(), before[0].clone(), before[1].clone()]);
     }
 
     #[test]

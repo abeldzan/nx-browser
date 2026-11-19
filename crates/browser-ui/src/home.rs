@@ -32,6 +32,8 @@ impl BrowserWindow {
         let mut pop = Pop::home();
         for id in blank {
             let (width, height) = self.page_sizes.get(&id).copied().unwrap_or((800., 600.));
+            // The page stretches with its tab; it is rebuilt only every 32pt, to flow the tiles and bookmarks again.
+            let width = ((width / 32.).floor() * 32.).max(32.);
             let page = home_page(&id, width, height, &pinned, &saved, &recent, &mut pop);
             self.engine.set_home(&id, width, [r, g, b, 1.], &page);
         }

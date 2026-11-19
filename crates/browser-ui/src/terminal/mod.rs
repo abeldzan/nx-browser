@@ -25,11 +25,6 @@ pub fn terminal_url(cwd: &std::path::Path) -> String {
     format!("{TERMINAL_URL}?cwd={}", cwd.display())
 }
 
-/// The folder a terminal tab is in, as `~/dev/app`.
-pub fn location(url: &str) -> String {
-    view::short_path(&cwd_of(url))
-}
-
 fn cwd_of(url: &str) -> PathBuf {
     url.split_once("?cwd=").map(|(_, dir)| PathBuf::from(dir)).or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(|| "/".into())
 }

@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use browser_engine::{EngineEvent, LogicalRect};
+use browser_engine::{EngineEvent, LogicalRect, Phase};
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{Bool, ProtocolObject, Sel};
+use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
+    NSAppearance,
     NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSControlSize, NSControlStateValueOff,
     NSControlStateValueOn, NSControlTextEditingDelegate, NSEvent, NSFont, NSFontWeightMedium, NSFontWeightRegular,
     NSFontWeightSemibold, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSLayoutAttribute,
@@ -21,6 +22,7 @@ use objc2_app_kit::{
     NSView, NSViewController, NSWindow, NSWindowStyleMask, NSComboBox, NSPopUpButton, NSStepper, NSVisualEffectView,
     NSVisualEffectMaterial, NSVisualEffectBlendingMode, NSWindowDelegate, NSApplication, NSControl, NSEventModifierFlags,
     NSFocusRingType, NSGlassEffectView, NSTextView, NSWindowOrderingMode, NSAnimationContext, NSAnimatablePropertyContainer,
+    NSEventMask, NSEventType,
 };
 use objc2_foundation::{NSArray, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -65,6 +67,20 @@ pub enum Node {
     Flow { gap: f64, center: bool, children: Vec<Node> },
     /// `child` exactly `width` wide; text inside wraps at that width.
     Width(f64, Box<Node>),
+    /// `child` exactly `height` tall; a `Spacer` in a column inside takes the slack.
+    Height(f64, Box<Node>),
+    /// `child`, running `action` on a right-click (the handler asks the engine where the pointer is).
+    Menu { action: u32, child: Box<Node> },
+    /// `child`, running `enter` when the pointer comes over it and `leave` when it goes; clicks pass through to
+    /// whatever is beneath.
+    Watch { enter: u32, leave: u32, child: Box<Node> },
+    /// `child`, showing `tip` when the pointer rests on it.
+    Tip { tip: String, child: Box<Node> },
+    /// `child`, whose items report being dragged as `EngineEvent::ItemDrag` with `id` instead of clicking.
+    Drag { id: u32, child: Box<Node> },
+    /// A column (or a row when `horizontal`) whose items can be dragged along it, the others sliding aside; a drop
+    /// sends `EngineEvent::ListReorder` for `list`.
+    Reorder { list: u32, gap: f64, horizontal: bool, children: Vec<Node> },
     /// A window's layout: a `sidebar_width` sidebar on the system sidebar material, then `content` scrolling,
     /// both `height` tall.
     Split { sidebar_width: f64, height: f64, sidebar: Box<Node>, content: Box<Node> },
@@ -78,6 +94,13 @@ pub enum Node {
     Faded(Box<Node>),
     /// A box with a tinted background and rounded corners around `child`.
     Card { tint: Ink, child: Box<Node> },
+    /// `child` in a rounded field ringed in the accent colour: a text field being typed in. Its corners are `radius`.
+    Ring { radius: f64, child: Box<Node> },
+    /// `child` with corners of `radius`, on a tinted fill when `tint`: an item's hover highlight takes the same
+    /// corners, so a capsule's contents can be concentric with it.
+    Round { radius: f64, tint: Option<Ink>, child: Box<Node> },
+    /// `child` on a Liquid Glass capsule with corners of `radius`: a group of controls, like a toolbar's.
+    Glass { radius: f64, child: Box<Node> },
     /// A `size` square with rounded corners, filled with `fill` (RGBA) and ringed when `selected`, `child` centred;
     /// pressing it runs `action`. A colour or icon choice, or a profile badge.
     Swatch { size: f64, fill: Option<[f64; 4]>, selected: bool, action: Option<u32>, child: Option<Box<Node>> },
@@ -143,6 +166,7 @@ pub enum Key {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Edge {
     Below,
+    Above,
     Right,
 }
 
@@ -195,6 +219,10 @@ thread_local! {
     static EMBEDS: RefCell<HashMap<String, Surface>> = RefCell::new(HashMap::new());
     /// Search fields, by field id: their arrows, Return, Tab and Esc go to the app as `EngineEvent::PopoverKey`.
     static KEY_FIELDS: RefCell<std::collections::HashSet<u32>> = RefCell::new(std::collections::HashSet::new());
+    /// The click count of the last press released on an item, for a handler telling a double-click apart.
+    static CLICKS: Cell<isize> = const { Cell::new(0) };
+    /// While a `Reorder` row is being dragged: hover swaps would re-lay its stack out from under the drag.
+    static REORDERING: Cell<bool> = const { Cell::new(false) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -220,7 +248,7 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
         if let Some(old) = surface.host.root() {
             scroll_offsets(&old, &mut offsets);
         }
-        let (view, _) = root(mtm, content, surface.width, &mut surface.submits, &mut surface.fields);
+        let (view, _) = root(mtm, content, surface.width, true, &mut surface.submits, &mut surface.fields);
         let size = view.fittingSize();
         match &surface.host {
             Host::Popover(popover) => {
@@ -288,7 +316,7 @@ pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor:
     close();
     let mtm = MainThreadMarker::new().expect("popovers live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, _) = root(mtm, content, width, &mut submits, &mut fields);
+    let (view, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let controller = NSViewController::new(mtm);
     controller.setView(&view);
     let popover = NSPopover::new(mtm);
@@ -305,6 +333,8 @@ pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor:
         (Edge::Right, _) => NSRectEdge::MaxX,
         (Edge::Below, true) => NSRectEdge::MaxY,
         (Edge::Below, false) => NSRectEdge::MinY,
+        (Edge::Above, true) => NSRectEdge::MinY,
+        (Edge::Above, false) => NSRectEdge::MaxY,
     };
     popover.showRelativeToRect_ofView_preferredEdge(rect, content_view, side);
     POPOVER.set(Some(Surface { host: Host::Popover(popover), window_no, key, width, content: content.clone(), submits, fields }));
@@ -337,7 +367,7 @@ pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width
     close_sheet(None);
     let mtm = MainThreadMarker::new().expect("sheets live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
+    let (view, first) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -390,7 +420,7 @@ pub(crate) fn present_window(window_no: isize, parent: &NSWindow, key: u64, titl
     close_window(None);
     let mtm = MainThreadMarker::new().expect("windows live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, _) = root(mtm, content, width, &mut submits, &mut fields);
+    let (view, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -519,7 +549,7 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
     close_float(kind, None, false);
     let mtm = MainThreadMarker::new().expect("panels live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
+    let (view, first) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
     let origin = float_origin(place, parent.frame(), size);
@@ -655,13 +685,15 @@ pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
     })
 }
 
-/// Fills `container` with `content` laid out `width` wide, for browser window `window_no`; rebuilt only when the
-/// content or width changes. The caller places `container`.
-pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64, content: &Node) {
+/// Fills `container` with `content` for browser window `window_no`; rebuilt only when the content or width changes,
+/// which it returns. The caller places `container`. Laid out exactly `width` wide (0: as wide as it needs), or when
+/// `stretch`, as wide as the container, following it as it resizes; `width` then only bounds wrapping and scrolling
+/// at the build, and a new one alone rebuilds nothing.
+pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64, stretch: bool, content: &Node) -> bool {
     let mtm = MainThreadMarker::new().expect("embedded views live on the main thread");
     // Out of the map while rebuilding: moving a focused field ends its editing, which calls back into this module.
     let Some(mut surface) = EMBEDS.with_borrow_mut(|embeds| match embeds.get(key) {
-        Some(surface) if surface.content == *content && surface.width == width => None,
+        Some(surface) if surface.content == *content && (stretch || surface.width == width) => None,
         _ => Some(embeds.remove(key).unwrap_or(Surface {
             host: Host::Embedded(container.retain()),
             window_no,
@@ -672,24 +704,51 @@ pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64,
             fields: HashMap::new(),
         })),
     }) else {
-        return;
+        return false;
     };
     let editing = surface.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
-    let (view, _) = root(mtm, content, width, &mut surface.submits, &mut surface.fields);
+    let (view, _) = root(mtm, content, width, !stretch, &mut surface.submits, &mut surface.fields);
     for old in container.subviews().iter() {
         old.removeFromSuperview();
     }
     container.addSubview(&view);
     view.setTranslatesAutoresizingMaskIntoConstraints(false);
-    // `root` fixed its width; the caller sizes the container to match.
     view.leadingAnchor().constraintEqualToAnchor(&container.leadingAnchor()).setActive(true);
     view.topAnchor().constraintEqualToAnchor(&container.topAnchor()).setActive(true);
+    // Otherwise `root` fixed its width and the caller sizes the container to match.
+    if stretch {
+        view.trailingAnchor().constraintEqualToAnchor(&container.trailingAnchor()).setActive(true);
+    }
     surface.width = width;
     surface.content = content.clone();
     if let Some(field) = editing.and_then(|id| surface.fields.get(&id)) {
         focus(field);
     }
     EMBEDS.with_borrow_mut(|embeds| embeds.insert(key.to_string(), surface));
+    true
+}
+
+/// Where embedded surface `key`'s clickable items sit in their window (top-left origin), by their action.
+pub(crate) fn embed_items(key: &str) -> Vec<(u32, LogicalRect)> {
+    fn walk(view: &NSView, content: &NSView, out: &mut Vec<(u32, LogicalRect)>) {
+        if let Some(action) = view.downcast_ref::<NxPopoverItem>().and_then(|item| item.ivars().click.get()) {
+            let rect = view.convertRect_toView(view.bounds(), Some(content));
+            let top = if content.isFlipped() { rect.origin.y } else { content.bounds().size.height - rect.origin.y - rect.size.height };
+            out.push((action, LogicalRect { x: rect.origin.x, y: top, width: rect.size.width, height: rect.size.height }));
+        }
+        for child in view.subviews().iter() {
+            walk(&child, content, out);
+        }
+    }
+    let mut out = Vec::new();
+    EMBEDS.with_borrow(|embeds| {
+        if let Some(Host::Embedded(container)) = embeds.get(key).map(|surface| &surface.host) {
+            if let Some(content) = container.window().and_then(|window| window.contentView()) {
+                walk(container, &content, &mut out);
+            }
+        }
+    });
+    out
 }
 
 pub(crate) fn unembed(key: &str) {
@@ -744,6 +803,68 @@ fn submit_action(field: u32) -> Option<u32> {
 /// back in here while `refresh` holds the slot.
 fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read: impl FnOnce(&Surface) -> Option<T>) -> Option<T> {
     slot.with(|cell| cell.try_borrow().ok().and_then(|surface| surface.as_ref().and_then(read)))
+}
+
+/// How many clicks the last press released on an item made: 2 for a double-click.
+pub(crate) fn last_clicks() -> isize {
+    CLICKS.get()
+}
+
+type DragFollower = RcBlock<dyn Fn(std::ptr::NonNull<NSEvent>) -> *mut NSEvent>;
+
+thread_local! {
+    /// The monitor following a drag torn off an item, until its release; and its handler, kept past its removal
+    /// (made from inside it) until the next drag.
+    static FOLLOW: RefCell<(Option<Retained<AnyObject>>, Option<DragFollower>)> = const { RefCell::new((None, None)) };
+}
+
+/// Reports the moves and the release of drag `id`, begun in `window`, wherever the pointer goes.
+fn follow_drag(window: Retained<NSWindow>, id: u32) {
+    let handler: DragFollower = RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+        let event_ref = unsafe { event.as_ref() };
+        let up = event_ref.r#type() == NSEventType::LeftMouseUp;
+        report_drag(&window, event_ref, id, if up { Phase::End } else { Phase::Move });
+        if up {
+            if let Some(monitor) = FOLLOW.with(|follow| follow.borrow_mut().0.take()) {
+                unsafe { NSEvent::removeMonitor(&monitor) };
+            }
+        }
+        event.as_ptr()
+    });
+    let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::LeftMouseDragged | NSEventMask::LeftMouseUp, &handler) };
+    let old = FOLLOW.with(|follow| std::mem::replace(&mut *follow.borrow_mut(), (monitor, Some(handler))));
+    if let Some(monitor) = old.0 {
+        unsafe { NSEvent::removeMonitor(&monitor) };
+    }
+}
+
+/// Reports a drag under `id` at `event`, in `window`'s content (top-left origin).
+fn report_drag(window: &NSWindow, event: &NSEvent, id: u32, phase: Phase) {
+    let Some(content) = window.contentView() else {
+        return;
+    };
+    let local = content.convertPoint_fromView(event.locationInWindow(), None);
+    let (x, y) = (local.x, if content.isFlipped() { local.y } else { content.bounds().size.height - local.y });
+    let event = EngineEvent::ItemDrag { id, phase, x, y };
+    match window.windowNumber() {
+        no if crate::webkit::is_browser_window(no) => crate::webkit::send_event(no, event),
+        _ => send(event),
+    }
+}
+
+/// Whether `hit`, or a view between it and `stop`, takes clicks itself: a control, an item, a text editor.
+pub(crate) fn interactive(hit: &NSView, stop: &NSView) -> bool {
+    let mut view = Some(hit.retain());
+    while let Some(current) = view {
+        if std::ptr::eq(&*current, stop) {
+            return false;
+        }
+        if current.downcast_ref::<objc2_app_kit::NSControl>().is_some() || current.downcast_ref::<NSTextView>().is_some() || current.downcast_ref::<NxPopoverItem>().is_some() {
+            return true;
+        }
+        view = unsafe { current.superview() };
+    }
+    false
 }
 
 /// Sends `event` to the browser window `view` is in, when it is embedded in one; else as `send` does.
@@ -882,6 +1003,22 @@ define_class!(
             }
         }
 
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn text_did_end(&self, notification: &NSNotification) {
+            // Search fields report losing the caret, so the address bar knows its edit ended.
+            let Some(field) = notification.object().and_then(|object| object.downcast::<NSTextField>().ok()) else {
+                return;
+            };
+            let tag = field.tag() as u32;
+            // Not while its surface is being rebuilt, which moves the field and focuses it again after.
+            let settled = |surface: &Surface| surface.fields.get(&tag).is_some_and(|kept| std::ptr::eq(&**kept, &*field));
+            let known = [&PANEL, &FIND, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().any(|slot| peek(slot, |surface| settled(surface).then_some(())).is_some())
+                || EMBEDS.with(|embeds| embeds.try_borrow().is_ok_and(|embeds| embeds.values().any(settled)));
+            if known && KEY_FIELDS.with_borrow(|fields| fields.contains(&tag)) {
+                send_for(&field, EngineEvent::PopoverKey { field: tag, key: "blur".into() });
+            }
+        }
+
         #[unsafe(method(controlTextDidChange:))]
         fn text_did_change(&self, notification: &NSNotification) {
             let Some(field) = notification.object().and_then(|object| object.downcast::<NSTextField>().ok()) else {
@@ -893,6 +1030,129 @@ define_class!(
     }
 );
 
+/// A `Reorder` row being dragged. The row itself stays in the stack, invisible, moving to the slot under the pointer
+/// as AppKit lays the stack out again (the rows it passes slide aside); a glass copy of it follows the pointer.
+struct Lift {
+    stack: Retained<NSStackView>,
+    row: Retained<NSView>,
+    /// The copy, in the window's content view above everything.
+    ghost: Retained<NSView>,
+    /// Where the copy was picked up, in content view coordinates.
+    home: NSRect,
+    from: usize,
+    to: usize,
+}
+
+/// Lays `stack` out again, its rows gliding to their new places, then runs `done`.
+/// How `arrange_list` last laid out a `Reorder` stack; a freshly built one stands as built.
+#[derive(Default)]
+struct Arranged {
+    widths: Vec<f64>,
+    hide: Option<usize>,
+    clear: Option<usize>,
+    gap: Option<(usize, f64)>,
+    spacer: Option<Retained<NSView>>,
+}
+
+thread_local! {
+    /// Every `Reorder` stack built, by list id (ids repeat across windows), with its arrangement.
+    static LISTS: RefCell<Vec<(u32, objc2::rc::Weak<NSStackView>, Arranged)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lays out `window`'s `Reorder` list `list` for a drag passing over it, animated from how it stood: its items
+/// `widths` wide, item `hide` collapsed away (the one being dragged), and a gap open before shown item `gap.0`,
+/// `gap.1` wide, where the drag would land; item `clear` kept in its place but unseen (one landing there). Nothing
+/// is rebuilt, so the items slide.
+pub(crate) fn arrange_list(window: &NSWindow, list: u32, widths: &[f64], hide: Option<usize>, clear: Option<usize>, gap: Option<(usize, f64)>) {
+    LISTS.with_borrow_mut(|lists| {
+        let ours = |stack: &NSStackView| stack.window().is_some_and(|other| std::ptr::eq(&*other, window));
+        let Some((_, weak, arranged)) = lists.iter_mut().find(|(id, stack, _)| *id == list && stack.load().is_some_and(|stack| ours(&stack))) else {
+            return;
+        };
+        let Some(stack) = weak.load() else {
+            return;
+        };
+        if arranged.widths == widths && arranged.hide == hide && arranged.clear == clear && arranged.gap == gap {
+            return;
+        }
+        let spacer = arranged.spacer.clone();
+        let is_spacer = |view: &NSView| spacer.as_deref().is_some_and(|spacer| std::ptr::eq(spacer, view));
+        let rows = stack.arrangedSubviews().iter().filter(|row| !is_spacer(row)).collect::<Vec<_>>();
+        for (index, row) in rows.iter().enumerate() {
+            if let (Some(width), Some(constraint)) = (widths.get(index), width_constraint(row)) {
+                if constraint.constant() != *width {
+                    constraint.setConstant(*width);
+                }
+            }
+            let hidden = hide == Some(index);
+            if row.isHidden() != hidden {
+                row.setHidden(hidden);
+            }
+            let alpha = if clear == Some(index) { 0. } else { 1. };
+            if row.alphaValue() != alpha {
+                row.setAlphaValue(alpha);
+            }
+        }
+        if let Some(spacer) = &arranged.spacer {
+            stack.removeArrangedSubview(spacer);
+            spacer.removeFromSuperview();
+        }
+        arranged.spacer = gap.map(|(at, width)| {
+            let spacer = NSView::new(stack.mtm());
+            spacer.setTranslatesAutoresizingMaskIntoConstraints(false);
+            spacer.widthAnchor().constraintEqualToConstant(width).setActive(true);
+            spacer.heightAnchor().constraintEqualToConstant(1.).setActive(true);
+            // Before the `at`th item still shown, or after them all.
+            let shown = rows.iter().filter(|row| !row.isHidden()).nth(at);
+            let all = stack.arrangedSubviews();
+            let index = shown.and_then(|row| all.iter().position(|other| std::ptr::eq(&*other, &**row))).unwrap_or(all.len());
+            stack.insertArrangedSubview_atIndex(&spacer, index as isize);
+            spacer
+        });
+        (arranged.widths, arranged.hide, arranged.clear, arranged.gap) = (widths.to_vec(), hide, clear, gap);
+        relayout(&stack, None);
+    });
+}
+
+/// The fixed-width constraint a `Width` node put on `view`.
+fn width_constraint(view: &NSView) -> Option<Retained<objc2_app_kit::NSLayoutConstraint>> {
+    view.constraints().iter().find(|constraint| {
+        // The view's own constant width: no second item, and the view itself first.
+        let (first, second) = unsafe { (constraint.firstItem(), constraint.secondItem()) };
+        constraint.firstAttribute() == NSLayoutAttribute::Width && second.is_none() && first.is_some_and(|item| std::ptr::eq(Retained::as_ptr(&item).cast::<NSView>(), view))
+    })
+}
+
+fn relayout(stack: &NSStackView, done: Option<Box<dyn Fn()>>) {
+    let stack = stack.retain();
+    let changes = RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
+        let context = unsafe { context.as_ref() };
+        context.setDuration(0.2);
+        context.setAllowsImplicitAnimation(true);
+        stack.layoutSubtreeIfNeeded();
+    });
+    let done = done.map(|done| RcBlock::new(move || done()));
+    NSAnimationContext::runAnimationGroup_completionHandler(&changes, done.as_deref());
+}
+
+/// A picture of `row` on a glass capsule, at `frame` in `content`, lifted above everything.
+fn ghost(row: &NSView, content: &NSView, frame: NSRect) -> Retained<NSView> {
+    let mtm = row.mtm();
+    let bounds = row.bounds();
+    let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), frame);
+    glass.setCornerRadius((bounds.size.height.min(bounds.size.width) / 2.).min(12.));
+    if let Some(rep) = row.bitmapImageRepForCachingDisplayInRect(bounds) {
+        row.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+        let image = NSImage::initWithSize(NSImage::alloc(), bounds.size);
+        image.addRepresentation(&rep);
+        let picture = NSImageView::imageViewWithImage(&image, mtm);
+        picture.setFrame(bounds);
+        glass.setContentView(Some(&picture));
+    }
+    content.addSubview(&glass);
+    Retained::into_super(glass)
+}
+
 struct ItemIvars {
     click: Cell<Option<u32>>,
     drag: RefCell<Option<PathBuf>>,
@@ -900,6 +1160,14 @@ struct ItemIvars {
     swaps: RefCell<Vec<(Retained<NSView>, bool)>>,
     press: Cell<Option<NSPoint>>,
     hovered: Cell<bool>,
+    /// The corners of its hover highlight.
+    radius: Cell<f64>,
+    /// The `Reorder` column it can be dragged along, by list id.
+    reorder: RefCell<Option<(u32, objc2::rc::Weak<NSStackView>)>>,
+    /// While dragged along it.
+    lifted: RefCell<Option<Lift>>,
+    /// The `Drag` id it reports drags under.
+    drags: Cell<Option<u32>>,
 }
 
 define_class!(
@@ -927,10 +1195,25 @@ define_class!(
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
-            let (Some(start), Some(path)) = (self.ivars().press.get(), self.ivars().drag.borrow().clone()) else {
+            let Some(start) = self.ivars().press.get() else {
                 return;
             };
             let at = event.locationInWindow();
+            let stack = self.ivars().reorder.borrow().as_ref().and_then(|(_, stack)| stack.load());
+            if let Some(stack) = stack {
+                self.drag_row(&stack, event, start, at);
+                return;
+            }
+            if self.ivars().drags.get().is_some() {
+                if (at.x - start.x).abs() + (at.y - start.y).abs() > 4. {
+                    self.tear_off(event);
+                }
+                return;
+            }
+
+            let Some(path) = self.ivars().drag.borrow().clone() else {
+                return;
+            };
             if (at.x - start.x).abs() + (at.y - start.y).abs() > 4. {
                 self.ivars().press.set(None);
                 crate::drag::drag_file(&path);
@@ -938,7 +1221,13 @@ define_class!(
         }
 
         #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
+        fn mouse_up(&self, event: &NSEvent) {
+            CLICKS.set(event.clickCount());
+            if self.ivars().lifted.borrow().is_some() {
+                self.ivars().press.set(None);
+                self.settle(true);
+                return;
+            }
             if self.ivars().press.take().is_some() {
                 if let Some(action) = self.ivars().click.get() {
                     send_for(self, EngineEvent::PopoverAction(action));
@@ -950,7 +1239,8 @@ define_class!(
         fn draw_rect(&self, _dirty: NSRect) {
             if self.ivars().hovered.get() && self.ivars().click.get().is_some() {
                 NSColor::quaternarySystemFillColor().setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 6., 6.).fill();
+                let radius = self.ivars().radius.get();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), radius, radius).fill();
             }
         }
     }
@@ -958,7 +1248,17 @@ define_class!(
 
 impl NxPopoverItem {
     fn new(mtm: MainThreadMarker, click: Option<u32>, drag: Option<PathBuf>) -> Retained<Self> {
-        let ivars = ItemIvars { click: Cell::new(click), drag: RefCell::new(drag), swaps: RefCell::default(), press: Cell::new(None), hovered: Cell::new(false) };
+        let ivars = ItemIvars {
+            click: Cell::new(click),
+            drag: RefCell::new(drag),
+            swaps: RefCell::default(),
+            press: Cell::new(None),
+            hovered: Cell::new(false),
+            radius: Cell::new(6.),
+            reorder: RefCell::default(),
+            lifted: RefCell::default(),
+            drags: Cell::new(None),
+        };
         let this: Retained<Self> = unsafe { msg_send![super(Self::alloc(mtm).set_ivars(ivars)), initWithFrame: NSRect::ZERO] };
         let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect;
         let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(&this), None) };
@@ -966,12 +1266,208 @@ impl NxPopoverItem {
         this
     }
 
+    /// Drags the `Reorder` row holding this item along its stack, from `start` to `at` (window coordinates). Pulled
+    /// well off the stack's line, an item that is also in a `Drag` tears off instead and reports an `ItemDrag` from then on.
+    fn drag_row(&self, stack: &NSStackView, event: &NSEvent, start: NSPoint, at: NSPoint) {
+        let horizontal = stack.orientation() == NSUserInterfaceLayoutOrientation::Horizontal;
+        let Some(content) = self.window().and_then(|window| window.contentView()) else {
+            return;
+        };
+        let (from, to) = (content.convertPoint_fromView(start, None), content.convertPoint_fromView(at, None));
+        let (along, across) = if horizontal { (to.x - from.x, to.y - from.y) } else { (to.y - from.y, to.x - from.x) };
+        let tears = self.ivars().drags.get().is_some();
+        if self.ivars().lifted.borrow().is_none() {
+            if tears && across.abs() > 8. && across.abs() > along.abs() {
+                return self.tear_off(event);
+            }
+            if along.abs() < 4. {
+                return;
+            }
+            let rows = stack.arrangedSubviews();
+            let Some(index) = rows.iter().position(|row| self.isDescendantOf(&row)) else {
+                return;
+            };
+            let row = rows.objectAtIndex(index);
+            let home = row.convertRect_toView(row.bounds(), Some(&content));
+            let ghost = ghost(&row, &content, home);
+            row.setAlphaValue(0.);
+            REORDERING.set(true);
+            *self.ivars().lifted.borrow_mut() = Some(Lift { stack: stack.retain(), row, ghost, home, from: index, to: index });
+        }
+        if tears && across.abs() > 28. {
+            self.settle(false);
+            return self.tear_off(event);
+        }
+        let mut lifted = self.ivars().lifted.borrow_mut();
+        let Some(lift) = lifted.as_mut() else {
+            return;
+        };
+        // Along the stack only, and not past its ends.
+        let line = stack.convertRect_toView(stack.bounds(), Some(&content));
+        let origin = if horizontal {
+            NSPoint::new((lift.home.origin.x + along).clamp(line.origin.x, (line.origin.x + line.size.width - lift.home.size.width).max(line.origin.x)), lift.home.origin.y)
+        } else {
+            NSPoint::new(lift.home.origin.x, (lift.home.origin.y + along).clamp(line.origin.y, (line.origin.y + line.size.height - lift.home.size.height).max(line.origin.y)))
+        };
+        lift.ghost.setFrameOrigin(origin);
+        let centre = |row: &NSView| {
+            let rect = row.convertRect_toView(row.bounds(), Some(&content));
+            if horizontal { rect.origin.x + rect.size.width / 2. } else { rect.origin.y + rect.size.height / 2. }
+        };
+        let (low, high) = if horizontal { (origin.x, origin.x + lift.home.size.width) } else { (origin.y, origin.y + lift.home.size.height) };
+        // In content coordinates the order runs left to right, or top to bottom: down the y axis unless flipped.
+        let forward = horizontal || content.isFlipped();
+        // As in AppKit's lists, a row gives way once the dragged one covers half of it, whichever way it moves:
+        // its leading edge past the next row's middle, or its trailing edge past the previous one's.
+        let (ahead, behind) = if forward { (high, low) } else { (low, high) };
+        let passed = |middle: f64, edge: f64, onward: bool| if onward == forward { edge > middle } else { edge < middle };
+        let rows = stack.arrangedSubviews().iter().collect::<Vec<_>>();
+        let mut before = lift.to;
+        while rows.get(before + 1).is_some_and(|next| passed(centre(next), ahead, true)) {
+            before += 1;
+        }
+        // One way at a time: scanning back from a slot already moved forward would meet its own (invisible) row.
+        if before == lift.to {
+            while before > 0 && rows.get(before - 1).is_some_and(|previous| passed(centre(previous), behind, false)) {
+                before -= 1;
+            }
+        }
+        if before != lift.to {
+            lift.to = before;
+            stack.removeArrangedSubview(&lift.row);
+            stack.insertArrangedSubview_atIndex(&lift.row, before as isize);
+            relayout(stack, None);
+        }
+    }
+
+    /// Ends a row drag: the copy glides into the slot the row now holds and the row shows again, then the move goes
+    /// out as `ListReorder`. When not `drop` (a tear-off), the row goes back to its own slot and nothing is reported.
+    fn settle(&self, drop: bool) {
+        let Some(lift) = self.ivars().lifted.take() else {
+            return;
+        };
+        REORDERING.set(false);
+        let Lift { stack, row, ghost, from, to, .. } = lift;
+        let moved = drop && to != from;
+        if !drop && to != from {
+            stack.removeArrangedSubview(&row);
+            stack.insertArrangedSubview_atIndex(&row, from as isize);
+            stack.layoutSubtreeIfNeeded();
+        }
+        if !drop {
+            ghost.removeFromSuperview();
+            row.setAlphaValue(1.);
+            return;
+        }
+        stack.layoutSubtreeIfNeeded();
+        let list = self.ivars().reorder.borrow().as_ref().map(|(list, _)| *list);
+        let target = unsafe { ghost.superview() }.map(|content| row.convertRect_toView(row.bounds(), Some(&content)));
+        let item = self.retain();
+        let changes = {
+            let ghost = ghost.clone();
+            RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
+                unsafe { context.as_ref() }.setDuration(0.18);
+                if let Some(target) = target {
+                    ghost.animator().setFrame(target);
+                }
+            })
+        };
+        let done = RcBlock::new(move || {
+            ghost.removeFromSuperview();
+            row.setAlphaValue(1.);
+            if let (true, Some(list)) = (moved, list) {
+                send_for(&item, EngineEvent::ListReorder { list, from, to });
+            }
+        });
+        NSAnimationContext::runAnimationGroup_completionHandler(&changes, Some(&done));
+    }
+
+    /// Hands the press over to the `Drag` it is in: an `ItemDrag` begins here.
+    /// The drag goes on to rebuild this item's surface, taking it out of its window, and AppKit sends a view gone
+    /// from its window no more of it: a monitor follows the rest, and the item lets the press go.
+    fn tear_off(&self, event: &NSEvent) {
+        let Some(id) = self.ivars().drags.get() else {
+            return;
+        };
+        self.ivars().press.set(None);
+        let Some(window) = self.window().or_else(|| event.window(self.mtm())) else {
+            return;
+        };
+        report_drag(&window, event, id, Phase::Begin);
+        follow_drag(window, id);
+    }
+
     fn set_hovered(&self, hovered: bool) {
+        if REORDERING.get() {
+            return;
+        }
         self.ivars().hovered.set(hovered);
         for (view, on_hover) in self.ivars().swaps.borrow().iter() {
             view.setHidden(*on_hover != hovered);
         }
         self.setNeedsDisplay(true);
+    }
+}
+
+define_class!(
+    /// Runs its action on a right-click anywhere inside, which the views within pass up the responder chain.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NxMenuView"]
+    #[ivars = Cell<u32>]
+    struct NxMenuView;
+
+    impl NxMenuView {
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, _event: &NSEvent) {
+            send_for(self, EngineEvent::PopoverAction(self.ivars().get()));
+        }
+    }
+);
+
+impl NxMenuView {
+    fn new(mtm: MainThreadMarker, action: u32) -> Retained<Self> {
+        unsafe { msg_send![super(Self::alloc(mtm).set_ivars(Cell::new(action))), initWithFrame: NSRect::ZERO] }
+    }
+}
+
+define_class!(
+    /// Reports the pointer coming over it and leaving, as actions; never the target of a click itself.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NxWatchView"]
+    #[ivars = (u32, u32)]
+    struct NxWatchView;
+
+    impl NxWatchView {
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            send_for(self, EngineEvent::PopoverAction(self.ivars().0));
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            send_for(self, EngineEvent::PopoverAction(self.ivars().1));
+        }
+
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> *mut NSView {
+            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
+            match hit {
+                Some(hit) if !std::ptr::eq(Retained::as_ptr(&hit).cast::<Self>(), self) => Retained::autorelease_ptr(hit),
+                _ => std::ptr::null_mut(),
+            }
+        }
+    }
+);
+
+impl NxWatchView {
+    fn new(mtm: MainThreadMarker, enter: u32, leave: u32) -> Retained<Self> {
+        let this: Retained<Self> = unsafe { msg_send![super(Self::alloc(mtm).set_ivars((enter, leave))), initWithFrame: NSRect::ZERO] };
+        let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect;
+        let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(&this), None) };
+        this.addTrackingArea(&area);
+        this
     }
 }
 
@@ -1017,14 +1513,19 @@ fn root(
     mtm: MainThreadMarker,
     content: &Node,
     width: f64,
+    fixed: bool,
     submits: &mut HashMap<u32, u32>,
     fields: &mut HashMap<u32, Retained<NSTextField>>,
 ) -> (Retained<NSView>, Option<Retained<NSTextField>>) {
     let mut kept = std::mem::take(fields);
     submits.clear();
-    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width, first: None };
+    // Width 0 leaves it its natural width; wrapping text and scroll views still need some bound.
+    let bound = if width > 0. { width } else { 10_000. };
+    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width: bound, first: None, reorder: None, drags: None };
     let view = build.node(content);
-    view.widthAnchor().constraintEqualToConstant(width).setActive(true);
+    if fixed && width > 0. {
+        view.widthAnchor().constraintEqualToConstant(width).setActive(true);
+    }
     view.layoutSubtreeIfNeeded();
     (view, build.first)
 }
@@ -1041,6 +1542,10 @@ struct Build<'a> {
     width: f64,
     /// The first text field built, which a sheet starts with focus in.
     first: Option<Retained<NSTextField>>,
+    /// Items met since the innermost `Reorder` began, while inside one.
+    reorder: Option<Vec<Retained<NxPopoverItem>>>,
+    /// The innermost `Drag` id, while inside one.
+    drags: Option<u32>,
 }
 
 impl Build<'_> {
@@ -1064,12 +1569,20 @@ impl Build<'_> {
             Node::Row { gap, children } => {
                 let stack = self.stack(children, NSUserInterfaceLayoutOrientation::Horizontal, *gap);
                 stack.setAlignment(NSLayoutAttribute::CenterY);
+                // Two spacers share the slack equally, centring what is between them.
+                let views = stack.arrangedSubviews();
+                let spacers = children.iter().enumerate().filter(|(_, child)| matches!(child, Node::Spacer)).filter(|(index, _)| *index < views.count()).map(|(index, _)| views.objectAtIndex(index)).collect::<Vec<_>>();
+                if let [first, second] = spacers.as_slice() {
+                    first.widthAnchor().constraintEqualToAnchor(&second.widthAnchor()).setActive(true);
+                }
                 Retained::into_super(stack)
             }
             Node::Spacer => {
                 let view = NSView::new(mtm);
-                view.setContentHuggingPriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
-                view.setContentCompressionResistancePriority_forOrientation(1., NSLayoutConstraintOrientation::Horizontal);
+                for orientation in [NSLayoutConstraintOrientation::Horizontal, NSLayoutConstraintOrientation::Vertical] {
+                    view.setContentHuggingPriority_forOrientation(1., orientation);
+                    view.setContentCompressionResistancePriority_forOrientation(1., orientation);
+                }
                 view
             }
             Node::Text { text, size, weight, ink, wrap, shrink } => {
@@ -1157,7 +1670,7 @@ impl Build<'_> {
                 Retained::into_super(Retained::into_super(view))
             }
             Node::Swatch { size, fill, selected, action, child } => {
-                let item = NxPopoverItem::new(mtm, *action, None);
+                let item = self.item(*action, None);
                 let tile = NSBox::new(mtm);
                 tile.setBoxType(NSBoxType::Custom);
                 tile.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
@@ -1339,6 +1852,46 @@ impl Build<'_> {
                 view.widthAnchor().constraintEqualToConstant(*width).setActive(true);
                 view
             }
+            Node::Height(height, child) => {
+                let view = self.node(child);
+                view.heightAnchor().constraintEqualToConstant(*height).setActive(true);
+                view
+            }
+            Node::Menu { action, child } => {
+                let holder = NxMenuView::new(mtm, *action);
+                pin(&holder, &self.node(child), 0.);
+                Retained::into_super(holder)
+            }
+            Node::Watch { enter, leave, child } => {
+                let holder = NxWatchView::new(mtm, *enter, *leave);
+                pin(&holder, &self.node(child), 0.);
+                Retained::into_super(holder)
+            }
+            Node::Tip { tip, child } => {
+                let view = self.node(child);
+                view.setToolTip(Some(&NSString::from_str(tip)));
+                view
+            }
+            Node::Drag { id, child } => {
+                let outer = self.drags.replace(*id);
+                let view = self.node(child);
+                self.drags = outer;
+                view
+            }
+            Node::Reorder { list, gap, horizontal, children } => {
+                let outer = self.reorder.replace(Vec::new());
+                let orientation = if *horizontal { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
+                let stack = self.stack(children, orientation, *gap);
+                stack.setAlignment(if *horizontal { NSLayoutAttribute::CenterY } else { NSLayoutAttribute::CenterX });
+                for item in std::mem::replace(&mut self.reorder, outer).unwrap_or_default() {
+                    *item.ivars().reorder.borrow_mut() = Some((*list, objc2::rc::Weak::from_retained(&stack)));
+                }
+                LISTS.with_borrow_mut(|lists| {
+                    lists.retain(|(_, stack, _)| stack.load().is_some());
+                    lists.push((*list, objc2::rc::Weak::from_retained(&stack), Arranged::default()));
+                });
+                Retained::into_super(stack)
+            }
             Node::Split { sidebar_width, height, sidebar, content } => {
                 let outer = self.width;
                 let side = NSVisualEffectView::new(mtm);
@@ -1399,7 +1952,7 @@ impl Build<'_> {
             }
             Node::Item { height, click, drag, children } => {
                 let outer = std::mem::take(&mut self.swaps);
-                let item = NxPopoverItem::new(mtm, *click, drag.clone());
+                let item = self.item(*click, drag.clone());
                 self.width -= 12.;
                 let row = self.node(&Node::Row { gap: 8., children: children.clone() });
                 self.width += 12.;
@@ -1427,11 +1980,55 @@ impl Build<'_> {
                 card.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
                 card.setBorderWidth(0.);
                 card.setCornerRadius(8.);
-                card.setFillColor(&color(*tint).colorWithAlphaComponent(0.12));
+                card.setFillColor(&tinted(*tint, 0.12));
                 // The box sits behind the child, not around it: as its content view the child sized nothing and the
                 // card collapsed, and pinned inside the box it never got clicks (a box hit-tests only its content view).
                 let holder = NSView::new(mtm);
                 pin(&holder, &card, 0.);
+                pin(&holder, &self.node(child), 0.);
+                holder
+            }
+            Node::Round { radius, tint, child } => {
+                let inner = self.node(child);
+                if let Some(item) = inner.downcast_ref::<NxPopoverItem>() {
+                    item.ivars().radius.set(*radius);
+                }
+                match tint {
+                    None => inner,
+                    Some(tint) => {
+                        let fill = NSBox::new(mtm);
+                        fill.setBoxType(NSBoxType::Custom);
+                        fill.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+                        fill.setBorderWidth(0.);
+                        fill.setCornerRadius(*radius);
+                        fill.setFillColor(&tinted(*tint, 0.14));
+                        let holder = NSView::new(mtm);
+                        pin(&holder, &fill, 0.);
+                        pin(&holder, &inner, 0.);
+                        holder
+                    }
+                }
+            }
+            Node::Ring { radius, child } => {
+                let ring = NSBox::new(mtm);
+                ring.setBoxType(NSBoxType::Custom);
+                ring.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+                ring.setCornerRadius(*radius);
+                ring.setBorderWidth(2.);
+                ring.setBorderColor(&NSColor::controlAccentColor());
+                ring.setFillColor(&tinted(Ink::Secondary, 0.12));
+                // Behind the child, as with `Card`.
+                let holder = NSView::new(mtm);
+                pin(&holder, &ring, 0.);
+                pin(&holder, &self.node(child), 0.);
+                holder
+            }
+            Node::Glass { radius, child } => {
+                // Behind the child rather than holding it, as with `Card`, so the child sizes the capsule.
+                let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+                glass.setCornerRadius(*radius);
+                let holder = NSView::new(mtm);
+                pin(&holder, &glass, 0.);
                 pin(&holder, &self.node(child), 0.);
                 holder
             }
@@ -1476,6 +2073,16 @@ impl Build<'_> {
             cell.setScrollable(true);
             cell.setUsesSingleLineMode(true);
         }
+    }
+
+    /// A clickable item view, which a `Reorder` being built lets drag.
+    fn item(&mut self, click: Option<u32>, drag: Option<PathBuf>) -> Retained<NxPopoverItem> {
+        let item = NxPopoverItem::new(self.mtm, click, drag);
+        item.ivars().drags.set(self.drags);
+        if let Some(items) = &mut self.reorder {
+            items.push(item.clone());
+        }
+        item
     }
 
     fn stack(&mut self, children: &[Node], orientation: NSUserInterfaceLayoutOrientation, gap: f64) -> Retained<NSStackView> {
@@ -1526,6 +2133,18 @@ fn color(ink: Ink) -> Retained<NSColor> {
         Ink::Accent => NSColor::controlAccentColor(),
         Ink::Danger => NSColor::systemRedColor(),
     }
+}
+
+/// `ink` at `alpha`, resolved per appearance at draw time: `colorWithAlphaComponent` on a system color freezes it
+/// in the appearance current when called, which on a dark system left light-theme cards white on white.
+fn tinted(ink: Ink, alpha: f64) -> Retained<NSColor> {
+    let provider = RcBlock::new(move |appearance: std::ptr::NonNull<NSAppearance>| {
+        let resolved = RefCell::new(None);
+        unsafe { appearance.as_ref() }.performAsCurrentDrawingAppearance(&RcBlock::new(|| *resolved.borrow_mut() = Some(color(ink).colorWithAlphaComponent(alpha))));
+        let resolved = resolved.into_inner().expect("performAsCurrentDrawingAppearance runs its block");
+        std::ptr::NonNull::new(Retained::autorelease_ptr(resolved)).expect("a color")
+    });
+    unsafe { NSColor::colorWithName_dynamicProvider(None, &provider) }
 }
 
 fn symbol(name: &str, size: f64) -> Option<Retained<NSImage>> {

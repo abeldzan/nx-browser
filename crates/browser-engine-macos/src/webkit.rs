@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSResponder, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSGlassEffectView, NSResponder, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
@@ -768,6 +768,12 @@ pub struct MacEngine {
     homes: HashMap<String, Retained<NSView>>,
     /// Where each home was last placed (content coordinates), for one made after its first placement.
     home_frames: HashMap<String, Option<NSRect>>,
+    /// Native chrome by key (the rail, …), over the GPUI view: the view placed, and the one holding the content.
+    bars: HashMap<String, (Retained<NSView>, Retained<NSView>)>,
+    /// Browser window frames by key, each stacked just above its page.
+    frames: HashMap<String, Retained<crate::frame::NxFrameView>>,
+    /// The snap preview while a dragged window would snap.
+    snap: Option<Retained<NSView>>,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     settings: EngineSettings,
     https_only: Arc<AtomicBool>,
@@ -816,6 +822,9 @@ impl MacEngine {
             placed_holes: None,
             homes: HashMap::new(),
             home_frames: HashMap::new(),
+            bars: HashMap::new(),
+            frames: HashMap::new(),
+            snap: None,
             permissions,
             settings: EngineSettings::default(),
             https_only: Arc::new(AtomicBool::new(false)),
@@ -1415,20 +1424,142 @@ impl MacEngine {
         CATransaction::commit();
     }
 
-    /// Orders live page views back to front, directly below the GPUI chrome view.
-    pub fn stack_tabs(&mut self, ids: &[String]) {
+    /// Orders windows back to front, directly below the GPUI chrome view: each one's page (by tab id), then its
+    /// frame (by frame key) over it.
+    pub fn stack_tabs(&mut self, windows: &[(String, String)]) {
+        let ids = windows.iter().flat_map(|(page, frame)| [page.clone(), frame.clone()]).collect::<Vec<_>>();
         // Restacking re-adds views to our window, which would pull a fullscreen page out of WebKit's.
         if self.stacked == ids || self.tabs.values().any(|live| in_fullscreen(&live.view)) {
             return;
         }
-        self.stacked = ids.to_vec();
-        for id in ids {
-            if let Some(home) = self.homes.get(id) {
+        self.stacked = ids;
+        for (page, frame) in windows {
+            if let Some(home) = self.homes.get(page) {
                 self.insert_below_chrome(home);
-            } else if let Some(live) = self.tabs.get(id) {
+            } else if let Some(live) = self.tabs.get(page) {
                 self.insert_below_chrome(&live.view);
             }
+            if let Some(view) = self.frames.get(frame) {
+                self.insert_below_chrome(view);
+            }
         }
+    }
+
+    /// Shows browser window frame `key` as `style` says, with `strip` in its title strip; `stack_tabs` orders it
+    /// above its page.
+    pub fn set_window_frame(&mut self, key: &str, style: crate::FrameStyle, strip: &crate::Node) {
+        let (Some(mtm), Some(content)) = (MainThreadMarker::new(), self.content.clone()) else {
+            return;
+        };
+        let view = match self.frames.get(key) {
+            Some(view) => view.clone(),
+            None => {
+                let view = crate::frame::NxFrameView::new(mtm, key, self.window_no, style.clone());
+                self.insert_below_chrome(&view);
+                self.frames.insert(key.to_string(), view.clone());
+                // Not yet in its place among the pages.
+                self.stacked.clear();
+                view
+            }
+        };
+        view.apply(style, content.bounds().size.height);
+        // Stretched, so resizing the window lays the strip out again rather than rebuilding it.
+        crate::popover::embed(self.window_no, &self.frame_key(key), view.strip(), 0., true, strip);
+    }
+
+    /// Moves window frame `key` to `shell` as its page moves, in the same pass, so the two never part.
+    pub fn place_window_frame(&self, key: &str, shell: LogicalRect) {
+        if let (Some(view), Some(content)) = (self.frames.get(key), &self.content) {
+            let style = crate::FrameStyle { shell, ..view.style() };
+            view.apply(style, content.bounds().size.height);
+        }
+    }
+
+    /// Shows where a dragged window would snap to, `rect` in the window (top-left origin), or nothing; a light tint
+    /// over whatever is there rather than glass, which would blur away the window being dragged.
+    pub fn set_snap(&mut self, rect: Option<LogicalRect>, radius: f64, accent: [f64; 4]) {
+        let (Some(mtm), Some(content)) = (MainThreadMarker::new(), self.content.clone()) else {
+            return;
+        };
+        let Some(rect) = rect else {
+            if let Some(view) = self.snap.take() {
+                view.removeFromSuperview();
+            }
+            return;
+        };
+        let frame = NSRect::new(NSPoint::new(rect.x, content.bounds().size.height - rect.y - rect.height), NSSize::new(rect.width, rect.height));
+        let fresh = self.snap.is_none();
+        let view = self.snap.get_or_insert_with(|| {
+            let view = NSView::new(mtm);
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                let [r, g, b, _] = accent;
+                layer.setCornerRadius(radius);
+                layer.setBorderWidth(2.);
+                layer.setBorderColor(Some(&CGColor::new_srgb(r, g, b, 0.9)));
+                layer.setBackgroundColor(Some(&CGColor::new_srgb(r, g, b, 0.2)));
+            }
+            match &self.chrome {
+                Some(chrome) => content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, Some(chrome)),
+                None => content.addSubview(&view),
+            }
+            view.setFrame(frame);
+            view.setAlphaValue(0.);
+            view
+        });
+        // Fades in where it first shows, then glides from target to target.
+        if fresh || view.frame() != frame {
+            let view = view.clone();
+            let changes = RcBlock::new(move |context: std::ptr::NonNull<objc2_app_kit::NSAnimationContext>| {
+                let context = unsafe { context.as_ref() };
+                context.setDuration(0.16);
+                context.setAllowsImplicitAnimation(true);
+                view.setFrame(frame);
+                view.setAlphaValue(1.);
+            });
+            objc2_app_kit::NSAnimationContext::runAnimationGroup_completionHandler(&changes, None);
+        }
+    }
+
+    /// Drops the window frames not named in `keep`.
+    pub fn keep_window_frames(&mut self, keep: &[String]) {
+        // Not one being pressed (a window carried off mid-drag): it is still getting that drag, so it only goes clear.
+        for (key, view) in &self.frames {
+            if !keep.contains(key) && view.pressed() {
+                view.setAlphaValue(0.);
+            }
+        }
+        let gone = self.frames.iter().filter(|(key, view)| !keep.contains(key) && !view.pressed()).map(|(key, _)| key.clone()).collect::<Vec<_>>();
+        for key in gone {
+            if let Some(view) = self.frames.remove(&key) {
+                view.removeFromSuperview();
+            }
+            crate::popover::unembed(&self.frame_key(&key));
+        }
+    }
+
+    /// Where window frame `key`'s clickable items sit in the window (top-left origin), by their action.
+    pub fn frame_items(&self, key: &str) -> Vec<(u32, LogicalRect)> {
+        crate::popover::embed_items(&self.frame_key(key))
+    }
+
+    /// Puts the caret in window frame `key`'s text field (its address bar), all of it selected.
+    pub fn focus_frame_field(&self, key: &str) {
+        crate::popover::focus_embed(&self.frame_key(key));
+    }
+
+    /// Puts the caret in native chrome `key`'s text field (a space being renamed).
+    pub fn focus_bar_field(&self, key: &str) {
+        crate::popover::focus_embed(&self.bar_key(key));
+    }
+
+    /// How many clicks the last press released on a native item made: 2 for a double-click.
+    pub fn last_clicks(&self) -> isize {
+        crate::popover::last_clicks()
+    }
+
+    fn frame_key(&self, key: &str) -> String {
+        format!("frame:{}:{key}", self.window_no)
     }
 
     /// Shows `content` as tab `tab_id`'s new tab page, laid out `width` wide on `background` (sRGB with alpha);
@@ -1455,7 +1586,7 @@ impl MacEngine {
             let [r, g, b, a] = background;
             layer.setBackgroundColor(Some(&CGColor::new_srgb(r, g, b, a)));
         }
-        crate::popover::embed(self.window_no, tab_id, &container, width, content);
+        crate::popover::embed(self.window_no, tab_id, &container, width, true, content);
     }
 
     /// Drops the new tab pages of tabs not in `keep` (navigated away, closed, or in another space).
@@ -1490,6 +1621,162 @@ impl MacEngine {
         if unsafe { container.superview() }.is_none() {
             self.insert_below_chrome(container);
         }
+    }
+
+    /// Shows `content` as native chrome `key` at `frame` (top-left origin), over the GPUI view; on Liquid Glass
+    /// with corner `radius` when given. A `frame` 0 wide fits the content, ending at `frame.x`. Rebuilt only when the
+    /// content or size changes; returns the width it took.
+    /// Puts the window's close, minimize and zoom buttons in a row whose top-left is `at`, or in a column whose
+    /// top centre is `at`; returns the y where they end. Each frame, as AppKit lays them out again on resizes and
+    /// fullscreen. Left alone in fullscreen, where AppKit shows them in its own title bar.
+    pub fn place_traffic_lights(&self, at: (f64, f64), column: bool) -> f64 {
+        const GAP: f64 = 6.;
+        const SIZE: f64 = 14.;
+        let end = at.1 + if column { 3. * SIZE + 2. * GAP } else { SIZE };
+        let Some(window) = self.content.as_ref().and_then(|view| view.window()) else {
+            return end;
+        };
+        if window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+            return end;
+        }
+        let buttons = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton].map(|kind| window.standardWindowButton(kind));
+        let [Some(close), Some(minimize), Some(zoom)] = buttons else {
+            return end;
+        };
+        // The buttons' own view, and the container AppKit sizes to the title bar; they only take clicks inside it.
+        let Some(container) = (unsafe { close.superview() }).and_then(|row| unsafe { row.superview() }) else {
+            return end;
+        };
+        let size = close.frame().size;
+        let height = end + at.1;
+        let window_h = window.frame().size.height;
+        let frame = NSRect::new(NSPoint::new(0., window_h - height), NSSize::new(window.frame().size.width, height));
+        let mut moved = container.frame() != frame;
+        if moved {
+            container.setFrame(frame);
+        }
+        // AppKit's title bar is not flipped: y runs up from the container's foot.
+        let lights = [close, minimize, zoom];
+        for (index, button) in lights.iter().enumerate() {
+            let step = index as f64 * (if column { size.height } else { size.width } + GAP);
+            let origin = if column {
+                NSPoint::new(at.0 - size.width / 2., height - at.1 - size.height - step)
+            } else {
+                NSPoint::new(at.0 + step, height - at.1 - size.height)
+            };
+            if button.frame().origin != origin {
+                button.setFrameOrigin(origin);
+                moved = true;
+            }
+        }
+        if moved {
+            container.updateTrackingAreas();
+            lights.iter().for_each(|button| button.updateTrackingAreas());
+        }
+        end
+    }
+
+    pub fn set_bar(&mut self, key: &str, frame: LogicalRect, radius: Option<f64>, content: &crate::Node) -> f64 {
+        let (Some(mtm), Some(view)) = (MainThreadMarker::new(), self.content.clone()) else {
+            return frame.width;
+        };
+        let (placed, holder) = match self.bars.get(key) {
+            Some(bar) => bar.clone(),
+            None => {
+                let holder = NSView::new(mtm);
+                // Presses on its empty space go on to the GPUI view beneath (the title bar's drag area).
+                let placed = crate::frame::NxPassView::new(mtm);
+                let inner = match radius {
+                    Some(radius) => {
+                        let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
+                        glass.setCornerRadius(radius);
+                        glass.setContentView(Some(&holder));
+                        Retained::into_super(glass)
+                    }
+                    None => holder.clone(),
+                };
+                inner.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+                placed.addSubview(&inner);
+                let placed = Retained::into_super(placed);
+                match &self.chrome {
+                    Some(chrome) => view.addSubview_positioned_relativeTo(&placed, NSWindowOrderingMode::Above, Some(chrome)),
+                    None => view.addSubview(&placed),
+                }
+                self.bars.insert(key.to_string(), (placed.clone(), holder.clone()));
+                (placed, holder)
+            }
+        };
+        let glass = placed.subviews().firstObject();
+        if let (Some(radius), Some(glass)) = (radius, glass.as_deref().and_then(|view| view.downcast_ref::<NSGlassEffectView>())) {
+            if glass.cornerRadius() != radius {
+                glass.setCornerRadius(radius);
+            }
+        }
+        let fit = frame.width <= 0.;
+        // A sized bar stretches to its frame, so moving or resizing it (a dragged card, the dock opening) rebuilds nothing.
+        let rebuilt = crate::popover::embed(self.window_no, &self.bar_key(key), &holder, frame.width.max(0.), !fit, content);
+        if let (true, false, Some(inner)) = (rebuilt, fit, holder.subviews().firstObject()) {
+            // Spacers fill the bar's height too (a dragged card centres its content), but content of a set height keeps it.
+            let bottom = inner.bottomAnchor().constraintEqualToAnchor(&holder.bottomAnchor());
+            bottom.setPriority(objc2_app_kit::NSLayoutPriorityDefaultHigh);
+            bottom.setActive(true);
+        }
+        let width = match holder.subviews().firstObject() {
+            Some(inner) if fit && rebuilt => inner.fittingSize().width,
+            _ if fit => placed.frame().size.width,
+            _ => frame.width,
+        };
+        let x = if fit { frame.x - width } else { frame.x };
+        let height = view.bounds().size.height;
+        let rect = NSRect::new(NSPoint::new(x, height - frame.y - frame.height), NSSize::new(width, frame.height));
+        if placed.frame() != rect {
+            placed.setFrame(rect);
+            if let Some(inner) = placed.subviews().firstObject() {
+                inner.setFrame(placed.bounds());
+            }
+        }
+        width
+    }
+
+    /// Arranges this window's reorder list `list` for a drag passing over it; see `popover::arrange_list`.
+    pub fn arrange_list(&self, list: u32, widths: &[f64], hide: Option<usize>, clear: Option<usize>, gap: Option<(usize, f64)>) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::arrange_list(&window, list, widths, hide, clear, gap);
+        }
+    }
+
+    /// Drops the native chrome not named in `keep`.
+    pub fn keep_bars(&mut self, keep: &[&str]) {
+        let gone = self.bars.keys().filter(|key| !keep.contains(&key.as_str())).cloned().collect::<Vec<_>>();
+        for key in gone {
+            if let Some((placed, _)) = self.bars.remove(&key) {
+                placed.removeFromSuperview();
+            }
+            crate::popover::unembed(&self.bar_key(&key));
+        }
+    }
+
+    /// Where native chrome `key`'s clickable items sit in the window (top-left origin), by their action.
+    pub fn bar_items(&self, key: &str) -> Vec<(u32, LogicalRect)> {
+        crate::popover::embed_items(&self.bar_key(key))
+    }
+
+    /// The pointer in this window's content (top-left origin), for a menu opened from native chrome.
+    pub fn pointer(&self) -> Option<(f64, f64)> {
+        let view = self.content.as_ref()?;
+        let at = view.window()?.mouseLocationOutsideOfEventStream();
+        let local = view.convertPoint_fromView(at, None);
+        Some((local.x, if view.isFlipped() { local.y } else { view.bounds().size.height - local.y }))
+    }
+
+    /// Whether Shift is held now, for a native control whose click acts differently with it.
+    pub fn shift_held(&self) -> bool {
+        NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Shift)
+    }
+
+    /// Bars live among the new tab pages in the embedded surfaces, so their keys carry the window.
+    fn bar_key(&self, key: &str) -> String {
+        format!("bar:{}:{key}", self.window_no)
     }
 
     fn insert_below_chrome(&self, view: &NSView) {
@@ -2145,7 +2432,7 @@ fn unify_data_root(webkit: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// The window's corner radius less the page inset in browser-ui, so the page's corners follow the window's.
-const PAGE_RADIUS: f64 = 9.0;
+const PAGE_RADIUS: f64 = 15.0;
 
 /// Rounds a page's bottom corners; the top ones meet the title bar and stay square.
 fn round_bottom_corners(view: &NSView) {
@@ -2313,6 +2600,21 @@ fn over_page(state: &WindowState, point: NSPoint) -> Option<&PageHole> {
     state.holes.iter().rev().find(|hole| hole_contains(hole.rect, point))
 }
 
+/// Whether `point` (in `content`'s coordinates) lands on a browser window's native frame: its title strip or rims.
+fn on_frame(content: &NSView, point: NSPoint) -> bool {
+    let Some(parent) = (unsafe { content.superview() }) else {
+        return false;
+    };
+    let mut view = content.hitTest(content.convertPoint_toView(point, Some(&parent)));
+    while let Some(current) = view {
+        if current.downcast_ref::<crate::frame::NxFrameView>().is_some() {
+            return true;
+        }
+        view = unsafe { current.superview() };
+    }
+    false
+}
+
 fn hole_contains(rect: NSRect, point: NSPoint) -> bool {
     point.x >= rect.origin.x
         && point.y >= rect.origin.y
@@ -2342,9 +2644,11 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
             return event.as_ptr();
         }
         let point = content.convertPoint_fromView(event_ref.locationInWindow(), None);
+        // A press on a window's native frame (its title strip, its rims) is the frame's, not the page's.
+        let on_frame = on_frame(&content, point);
         with_window(window.windowNumber(), |state| {
             // The latest click wins: a page click still waiting for the UI tick would blur an address field opened since.
-            state.click = over_page(state, point).map(|hit| hit.tab_id.clone());
+            state.click = over_page(state, point).filter(|_| !on_frame).map(|hit| hit.tab_id.clone());
             if let Some(notify) = state.on_click.as_ref().filter(|_| state.click.is_some()) {
                 notify();
             }
@@ -2401,7 +2705,12 @@ extern "C-unwind" fn drag_hit_test(this: &AnyObject, _cmd: Sel, point: *mut NSPo
     let (Some(window), Some(point)) = (view.window(), unsafe { point.as_ref() }) else {
         return std::ptr::null_mut();
     };
-    if !hole_contains(view.frame(), *point) || with_window(window.windowNumber(), |state| over_page(state, *point).is_some()) == Some(true) {
+    if !hole_contains(view.frame(), *point) {
+        return std::ptr::null_mut();
+    }
+    // Over a window's title strip a link drag is the chrome's (it opens a gap in the tab row), page or not.
+    let strip = unsafe { view.superview() }.is_some_and(|content| on_frame(&content, *point));
+    if !strip && with_window(window.windowNumber(), |state| over_page(state, *point).is_some()) == Some(true) {
         return std::ptr::null_mut();
     }
     std::ptr::from_ref(this).cast_mut()
@@ -2480,7 +2789,9 @@ extern "C-unwind" fn drag_conclude(this: &AnyObject, _cmd: Sel, info: *mut AnyOb
 extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *mut AnyObject {
     let view = unsafe { &*std::ptr::from_ref(this).cast::<NSView>() };
     if let Some(window) = view.window() {
-        if with_window(window.windowNumber(), |state| over_page(state, point).is_some()) == Some(true) {
+        // Over a window (page and frame) or its resize rims, the native views beneath take the press.
+        let beneath = |state: &mut WindowState| !state.modal && (over_page(state, point).is_some() || state.grabs.iter().any(|rect| hole_contains(*rect, point)));
+        if with_window(window.windowNumber(), beneath) == Some(true) {
             return std::ptr::null_mut();
         }
     }

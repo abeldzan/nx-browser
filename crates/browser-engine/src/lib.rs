@@ -13,6 +13,16 @@ pub struct LogicalRect {
     pub height: f64,
 }
 
+/// Where a native press, drag or hover is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Begin,
+    Move,
+    End,
+    /// The pointer came over it, no button held.
+    Enter,
+}
+
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
     Navigated {
@@ -94,6 +104,14 @@ pub enum EngineEvent {
     PopoverKey { field: u32, key: String },
     /// The floating panel (the command palette) closed because it lost key: a click outside it.
     PanelClosed,
+    /// An item of native list `list` was dragged from position `from` to `to`.
+    ListReorder { list: u32, from: usize, to: usize },
+    /// A press on window frame `key`'s title strip (`edges` 0: a move) or resize rim (`edges`: 1 left, 2 right,
+    /// 4 top, 8 bottom), followed while held; or the pointer entering the frame. At `x`, `y` in the window's
+    /// content, top-left origin.
+    WindowGesture { key: String, phase: Phase, x: f64, y: f64, edges: u8, shift: bool },
+    /// Native item `id` (a tab pill, a space chip) dragged past a few points, followed until released.
+    ItemDrag { id: u32, phase: Phase, x: f64, y: f64 },
     /// The native window (settings) was closed: its close button, Esc or ⌘W.
     NativeWindowClosed,
     /// Keys pressed while recording a shortcut, in gpui keystroke form: `escape`, `backspace`, or a combination

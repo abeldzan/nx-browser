@@ -2,6 +2,7 @@ mod default_browser;
 mod dock;
 mod drag;
 mod extensions;
+mod frame;
 mod popover;
 mod screenshot;
 mod updates;
@@ -17,4 +18,5 @@ pub use popover::{Edge, Float, Initial, Ink, Key, Node, Place, Style, Weight, Wr
 pub use updates::on_check_for_updates;
 pub use vault::{authenticate, vault_key};
 pub use extensions::{Extensions, SCHEME as EXTENSION_SCHEME};
+pub use frame::FrameStyle;
 pub use webkit::{LiveTab, MacEngine};

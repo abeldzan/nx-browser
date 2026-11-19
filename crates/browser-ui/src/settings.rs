@@ -7,7 +7,7 @@ use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
 use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
 use crate::terminal::is_terminal;
 use browser_engine::LogicalRect;
-use gpui::{canvas, prelude::*, Context};
+use gpui::Context;
 use gpuikit::theme::parse_hex;
 
 pub const PROFILE_ICONS: [&str; 17] =
@@ -346,8 +346,8 @@ impl BrowserWindow {
     }
 
     /// Shows `rows` as a native menu at `position`; `EngineEvent::MenuPick` runs the picked row.
-    fn show_menu(&mut self, rows: Vec<MenuRow>, position: gpui::Point<gpui::Pixels>) {
-        let items = rows.iter().map(|row| row.as_ref().map(|(label, enabled, _)| (*label, *enabled))).collect::<Vec<_>>();
+    pub(crate) fn show_menu(&mut self, rows: Vec<MenuRow>, position: gpui::Point<gpui::Pixels>) {
+        let items = rows.iter().map(|row| row.as_ref().map(|(label, enabled, _)| (label.as_ref(), *enabled))).collect::<Vec<_>>();
         self.engine.show_menu(&items, (f64::from(position.x), f64::from(position.y)));
         self.menu_actions = rows.into_iter().map(|row| row.map(|(_, _, run)| run)).collect();
     }
@@ -888,19 +888,6 @@ fn stepper(pop: &mut Pop, value: String, minus: fn(&mut Settings), plus: fn(&mut
     Node::Stepper { value, down }
 }
 
-/// Reports its parent's bounds each frame so web pages are cut out under that overlay.
-pub(crate) fn measure_overlay(radius: f64, cx: &mut Context<BrowserWindow>) -> impl IntoElement {
-    let watch = cx.entity();
-    canvas(
-        move |bounds: gpui::Bounds<gpui::Pixels>, _, cx| watch.update(cx, |view, _| view.overlay_rects.push((logical(bounds), radius))),
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .top_0()
-    .left_0()
-    .size_full()
-}
-
 
 /// A colour as RGBA for a native swatch.
 fn rgba(color: gpui::Hsla) -> [f64; 4] {
@@ -918,11 +905,11 @@ pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
 }
 
 /// A native menu row: (label, enabled, what picking it runs); `None` is a separator.
-pub(crate) type MenuRow = Option<(&'static str, bool, MenuAction)>;
+pub(crate) type MenuRow = Option<(std::borrow::Cow<'static, str>, bool, MenuAction)>;
 pub(crate) type MenuAction = Box<dyn Fn(&mut BrowserWindow, &mut Context<BrowserWindow>)>;
 
-fn menu_item(label: &'static str, enabled: bool, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> MenuRow {
-    Some((label, enabled, Box::new(run)))
+pub(crate) fn menu_item(label: impl Into<std::borrow::Cow<'static, str>>, enabled: bool, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> MenuRow {
+    Some((label.into(), enabled, Box::new(run)))
 }
 
 /// Asks for a folder, then stores it with `set`.

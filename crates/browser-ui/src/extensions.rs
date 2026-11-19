@@ -1,9 +1,8 @@
 use crate::native::{button, empty, field, rgb, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, Wrap};
 use crate::window::Popover;
-use crate::window::{paint, site_color, BrowserWindow};
+use crate::window::{site_color, BrowserWindow};
 use browser_extensions::store_id;
-use gpui::{div, img, prelude::*, px, ClickEvent, Context, FontWeight, SharedString};
-use gpuikit::layout::h_stack;
+use gpui::Context;
 
 /// The install field in the extensions popover.
 pub(crate) const EXT_FIELD: u32 = 0;
@@ -277,100 +276,10 @@ impl BrowserWindow {
         let installed = model.extensions.iter().any(|extension| extension.id == id) || self.installing.contains(&id);
         (!installed).then_some(id)
     }
-
-    /// Buttons for pinned extensions in the title bar, with the badge text the extension sets.
-    pub(crate) fn pinned_extensions(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let (store, tab) = (self.active_store(), self.active_tab_id());
-        let pinned = self.model.lock().extensions.iter().filter(|extension| extension.enabled && extension.pinned).cloned().collect::<Vec<_>>();
-        let mut row = h_stack().items_center().gap(px(2.));
-        if self.store_page_id().is_some() {
-            row = row.child(
-                div()
-                    .id("titlebar-add-extension")
-                    .h(px(22.))
-                    .px(px(10.))
-                    .mr(px(4.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .bg(paint.accent)
-                    .text_color(paint.bg)
-                    .text_size(paint.text(12.))
-                    .cursor_pointer()
-                    .child("Add to NxBrowser")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        if let Some(id) = this.store_page_id() {
-                            this.install_from_store(id);
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-        for extension in pinned {
-            let id = extension.id.clone();
-            let icon = self.ext_meta.get(&id).and_then(|meta| meta.icon.clone());
-            let badge = self.engine.extensions().badge(&id, &store, tab.as_deref());
-            row = row.child(
-                div()
-                    .id(SharedString::from(format!("pinned-{id}")))
-                    .relative()
-                    .size(px(22.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(paint.secondary))
-                    .child(extension_icon(&extension.name, icon, 16.))
-                    .when(!badge.is_empty(), |button| {
-                        button.child(
-                            div()
-                                .absolute()
-                                .bottom(px(1.))
-                                .right(px(0.))
-                                .px(px(3.))
-                                .rounded(px(4.))
-                                .bg(paint.accent)
-                                .text_color(paint.bg)
-                                .text_size(px(8.))
-                                .child(badge),
-                        )
-                    })
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| this.open_extension(&id, f32::from(event.position().x), cx))),
-            );
-        }
-        row
-    }
 }
 
 /// `extension_icon` for a native popover.
-fn extension_image(name: &str, icon: Option<std::path::PathBuf>, size: f64) -> Node {
+pub(crate) fn extension_image(name: &str, icon: Option<std::path::PathBuf>, size: f64) -> Node {
     let letter = name.chars().next().unwrap_or('?').to_uppercase().to_string();
     Node::Image { path: icon, letter, rgb: rgb(site_color(name)), size, radius: size / 4. }
-}
-
-/// An extension's manifest icon, or a lettered tile when it has none.
-pub(crate) fn extension_icon(name: &str, icon: Option<std::path::PathBuf>, size: f32) -> gpui::AnyElement {
-    let letter = name.chars().next().unwrap_or('?').to_uppercase().to_string();
-    let color = site_color(name);
-    let tile = move || {
-        div()
-            .size(px(size))
-            .flex_none()
-            .rounded(px(size / 4.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(color)
-            .text_color(gpui::rgb(0xFFFFFF))
-            .text_size(px(size * 0.55))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(letter.clone())
-            .into_any_element()
-    };
-    match icon {
-        Some(path) => img(path).size(px(size)).flex_none().with_fallback(tile).into_any_element(),
-        None => tile(),
-    }
 }

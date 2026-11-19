@@ -3,6 +3,8 @@ mod downloads;
 mod extensions;
 mod history;
 mod home;
+mod rail;
+mod toolbar;
 mod native;
 mod palette;
 mod passwords;
@@ -14,7 +16,7 @@ mod update;
 mod window;
 
 use gpui::{
-    App, AppContext, Application, Bounds, Pixels, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+    App, AppContext, Application, Bounds, Pixels, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
@@ -116,7 +118,8 @@ pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: i
             titlebar: Some(TitlebarOptions {
                 title: Some("NxBrowser".into()),
                 appears_transparent: true,
-                traffic_light_position: Some(point(px(12.), px(9.))),
+                // Placed by the engine each frame: a column at the rail's head, or a row in a torn-off window.
+                traffic_light_position: None,
             }),
             // Tabs live in the titlebar; empty titlebar space moves the window itself.
             app_owns_titlebar_drag: true,
