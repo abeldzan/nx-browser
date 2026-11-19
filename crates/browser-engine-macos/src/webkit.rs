@@ -1051,6 +1051,21 @@ impl MacEngine {
         crate::popover::close_float(crate::Float::List, Some(self.window_no), false);
     }
 
+    /// Shows the find bar on a glass panel whose top-left is `at` (window coordinates), taking key when it opens;
+    /// or updates and moves it.
+    pub fn show_find(&self, at: (f64, f64), width: f64, content: &crate::Node) {
+        self.float(crate::Float::Find, 1, width, crate::Place::Top { x: Some(at.0), y: at.1 }, false, content);
+    }
+
+    pub fn close_find(&self) {
+        crate::popover::close_float(crate::Float::Find, Some(self.window_no), false);
+    }
+
+    /// Puts the caret back in the find bar's field.
+    pub fn focus_find(&self) {
+        crate::popover::focus_float(crate::Float::Find, self.window_no);
+    }
+
     /// Shows `text` in a glass toast at the bottom of this window, fading in when `animate`.
     pub fn show_toast(&self, text: &str, animate: bool) {
         if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {

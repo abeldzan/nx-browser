@@ -89,9 +89,9 @@ pub enum EngineEvent {
     },
     /// The popover closed on its own (a press outside it, or Esc).
     PopoverClosed,
-    /// A list key in the command palette's search field: `up`, `down`, `enter`, `cmd-enter`, `tab`, `escape`,
-    /// `right` (caret at the end) or `backspace` (field empty).
-    PopoverKey(String),
+    /// A list key in a floating panel's search field (the palette's, the find bar's): `up`, `down`, `enter`,
+    /// `cmd-enter`, `shift-enter`, `tab`, `escape`, `right` (caret at the end) or `backspace` (field empty).
+    PopoverKey { field: u32, key: String },
     /// The floating panel (the command palette) closed because it lost key: a click outside it.
     PanelClosed,
     /// The native window (settings) was closed: its close button, Esc or ⌘W.

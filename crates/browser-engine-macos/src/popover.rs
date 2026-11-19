@@ -48,8 +48,9 @@ pub enum Node {
     /// A text field showing `value` when created; edits arrive as `PopoverText`, Return runs `submit` (and so
     /// does leaving the field, when `blur`).
     Field { field: u32, value: Initial, placeholder: String, submit: u32, secure: bool, blur: bool },
-    /// The command palette's borderless, larger search field; list keys arrive as `EngineEvent::PopoverKey`.
-    Search { field: u32, placeholder: String },
+    /// A borderless search field (the command palette's, the find bar's) in `size`pt text, showing `value` when
+    /// created; list keys arrive as `EngineEvent::PopoverKey`.
+    Search { field: u32, value: Initial, placeholder: String, size: f64 },
     /// A text field with a list to pick from (`NSComboBox`); a pick or Return runs `submit`, as does leaving it.
     Combo { field: u32, value: Initial, items: Vec<String>, submit: u32 },
     /// A pop-up menu of `items` showing `selected`; picking item `i` runs action `first + i`.
@@ -180,6 +181,7 @@ thread_local! {
     static PANEL: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static LIST: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static TOAST: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static FIND: RefCell<Option<Surface>> = const { RefCell::new(None) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -461,6 +463,8 @@ pub enum Float {
     List,
     /// Shows a message only: clicks pass through it, and it fades in and out.
     Toast,
+    /// Takes key for its search field like the palette, but stays up when the page is clicked (the find bar).
+    Find,
 }
 
 /// Where a floating panel's glass goes, in its browser window's coordinates (top-left origin).
@@ -477,6 +481,7 @@ fn float_slot(kind: Float) -> &'static std::thread::LocalKey<RefCell<Option<Surf
         Float::Palette => &PANEL,
         Float::List => &LIST,
         Float::Toast => &TOAST,
+        Float::Find => &FIND,
     }
 }
 
@@ -486,6 +491,15 @@ fn float_slot(kind: Float) -> &'static std::thread::LocalKey<RefCell<Option<Surf
 pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, key: u64, width: f64, place: Place, animate: bool, content: &Node) {
     let slot = float_slot(kind);
     if refresh(slot, window_no, key, content) {
+        // Follows what it is placed by (the find bar's page, when its window is dragged).
+        slot.with_borrow(|surface| {
+            if let Some(Surface { host: Host::Panel(panel, _, _), .. }) = surface {
+                let origin = float_origin(place, parent.frame(), panel.frame().size);
+                if origin != panel.frame().origin {
+                    panel.setFrameOrigin(origin);
+                }
+            }
+        });
         return;
     }
     close_float(kind, None, false);
@@ -494,17 +508,9 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
     let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
     let size = view.fittingSize();
     let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
-    let outer = parent.frame();
-    let centred = outer.origin.x + (outer.size.width - size.width) / 2.;
-    let origin = match place {
-        Place::Top { x, y } => NSPoint::new(
-            x.map_or(centred, |x| outer.origin.x + x - GLASS_MARGIN),
-            outer.origin.y + outer.size.height - y - size.height + GLASS_MARGIN,
-        ),
-        Place::Bottom(above) => NSPoint::new(centred, outer.origin.y + above - GLASS_MARGIN),
-    };
+    let origin = float_origin(place, parent.frame(), size);
     let panel: Retained<NxPanel> = unsafe {
-        let panel = NxPanel::alloc(mtm).set_ivars(PanelIvars { takes_key: kind == Float::Palette });
+        let panel = NxPanel::alloc(mtm).set_ivars(PanelIvars { takes_key: matches!(kind, Float::Palette | Float::Find) });
         msg_send![super(panel), initWithContentRect: NSRect::new(origin, size), styleMask: NSWindowStyleMask::Borderless, backing: NSBackingStoreType::Buffered, defer: false]
     };
     // Held by its slot; AppKit releasing it on close as well would free it twice.
@@ -536,6 +542,8 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
     unsafe { parent.addChildWindow_ordered(&panel, NSWindowOrderingMode::Above) };
     if kind == Float::Palette {
         TARGET.with(|target| panel.setDelegate(Some(ProtocolObject::from_ref(&**target))));
+    }
+    if matches!(kind, Float::Palette | Float::Find) {
         panel.makeKeyAndOrderFront(None);
         if let Some(field) = &first {
             focus(field);
@@ -545,6 +553,30 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
         fade(&panel, 1., None);
     }
     slot.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields }));
+}
+
+/// Where a panel `size` big (glass margin included) goes for `place` over a window framed `outer`, in screen points.
+fn float_origin(place: Place, outer: NSRect, size: NSSize) -> NSPoint {
+    let centred = outer.origin.x + (outer.size.width - size.width) / 2.;
+    match place {
+        Place::Top { x, y } => NSPoint::new(
+            x.map_or(centred, |x| outer.origin.x + x - GLASS_MARGIN),
+            outer.origin.y + outer.size.height - y - size.height + GLASS_MARGIN,
+        ),
+        Place::Bottom(above) => NSPoint::new(centred, outer.origin.y + above - GLASS_MARGIN),
+    }
+}
+
+/// Makes the panel of this kind key again with the caret in its field (⌘F while the find bar is up).
+pub(crate) fn focus_float(kind: Float, owner: isize) {
+    float_slot(kind).with_borrow(|surface| {
+        if let Some(Surface { host: Host::Panel(panel, _, _), fields, .. }) = surface.as_ref().filter(|surface| surface.window_no == owner) {
+            panel.makeKeyAndOrderFront(None);
+            if let Some(field) = fields.values().next() {
+                focus(field);
+            }
+        }
+    });
 }
 
 /// Animates `panel`'s opacity to `alpha` over a toast's fade, then runs `done`.
@@ -602,14 +634,16 @@ const GLASS_MARGIN: f64 = 48.;
 
 /// The browser window that opened `window`, when it is the open panel: keys pressed there run that window's shortcuts.
 pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
-    PANEL.with_borrow(|surface| {
-        surface.as_ref().filter(|surface| matches!(&surface.host, Host::Panel(panel, _, _) if std::ptr::eq(Retained::as_ptr(panel).cast::<NSWindow>(), window))).map(|surface| surface.window_no)
+    [&PANEL, &FIND].into_iter().find_map(|slot| {
+        slot.with_borrow(|surface| {
+            surface.as_ref().filter(|surface| matches!(&surface.host, Host::Panel(panel, _, _) if std::ptr::eq(Retained::as_ptr(panel).cast::<NSWindow>(), window))).map(|surface| surface.window_no)
+        })
     })
 }
 
 /// Replaces the text in field `field` of the open popover, sheet, window or panel, caret at the end.
 pub(crate) fn set_field(field: u32, text: &str) {
-    for slot in [&PANEL, &WINDOW, &SHEET, &POPOVER] {
+    for slot in [&PANEL, &FIND, &WINDOW, &SHEET, &POPOVER] {
         slot.with_borrow(|surface| {
             if let Some(input) = surface.as_ref().and_then(|surface| surface.fields.get(&field)) {
                 input.setStringValue(&NSString::from_str(text));
@@ -623,7 +657,7 @@ pub(crate) fn set_field(field: u32, text: &str) {
 
 /// Field `field`'s Return action, in whichever surface has it.
 fn submit_action(field: u32) -> Option<u32> {
-    [&PANEL, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+    [&PANEL, &FIND, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
 }
 
 /// `read` of the surface in `slot`, skipping one being rebuilt: moving its focused field ends editing, which calls
@@ -633,7 +667,7 @@ fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read:
 }
 
 fn send(event: EngineEvent) {
-    let window_no = [&PANEL, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
+    let window_no = [&PANEL, &FIND, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
     if let Some(window_no) = window_no {
         crate::webkit::send_event(window_no, event);
     }
@@ -689,29 +723,35 @@ define_class!(
     }
 
     unsafe impl NSControlTextEditingDelegate for NxPopoverTarget {
-        /// The palette's list keys: arrows, Return, Tab, Esc, and → or ⌫ at the field's ends. Other fields keep theirs.
+        /// The palette's and find bar's keys: arrows, Return (with ⌘ or ⇧), Tab, Esc, and → or ⌫ at the field's ends.
+        /// Other fields keep theirs.
         #[unsafe(method(control:textView:doCommandBySelector:))]
         fn do_command(&self, control: &NSControl, text_view: &NSTextView, command: Sel) -> Bool {
-            if peek(&PANEL, |surface| surface.fields.values().any(|field| std::ptr::eq(Retained::as_ptr(field).cast::<NSControl>(), control)).then_some(())).is_none() {
+            let mine = |surface: &Surface| surface.fields.iter().find(|(_, field)| std::ptr::eq(Retained::as_ptr(field).cast::<NSControl>(), control)).map(|(id, _)| *id);
+            let Some(field) = peek(&PANEL, mine).or_else(|| peek(&FIND, mine)) else {
                 return Bool::NO;
-            }
+            };
+            // The key event's own modifiers: the keyboard's live state misses replayed and posted keys.
+            let event = NSApplication::sharedApplication(self.mtm()).currentEvent();
+            let flags = event.as_ref().map(|event| event.modifierFlags()).unwrap_or(NSEventModifierFlags::empty());
+            let (shift_held, command_held) = (flags.contains(NSEventModifierFlags::Shift), flags.contains(NSEventModifierFlags::Command));
             let length = text_view.string().length();
             let at_end = text_view.selectedRange() == NSRange::new(length, 0);
-            let command_held = NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Command);
             let key = match command.name().to_str().unwrap_or_default() {
                 "moveUp:" => "up",
                 "moveDown:" => "down",
                 "insertNewline:" if command_held => "cmd-enter",
+                "insertNewline:" if shift_held => "shift-enter",
                 "insertNewline:" => "enter",
                 // ⌘↩ arrives as no command at all.
-                "noop:" if command_held && NSApplication::sharedApplication(self.mtm()).currentEvent().is_some_and(|event| event.keyCode() == 36) => "cmd-enter",
+                "noop:" if command_held && event.as_ref().is_some_and(|event| event.keyCode() == 36) => "cmd-enter",
                 "insertTab:" => "tab",
                 "cancelOperation:" => "escape",
                 "moveRight:" if at_end => "right",
                 "deleteBackward:" if length == 0 => "backspace",
                 _ => return Bool::NO,
             };
-            send(EngineEvent::PopoverKey(key.into()));
+            send(EngineEvent::PopoverKey { field, key: key.into() });
             Bool::YES
         }
     }
@@ -1080,13 +1120,14 @@ impl Build<'_> {
                 });
                 Retained::into_super(Retained::into_super(switch))
             }
-            Node::Search { field, placeholder } => {
+            Node::Search { field, value, placeholder, size } => {
                 let input = self.kept.remove(field).unwrap_or_else(|| {
                     let input = NSTextField::new(mtm);
                     input.setBordered(false);
                     input.setDrawsBackground(false);
                     input.setFocusRingType(NSFocusRingType::None);
-                    input.setFont(Some(&font(15., Weight::Regular)));
+                    input.setFont(Some(&font(*size, Weight::Regular)));
+                    input.setStringValue(&NSString::from_str(&value.0));
                     self.wire_field(&input, *field, false);
                     input
                 });

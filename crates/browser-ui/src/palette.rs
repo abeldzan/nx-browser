@@ -410,7 +410,7 @@ impl BrowserWindow {
             Some((_, site, _)) => format!("Search {site}"),
             None => "Search tabs, actions, history, or type !bang, @scope, 2+2".into(),
         };
-        search.push(Node::Search { field: PALETTE_QUERY, placeholder });
+        search.push(Node::Search { field: PALETTE_QUERY, value: crate::native::Initial(String::new()), placeholder, size: 15. });
         let mut children = vec![Node::Column { gap: 0., pad: (8., 0.), children: vec![Node::Item { height: 44., click: None, drag: None, children: search }] }];
         if !items.is_empty() {
             let mut rows = Vec::new();

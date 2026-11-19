@@ -22,7 +22,6 @@ use crate::settings::{logical, measure_overlay};
 use gpuikit::elements::icon_button::icon_button;
 use gpuikit::elements::scroll_area::scroll_area;
 use gpuikit::elements::input::input;
-use gpuikit::elements::text_field::{text_field, Adornment};
 use gpuikit::icons::Icons;
 use tiling::{cell, move_border, neighbour, set_span, span, uncell, Side, Tile};
 use gpuikit::input::{bindings, InputState, InputStateEvent, SubmitOn};
@@ -67,7 +66,6 @@ pub struct BrowserWindow {
     /// Last tab reported to extensions as active.
     ext_active: Option<String>,
     address: Entity<InputState>,
-    find_input: Entity<InputState>,
     /// Searchable font list in the Terminal settings; built on first show since it needs a `Window`.
     pub(crate) settings_open: bool,
     pub(crate) settings_section: SettingsSection,
@@ -89,6 +87,8 @@ pub struct BrowserWindow {
     panel_actions: Vec<crate::settings::MenuAction>,
     /// The address suggestions' handlers, from `native::LIST_BASE` up.
     list_actions: Vec<crate::settings::MenuAction>,
+    /// The find bar's handlers, from `native::FIND_BASE` up.
+    find_actions: Vec<crate::settings::MenuAction>,
     /// The settings window's handlers, from `native::WINDOW_BASE` up.
     window_actions: Vec<crate::settings::MenuAction>,
     /// What is typed in the open popover's text fields, by field id.
@@ -190,7 +190,8 @@ pub struct BrowserWindow {
     reorder: Option<Reorder>,
     /// Where a link dragged from a page is over the chrome; applied to the tab rows on the next render.
     link_hover: Option<(f64, f64)>,
-    find: Tween,
+    /// Where the find bar's page sits (window coordinates), for the bar to hang at its top right.
+    find_anchor: Option<LogicalRect>,
     /// Status message shown as a toast, and when it changed.
     toast: (SharedString, Instant),
     /// Load bar width for the active tab, and when its load finished (the bar then fades).
@@ -294,7 +295,6 @@ impl BrowserWindow {
     pub fn new(model: SharedModel, handoff: Option<Handoff>, self_test: bool, started: Instant, cx: &mut Context<Self>) -> Self {
         let (installs_tx, installs_rx) = mpsc::channel();
         let address = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
-        let find_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let space_input = cx.new(|cx| InputState::new_singleline(cx).submit_on(SubmitOn::Enter));
         let mut subscriptions = vec![
             cx.subscribe(&address, |this, input, event, cx| match event {
@@ -307,16 +307,6 @@ impl BrowserWindow {
                     let typed = input.read(cx).content().to_string();
                     this.update_suggestions(typed, cx);
                 }
-                _ => {}
-            }),
-            cx.subscribe(&find_input, |this, input, event, cx| match event {
-                InputStateEvent::Submit => this.find_step(false, cx),
-                InputStateEvent::TextChanged => {
-                    let query = input.read(cx).content().to_string();
-                    this.find_fresh(&query);
-                    cx.notify();
-                }
-                InputStateEvent::Focus => this.engine.focus_chrome(),
                 _ => {}
             }),
             cx.subscribe(&space_input, |this, input, event, cx| match event {
@@ -354,7 +344,6 @@ impl BrowserWindow {
             installs_rx,
             ext_active: None,
             address,
-            find_input,
             settings_open: false,
             settings_section: SettingsSection::Profiles,
             settings_note: None,
@@ -368,6 +357,7 @@ impl BrowserWindow {
             window_actions: Vec::new(),
             panel_actions: Vec::new(),
             list_actions: Vec::new(),
+            find_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
             history_modal: false,
@@ -436,7 +426,7 @@ impl BrowserWindow {
             tab_grab: Rc::default(),
             reorder: None,
             link_hover: None,
-            find: Tween::new(false),
+            find_anchor: None,
             toast: ("Ready".into(), Instant::now() - TOAST_LIFE),
             load_bar: 0.0,
             load_done: None,
@@ -757,8 +747,9 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
-                use crate::native::{LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
+                use crate::native::{FIND_BASE, LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
                 let (slot, base) = match action {
+                    FIND_BASE.. => (&mut self.find_actions, FIND_BASE),
                     LIST_BASE.. => (&mut self.list_actions, LIST_BASE),
                     PANEL_BASE.. => (&mut self.panel_actions, PANEL_BASE),
                     WINDOW_BASE.. => (&mut self.window_actions, WINDOW_BASE),
@@ -772,6 +763,7 @@ impl BrowserWindow {
                     cx.notify();
                 }
                 let slot = match action {
+                    FIND_BASE.. => &mut self.find_actions,
                     LIST_BASE.. => &mut self.list_actions,
                     PANEL_BASE.. => &mut self.panel_actions,
                     WINDOW_BASE.. => &mut self.window_actions,
@@ -789,7 +781,8 @@ impl BrowserWindow {
                 }
             }
             EngineEvent::RecordedKey(keys) => self.record_key(&keys, cx),
-            EngineEvent::PopoverKey(key) => self.palette_key(&key, cx),
+            EngineEvent::PopoverKey { field, key } if field == crate::native::FIND_QUERY => self.find_key(&key, cx),
+            EngineEvent::PopoverKey { key, .. } => self.palette_key(&key, cx),
             EngineEvent::PanelClosed => {
                 if self.palette_open {
                     self.palette_open = false;
@@ -802,6 +795,10 @@ impl BrowserWindow {
                 if field == crate::native::PALETTE_QUERY {
                     self.palette_index = 0;
                     self.absorb_bang(cx);
+                }
+                if field == crate::native::FIND_QUERY {
+                    let query = self.typed(field);
+                    self.find_fresh(&query);
                 }
                 // Sheets that show what is typed (the new profile's badge, history's matches) follow it.
                 cx.notify();
@@ -881,7 +878,7 @@ impl BrowserWindow {
             Shortcut::Reload => self.reload(),
             Shortcut::Back => self.back(),
             Shortcut::Forward => self.forward(),
-            Shortcut::Find => self.open_find(cx),
+            Shortcut::Find => self.open_find(),
             Shortcut::Bookmark => self.bookmark(),
             Shortcut::Settings => self.toggle_settings(cx),
             Shortcut::ReopenTab => match self.with_model(|model| model.reopen_closed()) {
@@ -2011,13 +2008,13 @@ impl BrowserWindow {
     }
 
     /// Opens the find bar on the active window, unless it's a terminal, which has no page to search.
-    fn open_find(&mut self, cx: &mut Context<Self>) {
+    fn open_find(&mut self) {
         let active = self.model.lock().active_tab().filter(|tab| !is_terminal(&tab.url)).map(|tab| tab.id.clone());
         if let Some(id) = active {
             if self.find_tab != id {
                 self.close_find();
                 self.find_tab = id;
-                let query = self.find_input.read(cx).content().to_string();
+                let query = self.typed(crate::native::FIND_QUERY);
                 self.find_fresh(&query);
             }
             self.find_open = true;
@@ -2035,7 +2032,10 @@ impl BrowserWindow {
     fn find_fresh(&mut self, query: &str) {
         // Drop the old match first, else the search goes on from after it.
         self.engine.eval(&self.find_tab, "find-clear", "getSelection().removeAllRanges()");
-        self.find_count = None;
+        // The old count stays until the page reports the new one: cleared, the tally blinked out on every key.
+        if query.is_empty() {
+            self.find_count = None;
+        }
         self.find_index = 1;
         if !query.is_empty() {
             self.engine.eval(&self.find_tab, "find-count", &find_count_js(query));
@@ -2049,7 +2049,7 @@ impl BrowserWindow {
         if let Some(count) = self.find_count.filter(|&count| count > 0) {
             self.find_index = if backwards { (self.find_index + count - 2) % count + 1 } else { self.find_index % count + 1 };
         }
-        let query = self.find_input.read(cx).content().to_string();
+        let query = self.typed(crate::native::FIND_QUERY);
         self.engine.find(&self.find_tab, &query, backwards);
         cx.notify();
     }
@@ -2057,15 +2057,6 @@ impl BrowserWindow {
     /// The find bar is open on the active window.
     fn find_here(&self) -> bool {
         self.find_open && self.active_tab_id().is_some_and(|id| id == self.find_tab)
-    }
-
-    fn request_find_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.focus_find) {
-            return;
-        }
-        let find = self.find_input.clone();
-        self.engine.focus_chrome();
-        window.defer(cx, move |window, cx| window.focus(&find.focus_handle(cx), cx));
     }
 
     /// Follows GPUI's focus on the address input. The input's own Focus/Blur events fire only while it is drawn,
@@ -2212,10 +2203,10 @@ impl Render for BrowserWindow {
         self.sync_settings(cx);
         self.sync_palette(cx);
         self.sync_suggestions();
+        self.sync_find();
         self.sync_toast();
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
-        self.request_find_focus(window, cx);
         self.request_terminal_focus(window, cx);
         let _subscriptions = &self.subscriptions;
         let entity = cx.entity();
@@ -2354,7 +2345,6 @@ impl Render for BrowserWindow {
 impl BrowserWindow {
     /// Moves every animation one frame along: tweens follow their targets, finished closes run.
     fn step_motion(&mut self) {
-        self.find.set(self.find_open, self.anim(PANEL_ANIM));
         if self.status != self.toast.0 {
             self.toast = (self.status.clone(), Instant::now());
         }
@@ -3212,7 +3202,6 @@ impl BrowserWindow {
                 self.engine.place_tab(&id, None);
                 continue;
             };
-            let find = if self.find_tab == id { FIND_H * f64::from(self.find.progress()) } else { 0.0 };
             let (scale, alpha) = self.window_motion(&id);
             let frame = scaled(frame, scale);
             if drawn.contains(&id) {
@@ -3226,10 +3215,13 @@ impl BrowserWindow {
             let (title_h, inset) = if self.tab_window { (0.0, 0.0) } else { (self.title_h(), PAGE_INSET) };
             let rect = LogicalRect {
                 x: origin_x + f64::from(frame.x) + inset,
-                y: origin_y + f64::from(frame.y) + title_h + find,
+                y: origin_y + f64::from(frame.y) + title_h,
                 width: (f64::from(frame.w) - inset * 2.0).max(1.0),
-                height: (f64::from(frame.h) - title_h - find - inset).max(1.0),
+                height: (f64::from(frame.h) - title_h - inset).max(1.0),
             };
+            if id == self.find_tab {
+                self.find_anchor = Some(rect.clone());
+            }
             self.engine.place_tab(&id, Some(rect.clone()));
             self.engine.set_alpha(&id, f64::from(alpha));
             let shell = LogicalRect {
@@ -3524,9 +3516,6 @@ impl BrowserWindow {
                 .bg(paint.secondary)
                 .overflow_hidden()
                 .when(!self.tab_window, |column| column.child(self.window_titlebar(tab, members, cx)))
-                .when(self.find_tab == tab.id && self.find.progress() > 0.0, |column| {
-                    column.child(div().h(px(FIND_H as f32 * self.find.progress())).flex_none().overflow_hidden().child(self.find_bar(cx)))
-                })
                 .child(match is_terminal(&tab.url) {
                     true => div()
                         // The shell occludes the root's capture handler, so a click here must itself take keys back
@@ -4386,7 +4375,7 @@ impl BrowserWindow {
                         if this.find_here() {
                             this.close_find();
                         } else {
-                            this.open_find(cx);
+                            this.open_find();
                         }
                         cx.notify();
                     })))
@@ -5288,7 +5277,6 @@ impl BrowserWindow {
 
     fn animating(&self) -> bool {
         self.dock.running()
-            || self.find.running()
             || self.toast.1.elapsed() < TOAST_IN
             || self.toast_fading()
             || self.load_moving()
@@ -5311,46 +5299,56 @@ impl BrowserWindow {
     }
 
 
-    fn find_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        let typed = !self.find_input.read(cx).content().is_empty();
+    /// Shows the find bar at the top right of its page while it is open there, or updates it; closes it otherwise.
+    fn sync_find(&mut self) {
+        use crate::native::{text, Ink, Node, Weight, FIND_QUERY};
+        let Some(page) = self.find_anchor.clone().filter(|_| self.find_here()) else {
+            return self.engine.close_find();
+        };
         let tally = match self.find_count {
+            _ if self.typed(FIND_QUERY).is_empty() => String::new(),
             Some(0) => "No matches".to_string(),
             Some(count) => format!("{} of {count}", self.find_index.min(count)),
             None => String::new(),
         };
-        let found = self.find_count.is_some_and(|count| count > 0);
-        let step = |id: &'static str, icon: gpui::Svg, backwards: bool| {
-            icon_button(id, icon)
-                .box_size(rems(1.25))
-                .icon_size(rems(0.75))
-                .disabled(!found)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.find_step(backwards, cx)))
+        let mut pop = crate::native::Pop::find();
+        let previous = pop.act(|this, cx| this.find_step(true, cx));
+        let next = pop.act(|this, cx| this.find_step(false, cx));
+        let close = pop.act(|this, _| this.close_find());
+        let content = Node::Column {
+            gap: 0.,
+            pad: (10., 4.),
+            children: vec![Node::Row {
+                gap: 4.,
+                children: vec![
+                    Node::Search { field: FIND_QUERY, value: crate::native::Initial(self.typed(FIND_QUERY)), placeholder: "Find in page".into(), size: 13. },
+                    text(tally, 11., Weight::Regular, Ink::Secondary),
+                    Node::Tool { symbol: "chevron.up", tip: "Previous match", action: previous, on: false },
+                    Node::Tool { symbol: "chevron.down", tip: "Next match", action: next, on: false },
+                    Node::Tool { symbol: "xmark", tip: "Close", action: close, on: false },
+                ],
+            }],
         };
-        h_stack()
-            .h(px(FIND_H as f32))
-            .items_center()
-            .justify_end()
-            .gap(px(2.))
-            .px(px(8.))
-            .bg(paint.surface)
-            .border_b_1()
-            .border_color(paint.border)
-            .child(
-                div().w(px(260.)).child(
-                    text_field(&self.find_input, cx)
-                        .placeholder("Find in page")
-                        .full_width(true)
-                        .when(typed, |field| field.suffix(Adornment::element(div().text_size(paint.text(11.)).text_color(paint.muted).child(tally)))),
-                ),
-            )
-            .child(div().w(px(4.)))
-            .child(step("find-prev", Icons::chevron_up(), true))
-            .child(step("find-next", Icons::chevron_down(), false))
-            .child(icon_button("find-close", Icons::cross_2()).box_size(rems(1.25)).icon_size(rems(0.75)).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.close_find();
-                cx.notify();
-            })))
+        const WIDTH: f64 = 340.;
+        self.engine.show_find((page.x + page.width - WIDTH - 10., page.y + 10.), WIDTH, &content);
+        if std::mem::take(&mut self.focus_find) {
+            self.engine.focus_find();
+        }
+        self.find_actions = pop.actions;
+    }
+
+    /// A key from the find bar's field: Return finds the next match, ⇧Return the previous, Esc closes it.
+    fn find_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        match key {
+            "enter" => self.find_step(false, cx),
+            "shift-enter" => self.find_step(true, cx),
+            "escape" => {
+                self.close_find();
+                self.focus_active_content();
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
@@ -5816,7 +5814,6 @@ const LIFT_ANIM: Duration = Duration::from_millis(220);
 const LAND_ANIM: Duration = Duration::from_millis(280);
 /// Width a window shrinks to while carried over the spaces bar.
 const LIFT_W: f32 = 140.0;
-const PANEL_ANIM: Duration = Duration::from_millis(180);
 const WINDOW_ANIM: Duration = Duration::from_millis(170);
 const SLIDE_ANIM: Duration = Duration::from_millis(220);
 const WINDOW_FROM_SCALE: f32 = 0.94;
@@ -5928,7 +5925,6 @@ const TITLE_H: f64 = 26.0;
 const PAGE_INSET: f64 = 1.0;
 /// Must match PAGE_RADIUS in the macOS engine, which rounds the page's bottom corners.
 const PAGE_RADIUS: f64 = WINDOW_RADIUS - PAGE_INSET;
-const FIND_H: f64 = 32.0;
 
 /// Visible parts of each page, as disjoint rects: a page is hidden wherever a window in front of it sits.
 /// `stack` is back to front: (tab id, window shell, page rect). Pages never show outside `stage`.
