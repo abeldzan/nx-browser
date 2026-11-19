@@ -32,6 +32,8 @@ pub(crate) const PALETTE_QUERY: u32 = 18;
 pub(crate) const WINDOW_BASE: u32 = 2 << 20;
 /// And from here up, to the floating panel (the command palette).
 pub(crate) const PANEL_BASE: u32 = 3 << 20;
+/// And from here up, to the address suggestions list.
+pub(crate) const LIST_BASE: u32 = 4 << 20;
 
 /// Collects a popover's or sheet's handlers while its content is built; a control carries the id `act` returns.
 #[derive(Default)]
@@ -51,6 +53,10 @@ impl Pop {
 
     pub(crate) fn panel() -> Self {
         Self { actions: Vec::new(), base: PANEL_BASE }
+    }
+
+    pub(crate) fn list() -> Self {
+        Self { actions: Vec::new(), base: LIST_BASE }
     }
 
     pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {

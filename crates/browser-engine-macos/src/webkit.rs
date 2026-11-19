@@ -1034,13 +1034,38 @@ impl MacEngine {
 
     /// Shows `content` on a floating glass panel centred `top` points below this window's top, or updates it.
     pub fn present_panel(&self, key: u64, width: f64, top: f64, content: &crate::Node) {
-        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
-            crate::popover::present_panel(self.window_no, &window, key, width, top, content);
-        }
+        self.float(crate::Float::Palette, key, width, crate::Place::Top { x: None, y: top }, false, content);
     }
 
     pub fn close_panel(&self) {
-        crate::popover::close_panel(Some(self.window_no));
+        crate::popover::close_float(crate::Float::Palette, Some(self.window_no), false);
+    }
+
+    /// Shows clickable rows on a glass panel whose top-left is `at` (window coordinates), never taking key from
+    /// the field being typed in; or updates them.
+    pub fn show_list(&self, key: u64, at: (f64, f64), width: f64, content: &crate::Node) {
+        self.float(crate::Float::List, key, width, crate::Place::Top { x: Some(at.0), y: at.1 }, false, content);
+    }
+
+    pub fn close_list(&self) {
+        crate::popover::close_float(crate::Float::List, Some(self.window_no), false);
+    }
+
+    /// Shows `text` in a glass toast at the bottom of this window, fading in when `animate`.
+    pub fn show_toast(&self, text: &str, animate: bool) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::show_toast(self.window_no, &window, text, animate);
+        }
+    }
+
+    pub fn hide_toast(&self, animate: bool) {
+        crate::popover::close_float(crate::Float::Toast, Some(self.window_no), animate);
+    }
+
+    fn float(&self, kind: crate::Float, key: u64, width: f64, place: crate::Place, animate: bool, content: &crate::Node) {
+        if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
+            crate::popover::present_float(kind, self.window_no, &window, key, width, place, animate, content);
+        }
     }
 
     /// Whether ⌘ is held now, for a click that opens in a new tab with it.

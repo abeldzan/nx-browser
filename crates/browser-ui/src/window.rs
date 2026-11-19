@@ -87,6 +87,8 @@ pub struct BrowserWindow {
     sheet_actions: Vec<crate::settings::MenuAction>,
     /// The command palette's handlers, from `native::PANEL_BASE` up.
     panel_actions: Vec<crate::settings::MenuAction>,
+    /// The address suggestions' handlers, from `native::LIST_BASE` up.
+    list_actions: Vec<crate::settings::MenuAction>,
     /// The settings window's handlers, from `native::WINDOW_BASE` up.
     window_actions: Vec<crate::settings::MenuAction>,
     /// What is typed in the open popover's text fields, by field id.
@@ -365,6 +367,7 @@ impl BrowserWindow {
             sheet_actions: Vec::new(),
             window_actions: Vec::new(),
             panel_actions: Vec::new(),
+            list_actions: Vec::new(),
             popover_texts: HashMap::new(),
             popover_anchors: HashMap::new(),
             history_modal: false,
@@ -754,8 +757,9 @@ impl BrowserWindow {
             }
             EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
             EngineEvent::PopoverAction(action) => {
-                use crate::native::{PANEL_BASE, SHEET_BASE, WINDOW_BASE};
+                use crate::native::{LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
                 let (slot, base) = match action {
+                    LIST_BASE.. => (&mut self.list_actions, LIST_BASE),
                     PANEL_BASE.. => (&mut self.panel_actions, PANEL_BASE),
                     WINDOW_BASE.. => (&mut self.window_actions, WINDOW_BASE),
                     SHEET_BASE.. => (&mut self.sheet_actions, SHEET_BASE),
@@ -768,6 +772,7 @@ impl BrowserWindow {
                     cx.notify();
                 }
                 let slot = match action {
+                    LIST_BASE.. => &mut self.list_actions,
                     PANEL_BASE.. => &mut self.panel_actions,
                     WINDOW_BASE.. => &mut self.window_actions,
                     SHEET_BASE.. => &mut self.sheet_actions,
@@ -1434,7 +1439,13 @@ impl BrowserWindow {
             let model = self.model.lock();
             (model.suggest(&typed, 4).unwrap_or_default(), model.settings.suggest_template())
         };
-        self.suggestions = history.into_iter().map(|(url, title)| (url, title, false)).collect();
+        // The last fetch's searches that still fit stay until this one answers: cleared on every key, the list
+        // blinked away and back while typing.
+        let query = typed.trim().to_lowercase();
+        let kept = std::mem::take(&mut self.suggestions)
+            .into_iter()
+            .filter(|(text, _, search)| *search && !query.is_empty() && text.to_lowercase().starts_with(&query));
+        self.suggestions = history.into_iter().map(|(url, title)| (url, title, false)).chain(kept).collect();
         self.suggestion = None;
         self.suggest_task = template.filter(|_| !typed.trim().is_empty()).map(|template| {
             let fetch = fetch_suggestions(template, typed.trim());
@@ -1444,6 +1455,7 @@ impl BrowserWindow {
                     if !view.address_focused {
                         return;
                     }
+                    view.suggestions.retain(|(_, _, search)| !search);
                     let room = 8usize.saturating_sub(view.suggestions.len());
                     view.suggestions.extend(found.into_iter().take(room).map(|query| (query, String::new(), true)));
                     cx.notify();
@@ -2116,7 +2128,6 @@ pub(crate) struct Paint {
     pub(crate) secondary: gpui::Hsla,
     pub(crate) border: gpui::Hsla,
     pub(crate) accent: gpui::Hsla,
-    pub(crate) accent_bg: gpui::Hsla,
     /// The interface font size setting, in points.
     pub(crate) font: f32,
 }
@@ -2167,7 +2178,6 @@ pub(crate) fn paint(cx: &gpui::App) -> Paint {
         secondary: theme.surface_secondary(),
         border: theme.border(),
         accent: theme.accent(),
-        accent_bg: theme.accent_bg(),
         font: crate::terminal::prefs(cx).ui_font_size as f32,
     }
 }
@@ -2201,6 +2211,8 @@ impl Render for BrowserWindow {
         self.sync_sheet(cx);
         self.sync_settings(cx);
         self.sync_palette(cx);
+        self.sync_suggestions();
+        self.sync_toast();
         self.sync_address_focus(window, cx);
         self.request_address_focus(window, cx);
         self.request_find_focus(window, cx);
@@ -2336,8 +2348,6 @@ impl Render for BrowserWindow {
                 this.preview_drag(&id, event.event.position - this.rail_grab.get(), vec![(RAIL_ROW.to_string(), row)], true, 6.0);
                 cx.notify();
             }))
-            .when(self.address_focused && !self.suggestions.is_empty(), |root| root.child(self.suggestions_view(cx)))
-            .child(self.toast_view(cx))
     }
 }
 
@@ -2372,85 +2382,43 @@ impl BrowserWindow {
         }
     }
 
-    fn toast_view(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let age = self.toast.1.elapsed();
-        if age >= TOAST_LIFE || self.toast.0.is_empty() || self.self_test.is_some() {
-            return div();
-        }
-        let paint = paint(cx);
-        let fade = TOAST_LIFE - TOAST_IN;
-        let p = if self.reduce_motion {
-            1.0
-        } else if age < TOAST_IN {
-            ease(age.as_secs_f32() / TOAST_IN.as_secs_f32())
-        } else if age > fade {
-            1.0 - ease((age - fade).as_secs_f32() / TOAST_IN.as_secs_f32())
+    /// Shows the status message in a glass toast at the bottom, until it has been up for `TOAST_LIFE`.
+    fn sync_toast(&mut self) {
+        let animate = !self.reduce_motion;
+        if self.toast.0.is_empty() || self.self_test.is_some() || self.toast.1.elapsed() >= TOAST_LIFE - TOAST_IN {
+            self.engine.hide_toast(animate);
         } else {
-            1.0
-        };
-        // The pill stays opaque: pages are cut out beneath it, so only its contents fade.
-        div().absolute().bottom(px(18. - (1. - p) * 14.)).left_0().right_0().flex().justify_center().child(
-            div()
-                .relative()
-                .max_w(px(420.))
-                .px(px(14.))
-                .py(px(7.))
-                .rounded(px(10.))
-                .bg(paint.surface)
-                .border_1()
-                .border_color(paint.border)
-                .shadow_md()
-                .text_size(paint.text(12.))
-                .occlude()
-                .child(measure_overlay(10., cx))
-                .child(div().opacity(p).truncate().child(self.toast.0.clone())),
-        )
+            self.engine.show_toast(&self.toast.0, animate);
+        }
     }
 
-    fn suggestions_view(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let Some(bounds) = self.address_bounds else {
-            return div();
+    /// Hangs the address suggestions below the address field while it is focused, or updates them.
+    fn sync_suggestions(&mut self) {
+        use crate::native::{Ink, Node, Weight};
+        let Some(bounds) = self.address_bounds.filter(|_| self.address_focused && !self.suggestions.is_empty()) else {
+            return self.engine.close_list();
         };
-        let paint = paint(cx);
-        let mut list = v_stack()
-            .id("address-suggestions")
-            .absolute()
-            .left(bounds.origin.x)
-            .top(bounds.origin.y + bounds.size.height + px(4.))
-            .w(bounds.size.width.max(px(320.)))
-            .p(px(4.))
-            .rounded(px(10.))
-            .bg(paint.surface)
-            .border_1()
-            .border_color(paint.border)
-            .shadow_md()
-            .occlude()
-            .child(measure_overlay(10., cx));
+        let mut pop = crate::native::Pop::list();
+        let mut rows = Vec::new();
         for (index, (url, title, search)) in self.suggestions.iter().enumerate() {
             let target = url.clone();
-            let picked = self.suggestion == Some(index);
-            list = list.child(
-                h_stack()
-                    .id(SharedString::from(format!("suggestion-{index}")))
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .py(px(5.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .text_size(paint.text(12.))
-                    .when(picked, |row| row.bg(paint.accent_bg))
-                    .hover(|row| row.bg(paint.secondary))
-                    .when(*search, |row| row.child(Icons::magnifying_glass().size(px(12.)).text_color(paint.muted)))
-                    .child(div().flex_none().max_w(px(220.)).truncate().child(if *search || title.is_empty() { display_url(url) } else { title.clone() }))
-                    .when(!*search, |row| row.child(div().flex_1().min_w_0().truncate().text_color(paint.muted).child(display_url(url))))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.commit_navigation(&target, cx);
-                    })),
-            );
+            let mut children = Vec::new();
+            if *search {
+                children.push(Node::Glyph { name: "magnifyingglass", size: 11., ink: Ink::Secondary });
+            }
+            children.push(crate::native::title(if *search || title.is_empty() { display_url(url) } else { title.clone() }, 12., Weight::Regular, Ink::Primary));
+            if !*search {
+                children.push(crate::native::title(display_url(url), 12., Weight::Regular, Ink::Secondary));
+            }
+            children.push(Node::Spacer);
+            let go = pop.act(move |this, cx| this.commit_navigation(&target, cx));
+            let row = Node::Item { height: 26., click: Some(go), drag: None, children };
+            rows.push(if self.suggestion == Some(index) { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
         }
-        // Absolute so the list's offsets count from the window origin, not from where this sits in the root column.
-        div().absolute().top_0().left_0().child(list)
+        let content = Node::Column { gap: 0., pad: (4., 4.), children: rows };
+        let at = (f64::from(bounds.origin.x), f64::from(bounds.origin.y + bounds.size.height) + 4.);
+        self.engine.show_list(1, at, f64::from(bounds.size.width.max(px(320.))), &content);
+        self.list_actions = pop.actions;
     }
 
     /// What each profile's pages are doing across this window's tabs, for the rail.

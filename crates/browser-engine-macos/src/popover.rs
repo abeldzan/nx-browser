@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use browser_engine::{EngineEvent, LogicalRect};
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
@@ -19,7 +20,7 @@ use objc2_app_kit::{
     NSTextAlignment, NSTextField, NSTextFieldDelegate, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation,
     NSView, NSViewController, NSWindow, NSWindowStyleMask, NSComboBox, NSPopUpButton, NSStepper, NSVisualEffectView,
     NSVisualEffectMaterial, NSVisualEffectBlendingMode, NSWindowDelegate, NSApplication, NSControl, NSEventModifierFlags,
-    NSFocusRingType, NSGlassEffectView, NSTextView, NSWindowOrderingMode, NSAnimationContext,
+    NSFocusRingType, NSGlassEffectView, NSTextView, NSWindowOrderingMode, NSAnimationContext, NSAnimatablePropertyContainer,
 };
 use objc2_foundation::{NSArray, NSData, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSRectEdge, NSSize, NSString};
 
@@ -177,6 +178,8 @@ thread_local! {
     static SHEET: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static WINDOW: RefCell<Option<Surface>> = const { RefCell::new(None) };
     static PANEL: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static LIST: RefCell<Option<Surface>> = const { RefCell::new(None) };
+    static TOAST: RefCell<Option<Surface>> = const { RefCell::new(None) };
     /// The last popover to close, by key, and when.
     static CLOSED: Cell<Option<(u64, Instant)>> = const { Cell::new(None) };
     static TARGET: Retained<NxPopoverTarget> = {
@@ -449,33 +452,69 @@ fn restore_offsets(view: &NSView, offsets: &mut impl Iterator<Item = NSPoint>) {
     }
 }
 
-/// Shows `content` on a floating glass panel `width` wide, centred `top` points below the top of `parent`, or
-/// updates the one open under `key`. It closes, with `EngineEvent::PanelClosed`, once it loses key (a click outside).
-pub(crate) fn present_panel(window_no: isize, parent: &NSWindow, key: u64, width: f64, top: f64, content: &Node) {
-    if refresh(&PANEL, window_no, key, content) {
+/// What a floating glass panel is for, which decides how it behaves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Float {
+    /// Takes key for its search field; closes, with `EngineEvent::PanelClosed`, once it loses key (a click outside).
+    Palette,
+    /// Clickable rows that never take key, so typing stays in the field it hangs from (address suggestions).
+    List,
+    /// Shows a message only: clicks pass through it, and it fades in and out.
+    Toast,
+}
+
+/// Where a floating panel's glass goes, in its browser window's coordinates (top-left origin).
+#[derive(Clone, Copy)]
+pub enum Place {
+    /// Top edge `y` down; left edge at `x`, or centred for None.
+    Top { x: Option<f64>, y: f64 },
+    /// Centred, bottom edge this far above the window's bottom.
+    Bottom(f64),
+}
+
+fn float_slot(kind: Float) -> &'static std::thread::LocalKey<RefCell<Option<Surface>>> {
+    match kind {
+        Float::Palette => &PANEL,
+        Float::List => &LIST,
+        Float::Toast => &TOAST,
+    }
+}
+
+/// Shows `content` on a floating glass panel `width` wide at `place` over `parent`, or updates the one of this kind
+/// open under `key`. A toast fades in when `animate`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, key: u64, width: f64, place: Place, animate: bool, content: &Node) {
+    let slot = float_slot(kind);
+    if refresh(slot, window_no, key, content) {
         return;
     }
-    close_panel(None);
+    close_float(kind, None, false);
     let mtm = MainThreadMarker::new().expect("panels live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
     let (view, first) = root(mtm, content, width, &mut submits, &mut fields);
     let size = view.fittingSize();
     let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
     let outer = parent.frame();
-    let frame = NSRect::new(
-        NSPoint::new(outer.origin.x + (outer.size.width - size.width) / 2., outer.origin.y + outer.size.height - top - size.height + GLASS_MARGIN),
-        size,
-    );
-    let panel: Retained<NxPanel> = unsafe {
-        msg_send![super(NxPanel::alloc(mtm).set_ivars(())), initWithContentRect: frame, styleMask: NSWindowStyleMask::Borderless, backing: NSBackingStoreType::Buffered, defer: false]
+    let centred = outer.origin.x + (outer.size.width - size.width) / 2.;
+    let origin = match place {
+        Place::Top { x, y } => NSPoint::new(
+            x.map_or(centred, |x| outer.origin.x + x - GLASS_MARGIN),
+            outer.origin.y + outer.size.height - y - size.height + GLASS_MARGIN,
+        ),
+        Place::Bottom(above) => NSPoint::new(centred, outer.origin.y + above - GLASS_MARGIN),
     };
-    // Held by `PANEL`; AppKit releasing it on close as well would free it twice.
+    let panel: Retained<NxPanel> = unsafe {
+        let panel = NxPanel::alloc(mtm).set_ivars(PanelIvars { takes_key: kind == Float::Palette });
+        msg_send![super(panel), initWithContentRect: NSRect::new(origin, size), styleMask: NSWindowStyleMask::Borderless, backing: NSBackingStoreType::Buffered, defer: false]
+    };
+    // Held by its slot; AppKit releasing it on close as well would free it twice.
     unsafe { panel.setReleasedWhenClosed(false) };
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
     panel.setHasShadow(false);
+    panel.setIgnoresMouseEvents(kind == Float::Toast);
     let glass = NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO);
-    glass.setCornerRadius(12.);
+    glass.setCornerRadius(if kind == Float::Toast { 10. } else { 12. });
     glass.setContentView(Some(&view));
     // Inset in a clear view: the glass's own shadow spills past its edge, and the panel's square edge cut it off
     // into a dark outline.
@@ -491,30 +530,75 @@ pub(crate) fn present_panel(window_no: isize, parent: &NSWindow, key: u64, width
         edge.setActive(true);
     }
     panel.setContentView(Some(&clear));
-    TARGET.with(|target| panel.setDelegate(Some(ProtocolObject::from_ref(&**target))));
-    unsafe { parent.addChildWindow_ordered(&panel, NSWindowOrderingMode::Above) };
-    panel.makeKeyAndOrderFront(None);
-    if let Some(field) = &first {
-        focus(field);
+    if kind == Float::Toast && animate {
+        panel.setAlphaValue(0.);
     }
-    PANEL.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields }));
+    unsafe { parent.addChildWindow_ordered(&panel, NSWindowOrderingMode::Above) };
+    if kind == Float::Palette {
+        TARGET.with(|target| panel.setDelegate(Some(ProtocolObject::from_ref(&**target))));
+        panel.makeKeyAndOrderFront(None);
+        if let Some(field) = &first {
+            focus(field);
+        }
+    }
+    if kind == Float::Toast && animate {
+        fade(&panel, 1., None);
+    }
+    slot.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields }));
 }
 
-/// Clear room around the panel's glass for its shadow to fade out in.
-const GLASS_MARGIN: f64 = 48.;
+/// Animates `panel`'s opacity to `alpha` over a toast's fade, then runs `done`.
+fn fade(panel: &NxPanel, alpha: f64, done: Option<Box<dyn Fn()>>) {
+    let panel = panel.retain();
+    let changes = RcBlock::new(move |context: std::ptr::NonNull<NSAnimationContext>| {
+        unsafe { context.as_ref() }.setDuration(0.18);
+        let window: &NSWindow = &panel;
+        window.animator().setAlphaValue(alpha);
+    });
+    let done = done.map(|done| RcBlock::new(move || done()));
+    NSAnimationContext::runAnimationGroup_completionHandler(&changes, done.as_deref());
+}
 
-/// Closes the panel if browser window `owner` opened it, or whichever is open for None.
-pub(crate) fn close_panel(owner: Option<isize>) {
-    // Taken first: losing key calls the delegate, which looks at `PANEL`.
+/// Shows `text` in a toast 18pt above the bottom of `parent`, as wide as the text up to 420pt; nothing changes
+/// while the same text is up.
+pub(crate) fn show_toast(window_no: isize, parent: &NSWindow, text: &str, animate: bool) {
+    let mtm = MainThreadMarker::new().expect("toasts live on the main thread");
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setFont(Some(&font(12., Weight::Regular)));
+    let width = (label.fittingSize().width.ceil() + 2. * 14.).min(420.);
+    let content = Node::Column { gap: 0., pad: (14., 7.), children: vec![Node::Text { text: text.into(), size: 12., weight: Weight::Regular, ink: Ink::Primary, wrap: Wrap::Line, shrink: true }] };
+    use std::hash::{Hash, Hasher};
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut key);
+    present_float(Float::Toast, window_no, parent, key.finish(), width, Place::Bottom(18.), animate, &content);
+}
+
+/// Closes the panel of this kind if browser window `owner` opened it, or whichever is open for None; a toast
+/// fades out first when `animate`.
+pub(crate) fn close_float(kind: Float, owner: Option<isize>, animate: bool) {
+    // Taken first: losing key calls the delegate, which looks at the slot.
+    let slot = float_slot(kind);
     let surface = match owner {
-        Some(window_no) => take_owned(&PANEL, window_no),
-        None => PANEL.take(),
+        Some(window_no) => take_owned(slot, window_no),
+        None => slot.take(),
     };
-    if let Some(Surface { host: Host::Panel(panel, parent, _), .. }) = surface {
+    let Some(Surface { host: Host::Panel(panel, parent, _), .. }) = surface else {
+        return;
+    };
+    if animate {
+        let gone = panel.clone();
+        fade(&panel, 0., Some(Box::new(move || {
+            parent.removeChildWindow(&gone);
+            gone.orderOut(None);
+        })));
+    } else {
         parent.removeChildWindow(&panel);
         panel.orderOut(None);
     }
 }
+
+/// Clear room around the panel's glass for its shadow to fade out in.
+const GLASS_MARGIN: f64 = 48.;
 
 /// The browser window that opened `window`, when it is the open panel: keys pressed there run that window's shortcuts.
 pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
@@ -539,7 +623,7 @@ pub(crate) fn set_field(field: u32, text: &str) {
 
 /// Field `field`'s Return action, in whichever surface has it.
 fn submit_action(field: u32) -> Option<u32> {
-    [&PANEL, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
+    [&PANEL, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| surface.submits.get(&field).copied()))
 }
 
 /// `read` of the surface in `slot`, skipping one being rebuilt: moving its focused field ends editing, which calls
@@ -549,7 +633,7 @@ fn peek<T>(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, read:
 }
 
 fn send(event: EngineEvent) {
-    let window_no = [&PANEL, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
+    let window_no = [&PANEL, &LIST, &WINDOW, &SHEET, &POPOVER].into_iter().find_map(|slot| peek(slot, |surface| Some(surface.window_no)));
     if let Some(window_no) = window_no {
         crate::webkit::send_event(window_no, event);
     }
@@ -590,7 +674,7 @@ define_class!(
                     .map(|surface| surface.window_no)
             });
             if let Some(window_no) = window_no {
-                close_panel(Some(window_no));
+                close_float(Float::Palette, Some(window_no), false);
                 crate::webkit::send_event(window_no, EngineEvent::PanelClosed);
             }
         }
@@ -763,17 +847,23 @@ impl NxPopoverItem {
     }
 }
 
+pub(crate) struct PanelIvars {
+    takes_key: bool,
+}
+
 define_class!(
-    /// Borderless, so it would never take key (and its search field typing) without saying it can.
+    /// Borderless, so the palette would never take key (and its search field typing) without saying it can; a
+    /// list must not, or clicking it would take typing away from the field it hangs from.
     #[unsafe(super(NSPanel, NSWindow, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "NxPanel"]
+    #[ivars = PanelIvars]
     pub(crate) struct NxPanel;
 
     impl NxPanel {
         #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key(&self) -> bool {
-            true
+            self.ivars().takes_key
         }
     }
 );
