@@ -9,8 +9,9 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSCursor, NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEvent, NSEventModifierFlags,
-    NSGraphicsContext, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView,
 };
+use objc2_quartz_core::CACornerMask;
 use objc2_core_graphics::CGColor;
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 
@@ -24,7 +25,6 @@ pub struct FrameStyle {
     pub title_h: f64,
     pub radius: f64,
     pub body: [f64; 4],
-    pub strip: [f64; 4],
     pub line: [f64; 4],
     pub ring: [f64; 4],
     pub accent: [f64; 4],
@@ -44,6 +44,8 @@ pub(crate) struct FrameIvars {
     key: String,
     window_no: isize,
     style: RefCell<FrameStyle>,
+    /// The strip's backing: the sidebar material, as the app's own sidebar has.
+    material: Retained<NSVisualEffectView>,
     /// The view holding the strip's controls.
     strip: Retained<NSView>,
     /// The loading bar along the strip's foot.
@@ -70,13 +72,6 @@ define_class!(
             let style = self.ivars().style.borrow();
             let shell = self.shell_rect(&style);
             let r = style.radius;
-            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(shell, r, r);
-            NSGraphicsContext::saveGraphicsState_class();
-            path.addClip();
-            // The strip, solid: the page starts below it.
-            rgba(style.strip).setFill();
-            NSBezierPath::fillRect(NSRect::new(shell.origin, NSSize::new(shell.size.width, style.title_h)));
-            NSGraphicsContext::restoreGraphicsState_class();
             // The page sits 1pt in (and the GPUI terminal screen over it): only that edge is body, not the page area.
             let edge = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset(shell, 1.5), r - 1.5, r - 1.5);
             edge.setLineWidth(1.);
@@ -207,11 +202,20 @@ impl NxPassView {
 
 impl NxFrameView {
     pub(crate) fn new(mtm: MainThreadMarker, key: &str, window_no: isize, style: FrameStyle) -> Retained<Self> {
+        let material = NSVisualEffectView::new(mtm);
+        material.setMaterial(NSVisualEffectMaterial::Sidebar);
+        material.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        material.setWantsLayer(true);
+        if let Some(layer) = material.layer() {
+            // Rounded along the top only, nesting in the window's corners; the page meets its foot.
+            layer.setMaskedCorners(CACornerMask::LayerMinXMaxYCorner | CACornerMask::LayerMaxXMaxYCorner);
+        }
         let strip = NSView::new(mtm);
         let load = NSView::new(mtm);
         load.setWantsLayer(true);
-        let ivars = FrameIvars { key: key.to_string(), window_no, style: RefCell::new(style), strip: strip.clone(), load: load.clone(), press: Cell::new(None) };
+        let ivars = FrameIvars { key: key.to_string(), window_no, style: RefCell::new(style), material: material.clone(), strip: strip.clone(), load: load.clone(), press: Cell::new(None) };
         let this: Retained<Self> = unsafe { msg_send![super(Self::alloc(mtm).set_ivars(ivars)), initWithFrame: NSRect::ZERO] };
+        this.addSubview(&material);
         this.addSubview(&strip);
         this.addSubview(&load);
         let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveInKeyWindow | NSTrackingAreaOptions::InVisibleRect;
@@ -247,6 +251,11 @@ impl NxFrameView {
         }
         if self.ivars().strip.frame() != strip {
             self.ivars().strip.setFrame(strip);
+            // 1pt in from the top and sides, leaving the window's ring drawn beneath it showing.
+            self.ivars().material.setFrame(NSRect::new(NSPoint::new(grip + 1., grip + 1.), NSSize::new((shell.width - 2.).max(0.), (style.title_h - 1.).max(0.))));
+        }
+        if let Some(layer) = self.ivars().material.layer().filter(|layer| layer.cornerRadius() != style.radius - 1.) {
+            layer.setCornerRadius(style.radius - 1.);
         }
         let (along, opacity) = style.load;
         let load = NSRect::new(NSPoint::new(grip + 1., grip + style.title_h - 2.), NSSize::new(((shell.width - 2.) * along.min(1.)).max(0.), 2.));

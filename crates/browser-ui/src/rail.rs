@@ -1,16 +1,12 @@
-//! The profile rail down the window's left side: native views on Liquid Glass over the GPUI view.
+//! The profile rail down the window's left side: a native sidebar over the GPUI view.
 
 use crate::native::{Ink, Node, Pop};
 use crate::window::{paint, profile_badge_node, BrowserWindow, Popover};
 use browser_engine::LogicalRect;
 use gpui::{px, Context, Window};
 
-/// Room the stage leaves the rail, which floats inset within it.
+/// The sidebar's width, flush with the window's left edge, top and foot.
 pub(crate) const RAIL_W: f32 = 50.;
-const INSET: f64 = 6.;
-/// From the window's top and foot: level with the windows, `SNAP_INSET` from the stage's edges.
-const EDGE: f64 = 8.;
-const GLASS_W: f64 = 40.;
 const BADGE: f64 = 30.;
 /// Bottom tools: their 30pt rows, the gaps and the separator.
 const TOOLS_H: f64 = 3. * BADGE + 4. * 6. + 1.;
@@ -30,10 +26,10 @@ impl BrowserWindow {
             (model.profiles.clone(), model.active_profile_id.clone())
         };
         let activity = self.profile_activity();
-        let top = EDGE;
-        let height = (f64::from(window.viewport_size().height) - top - EDGE).max(TOOLS_H + BADGE);
-        // The window's close, minimize and zoom buttons, stacked at the rail's head on its glass.
-        let lights = self.engine.place_traffic_lights((INSET + GLASS_W / 2., top + 12.), true) + 10. - top;
+        let width = f64::from(RAIL_W);
+        let height = f64::from(window.viewport_size().height).max(TOOLS_H + BADGE);
+        // The window's close, minimize and zoom buttons, stacked at the sidebar's head.
+        let lights = self.engine.place_traffic_lights((width / 2., 14.), true) + 10.;
         let mut switches = Vec::new();
         let badges = profiles
             .iter()
@@ -86,7 +82,7 @@ impl BrowserWindow {
             height,
             Box::new(Node::Column {
                 gap: 6.,
-                pad: ((GLASS_W - BADGE) / 2., 6.),
+                pad: ((width - BADGE) / 2., 6.),
                 children: vec![
                     // Room for the lights: the column's padding and gap come on top.
                     Node::Height(lights - 12., Box::new(Node::Spacer)),
@@ -99,8 +95,8 @@ impl BrowserWindow {
                 ],
             }),
         );
-        let frame = LogicalRect { x: INSET, y: top, width: GLASS_W, height };
-        self.engine.set_bar("rail", frame, Some(12.), &content);
+        let frame = LogicalRect { x: 0., y: 0., width, height };
+        self.engine.set_sidebar("rail", frame, &content);
         bars.push("rail");
         // Where the badges are, for a window dragged over the rail, and Downloads, for its popover.
         let rect = |frame: LogicalRect| gpui::Bounds::new(gpui::point(px(frame.x as f32), px(frame.y as f32)), gpui::size(px(frame.width as f32), px(frame.height as f32)));

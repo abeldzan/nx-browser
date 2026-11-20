@@ -10,8 +10,8 @@ pub(crate) const EXT_FIELD: u32 = 0;
 const STORE_URL: &str = "https://chromewebstore.google.com/category/extensions";
 
 impl BrowserWindow {
-    /// Extension manager, dropped from the title bar's puzzle button.
-    pub(crate) fn extensions_popover(&self, pop: &mut Pop) -> Node {
+    /// Extension manager, a sheet opened from the dock's puzzle button.
+    pub(crate) fn extensions_sheet(&self, pop: &mut Pop) -> Node {
         let extensions = self.model.lock().extensions.clone();
         let on = extensions.iter().filter(|extension| extension.enabled).count();
         let summary = match extensions.len() {
@@ -117,6 +117,10 @@ impl BrowserWindow {
             this.with_model(|model| { let _ = model.create_tab(STORE_URL); });
         });
         let unpacked = pop.act(|this, cx| this.load_unpacked(cx));
+        let done = pop.act(|this, cx| {
+            this.popover = None;
+            cx.notify();
+        });
         let reload = pop.act(|this, _| {
             this.reload_extensions();
             this.status = "Extensions reloaded".into();
@@ -138,8 +142,9 @@ impl BrowserWindow {
                     children: vec![
                         Node::Link { title: "Browse the store".into(), action: browse },
                         Node::Link { title: "Load unpacked…".into(), action: unpacked },
-                        Node::Spacer,
                         Node::Link { title: "Reload all".into(), action: reload },
+                        Node::Spacer,
+                        button("Done", done, Style::Plain, Key::Escape),
                     ],
                 },
             ],

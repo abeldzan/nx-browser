@@ -14,11 +14,11 @@ use browser_engine::{DialogKind, EngineEvent, EngineSettings, Hole, LogicalRect,
 use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSFont, NSGlassEffectView, NSResponder, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask};
+use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSBox, NSBoxType, NSFont, NSGlassEffectView, NSImage, NSResponder, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
-use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
+use objc2_quartz_core::{kCAFillRuleEvenOdd, kCAGravityResizeAspectFill, CACornerMask, CAShapeLayer, CATransaction};
 use objc2_foundation::{
     ns_string, NSArray, NSBundle, NSData, NSDate, NSDictionary, NSError, NSHTTPCookie, NSObject, NSObjectProtocol,
     NSKeyValueObservingOptions, NSNumber, NSObjectNSKeyValueObserverRegistration, NSPoint, NSPropertyListFormat, NSPropertyListMutabilityOptions, NSPropertyListSerialization, NSRect, NSRunLoop, NSSize, NSString, NSURL, NSURLAuthenticationChallenge, NSURLCredential, NSURLProtectionSpace, NSURLRequest, NSURLResponse, NSURLSessionAuthChallengeDisposition, NSHTTPURLResponse, NSProgress, NSUUID,
@@ -774,6 +774,8 @@ pub struct MacEngine {
     frames: HashMap<String, Retained<crate::frame::NxFrameView>>,
     /// The snap preview while a dragged window would snap.
     snap: Option<Retained<NSView>>,
+    /// The window's own background under everything, and the wallpaper it shows (empty for Liquid Glass).
+    backdrop: Option<(Retained<NSView>, String)>,
     permissions: Arc<Mutex<HashMap<String, String>>>,
     settings: EngineSettings,
     https_only: Arc<AtomicBool>,
@@ -825,6 +827,7 @@ impl MacEngine {
             bars: HashMap::new(),
             frames: HashMap::new(),
             snap: None,
+            backdrop: None,
             permissions,
             settings: EngineSettings::default(),
             https_only: Arc::new(AtomicBool::new(false)),
@@ -1738,6 +1741,37 @@ impl MacEngine {
         width
     }
 
+    /// `set_bar` without glass: flush with the window on the sidebar material, a hairline down its trailing edge,
+    /// as a Mac sidebar sits.
+    pub fn set_sidebar(&mut self, key: &str, frame: LogicalRect, content: &crate::Node) -> f64 {
+        if let (false, Some(mtm), Some(view)) = (self.bars.contains_key(key), MainThreadMarker::new(), self.content.clone()) {
+            let side = NSVisualEffectView::new(mtm);
+            side.setMaterial(NSVisualEffectMaterial::Sidebar);
+            side.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            let holder = NSView::new(mtm);
+            holder.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+            side.addSubview(&holder);
+            let line = NSBox::new(mtm);
+            line.setBoxType(NSBoxType::Separator);
+            line.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin | NSAutoresizingMaskOptions::ViewHeightSizable);
+            side.addSubview(&line);
+            side.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+            side.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(frame.width, frame.height)));
+            holder.setFrame(side.bounds());
+            line.setFrame(NSRect::new(NSPoint::new(frame.width - 1., 0.), NSSize::new(1., frame.height)));
+            // Presses on its empty space go on to the GPUI view beneath, which moves the window.
+            let placed = crate::frame::NxPassView::new(mtm);
+            placed.addSubview(&side);
+            let placed = Retained::into_super(placed);
+            match &self.chrome {
+                Some(chrome) => view.addSubview_positioned_relativeTo(&placed, NSWindowOrderingMode::Above, Some(chrome)),
+                None => view.addSubview(&placed),
+            }
+            self.bars.insert(key.to_string(), (placed, holder));
+        }
+        self.set_bar(key, frame, None, content)
+    }
+
     /// Arranges this window's reorder list `list` for a drag passing over it; see `popover::arrange_list`.
     pub fn arrange_list(&self, list: u32, widths: &[f64], hide: Option<usize>, clear: Option<usize>, gap: Option<(usize, f64)>) {
         if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
@@ -1767,6 +1801,40 @@ impl MacEngine {
         let at = view.window()?.mouseLocationOutsideOfEventStream();
         let local = view.convertPoint_fromView(at, None);
         Some((local.x, if view.isFlipped() { local.y } else { view.bounds().size.height - local.y }))
+    }
+
+    /// Puts `wallpaper` (an image file) under the whole window, filling it; empty, or one that won't load, shows
+    /// Liquid Glass over the desktop instead.
+    pub fn set_backdrop(&mut self, wallpaper: &str) {
+        let (Some(mtm), Some(content)) = (MainThreadMarker::new(), self.content.clone()) else {
+            return;
+        };
+        if self.backdrop.as_ref().is_some_and(|(_, shown)| shown == wallpaper) {
+            return;
+        }
+        if let Some((old, _)) = self.backdrop.take() {
+            old.removeFromSuperview();
+        }
+        let image = Some(wallpaper).filter(|path| !path.is_empty()).and_then(|path| NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path)));
+        let view = match image {
+            Some(image) => {
+                let view = NSView::new(mtm);
+                view.setWantsLayer(true);
+                if let Some(layer) = view.layer() {
+                    unsafe {
+                        layer.setContents(Some(&image));
+                        layer.setContentsGravity(kCAGravityResizeAspectFill);
+                    }
+                    layer.setMasksToBounds(true);
+                }
+                view
+            }
+            None => Retained::into_super(NSGlassEffectView::initWithFrame(NSGlassEffectView::alloc(mtm), NSRect::ZERO)),
+        };
+        view.setFrame(content.bounds());
+        view.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
+        self.backdrop = Some((view, wallpaper.to_string()));
     }
 
     /// Whether Shift is held now, for a native control whose click acts differently with it.

@@ -1470,10 +1470,11 @@ impl BrowserWindow {
     }
 
     fn apply_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let (theme, accent) = {
+        let (theme, accent, wallpaper) = {
             let model = self.model.lock();
-            (model.settings.theme.clone(), model.settings.accent.clone())
+            (model.settings.theme.clone(), model.settings.accent.clone(), model.settings.wallpaper.clone())
         };
+        self.engine.set_backdrop(&wallpaper);
         let dark = match theme.as_str() {
             "light" => false,
             "dark" => true,
@@ -1601,7 +1602,7 @@ impl BrowserWindow {
     /// Gives keys to the active tab's content: its web page, or its terminal on the next render.
     /// A chrome modal is open: pages are dimmed, take no clicks and must not take keys.
     fn modal_open(&self) -> bool {
-        self.settings_open || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.ext_logs.is_some() || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty()
+        self.settings_open || self.popover == Some(Popover::Extensions) || self.delete_prompt.is_some() || self.new_profile.is_some() || self.history_modal || self.ext_logs.is_some() || self.bookmark_edit.is_some() || self.passwords.edit.is_some() || !self.pending_links.is_empty()
     }
 
     pub(crate) fn focus_active_content(&mut self) {
@@ -1654,7 +1655,13 @@ impl BrowserWindow {
             Popover::History => (self.history_popover(&mut pop), crate::history::POPOVER_W),
             Popover::Bookmarks => (self.bookmarks_popover(&mut pop), crate::history::POPOVER_W),
             Popover::Downloads => (self.downloads_popover(&mut pop), crate::history::POPOVER_W),
-            Popover::Extensions => (self.extensions_popover(&mut pop), 400.),
+            Popover::Extensions => {
+                // A sheet, not a popover: `sync_sheet` shows it.
+                if self.engine.popover_shown() {
+                    self.engine.close_popover();
+                }
+                return;
+            }
         };
         let edge = match kind {
             Popover::Downloads => browser_engine_macos::Edge::Right,
@@ -1683,6 +1690,8 @@ impl BrowserWindow {
             Some((format!("bookmark:{id:?}"), 400., self.bookmark_sheet(&mut pop)))
         } else if let Some(id) = self.ext_logs.clone() {
             Some((format!("logs:{id}"), 640., self.logs_sheet(&id, &mut pop)))
+        } else if self.popover == Some(Popover::Extensions) {
+            Some(("extensions".into(), 460., self.extensions_sheet(&mut pop)))
         } else if self.history_modal {
             Some(("history".into(), 560., self.history_sheet(&mut pop)))
         } else if !self.pending_links.is_empty() {
@@ -2342,7 +2351,6 @@ impl Render for BrowserWindow {
         v_stack()
             .relative()
             .size_full()
-            .bg(colors.bg)
             // Shift pressed or released without moving still shows or drops the swap at once.
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, window, cx| {
                 if let Some((x, y)) = this.gesture.as_ref().map(|gesture| gesture.pointer) {
@@ -2377,7 +2385,9 @@ impl Render for BrowserWindow {
                     .flex_1()
                     .h_full()
                     .overflow_hidden()
-                    .child(self.stage(&tabs, entity, cx)),
+                    .child(self.stage(&tabs, entity, cx))
+                    // No title bar here: the gap windows leave along the stage's top moves the window.
+                    .when(self.model.detached.is_none(), |column| column.child(drag_area().absolute().top_0().left_0().w_full().h(px(SNAP_INSET)))),
             ),
             )
             .when(self.model.detached.is_none(), |root| root.child(self.dock_zone(cx)))
@@ -2555,6 +2565,9 @@ impl BrowserWindow {
                     }
                     if entry.frame.is_some_and(|frame| mostly_off(frame, sw, sh)) {
                         entry.frame = None;
+                    }
+                    if entry.snap.is_none() {
+                        entry.frame = entry.frame.map(|frame| fit_on_stage(frame, sw, sh));
                     }
                 }
             }
@@ -3140,9 +3153,7 @@ impl BrowserWindow {
         if let Some(id) = self.home_caret.take() {
             self.engine.focus_home(&id);
         }
-        // Windows show under the rail too: it floats over them as glass rather than walling the stage off.
-        let under = if self.model.detached.is_none() { f64::from(crate::rail::RAIL_W).min(origin_x) } else { 0. };
-        let stage = LogicalRect { x: origin_x - under, y: origin_y, width: stage_w + under, height: stage_h };
+        let stage = LogicalRect { x: origin_x, y: origin_y, width: stage_w, height: stage_h };
         let (mut holes, mut notches) = visible_pages(&stack, &stage);
         // Pages show through holes in the chrome, so cut modal cards and menus out of them.
         for (rect, radius) in &self.overlay_rects {
@@ -4837,6 +4848,14 @@ fn mostly_off(frame: Frame, sw: f32, sh: f32) -> bool {
     visible_w < frame.w * 0.6 || visible_h < frame.h * 0.6 || frame.w > sw + 1.0 || frame.h > sh + 1.0
 }
 
+/// `frame` moved, and shrunk if it must be, to lie wholly on a `sw` × `sh` stage: a floating window the stage
+/// shrank under (the app window resized, or reopened smaller) comes back into view, as macOS does on a smaller screen.
+fn fit_on_stage(frame: Frame, sw: f32, sh: f32) -> Frame {
+    let w = frame.w.min(sw - SNAP_INSET * 2.0).max(1.0);
+    let h = frame.h.min(sh - SNAP_INSET * 2.0).max(1.0);
+    Frame { x: frame.x.clamp(0.0, sw - SNAP_INSET - w), y: frame.y.clamp(0.0, sh - SNAP_INSET - h), w, h }
+}
+
 fn keep_on_stage(frame: Frame, sw: f32, sh: f32) -> Frame {
     let visible = 64.0;
     Frame {
@@ -5040,6 +5059,20 @@ pub(crate) fn rail_mark(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_on_stage_brings_a_window_back_whole() {
+        let fit = |x, y, w, h| {
+            let frame = fit_on_stage(Frame { x, y, w, h }, 800.0, 600.0);
+            (frame.x, frame.y, frame.w, frame.h)
+        };
+        // Hanging off the right and bottom: moved in, size kept.
+        assert_eq!(fit(500.0, 400.0, 400.0, 300.0), (392.0, 292.0, 400.0, 300.0));
+        // Larger than the stage: shrunk to fit inside its margins.
+        assert_eq!(fit(100.0, 50.0, 1200.0, 900.0), (8.0, 8.0, 784.0, 584.0));
+        // Already on the stage: untouched.
+        assert_eq!(fit(20.0, 30.0, 300.0, 200.0), (20.0, 30.0, 300.0, 200.0));
+    }
 
     fn window_model() -> WindowModel {
         let model = Model::open(browser_storage::Storage::open_in_memory().unwrap()).unwrap();

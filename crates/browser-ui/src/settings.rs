@@ -76,13 +76,32 @@ impl SettingsSection {
         }
     }
 
+    /// Its SF Symbol in the sidebar.
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Profiles => "person.2",
+            Self::General => "gearshape",
+            Self::Shortcuts => "keyboard",
+            Self::Appearance => "paintbrush",
+            Self::Search => "magnifyingglass",
+            Self::Privacy => "hand.raised",
+            Self::Passwords => "key",
+            Self::Content => "globe",
+            Self::Downloads => "arrow.down.circle",
+            Self::Terminal => "terminal",
+            Self::Performance => "gauge.with.dots.needle.67percent",
+            Self::Developer => "hammer",
+            Self::About => "info.circle",
+        }
+    }
+
     /// Row titles of the section, so search finds a setting by name.
     fn keywords(self) -> &'static str {
         match self {
             Self::Profiles => "new profile icon color rename delete switch export import backup",
             Self::General => "on startup restore session new tab page home focus windows hover click default browser links other apps profile",
             Self::Shortcuts => "keyboard keys reset",
-            Self::Appearance => "theme dark light system font typeface page zoom accent color size line height reduce motion site zoom",
+            Self::Appearance => "theme dark light system font typeface page zoom accent color size line height reduce motion site zoom background wallpaper liquid glass",
             Self::Search => "address bar google duckduckgo",
             Self::Privacy => "save browsing history https ads trackers block pop-ups popups fraudulent warnings clear cookies site data permissions",
             Self::Passwords => "offer save suggest autofill logins vault",
@@ -375,7 +394,7 @@ impl BrowserWindow {
         let current = if shown.contains(&self.settings_section) { Some(self.settings_section) } else { shown.first().copied() };
         let search = pop.act(|_, _| {});
         // Room for the traffic lights, which sit over the sidebar.
-        let mut nav = vec![Node::Item { height: 30., click: None, drag: None, children: Vec::new() }, field(SETTINGS_QUERY, "", "Search", search)];
+        let mut nav = vec![Node::Item { height: 30., click: None, drag: None, children: Vec::new() }, field(SETTINGS_QUERY, "", "Search", search), Node::Item { height: 6., click: None, drag: None, children: Vec::new() }];
         if shown.is_empty() {
             nav.push(Node::Item { height: 28., click: None, drag: None, children: vec![text("No matches", 13., Weight::Regular, Ink::Secondary)] });
         }
@@ -385,7 +404,9 @@ impl BrowserWindow {
                 this.settings_section = section;
             });
             let selected = current == Some(section);
-            let row = Node::Item { height: 28., click: Some(open), drag: None, children: vec![text(section.label(), 13., Weight::Regular, if selected { Ink::Accent } else { Ink::Primary })] };
+            // A fixed-width icon column, so the labels line up whatever each symbol's width.
+            let icon = Node::Width(18., Box::new(Node::Center(Box::new(Node::Glyph { name: section.symbol(), size: 13., ink: Ink::Accent }))));
+            let row = Node::Item { height: 28., click: Some(open), drag: None, children: vec![icon, text(section.label(), 13., if selected { Weight::Medium } else { Weight::Regular }, Ink::Primary)] };
             nav.push(if selected { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
         }
         let mut page = Vec::new();
@@ -451,6 +472,11 @@ impl BrowserWindow {
                     let pick = pop.act(move |this, cx| this.set_pref(cx, |s| s.accent = option.to_string()));
                     accents.push(Node::Swatch { size: 18., fill: Some(rgba(fill)), selected: settings.accent == option, action: Some(pick), child: None });
                 }
+                let mut backgrounds = Vec::new();
+                if !settings.wallpaper.is_empty() {
+                    backgrounds.push(button("Use Liquid Glass", pop.act(|this, cx| this.set_pref(cx, |s| s.wallpaper.clear())), Style::Plain, Key::None));
+                }
+                backgrounds.push(button("Choose Image…", pop.act(|_, cx| pick_path(cx, false, |s, path| s.wallpaper = path)), Style::Plain, Key::None));
                 let mut page = vec![
                     setting("Theme", None, choice(pop, vec![("System", "system".to_string()), ("Light", "light".into()), ("Dark", "dark".into())], settings.theme.clone(), |s, v| s.theme = v)),
                     setting("Font", Some("Used across the browser's interface. Type to search, or type any font name."), Node::Combo { field: UI_FONT, value: Initial(shown), items: fonts, submit: font }),
@@ -476,6 +502,7 @@ impl BrowserWindow {
                         stepper(pop, format!("{:.0}%", settings.page_zoom * 100.0), |s| s.page_zoom = (s.page_zoom - 0.1).max(0.5), |s| s.page_zoom = (s.page_zoom + 0.1).min(2.0)),
                     ),
                     setting("Accent color", Some("Highlights, focus rings and the active window border."), Node::Row { gap: 4., children: accents }),
+                    setting("Background", Some(if settings.wallpaper.is_empty() { "Liquid Glass" } else { settings.wallpaper.as_str() }), Node::Row { gap: 6., children: backgrounds }),
                     setting("Reduce motion", Some("Panels, windows and messages appear without animating."), switch(pop, settings.reduce_motion, |s, v| s.reduce_motion = v)),
                     heading("Site zoom"),
                 ];
@@ -564,8 +591,8 @@ impl BrowserWindow {
                 ]
             }
             SettingsSection::Downloads => {
-                let downloads = pop.act(|_, cx| pick_folder(cx, |s, dir| s.download_dir = dir));
-                let shots = pop.act(|_, cx| pick_folder(cx, |s, dir| s.screenshot_dir = dir));
+                let downloads = pop.act(|_, cx| pick_path(cx, true, |s, dir| s.download_dir = dir));
+                let shots = pop.act(|_, cx| pick_path(cx, true, |s, dir| s.screenshot_dir = dir));
                 let mut shot_buttons = Vec::new();
                 if !settings.screenshot_dir.is_empty() {
                     shot_buttons.push(button("Use Downloads", pop.act(|this, cx| this.set_pref(cx, |s| s.screenshot_dir.clear())), Style::Plain, Key::None));
@@ -912,10 +939,10 @@ pub(crate) fn menu_item(label: impl Into<std::borrow::Cow<'static, str>>, enable
     Some((label.into(), enabled, Box::new(run)))
 }
 
-/// Asks for a folder, then stores it with `set`.
-fn pick_folder(cx: &mut Context<BrowserWindow>, set: fn(&mut Settings, String)) {
+/// Asks for a folder (or a file), then stores it with `set`.
+fn pick_path(cx: &mut Context<BrowserWindow>, folder: bool, set: fn(&mut Settings, String)) {
     // gpui's sheet, not runModal: a modal loop inside this click lets gpui's timers re-enter and abort.
-    let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
+    let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: !folder, directories: folder, multiple: false, prompt: None });
     cx.spawn(async move |this, cx| {
         let Ok(Ok(Some(paths))) = paths.await else { return };
         let Some(path) = paths.into_iter().next() else { return };

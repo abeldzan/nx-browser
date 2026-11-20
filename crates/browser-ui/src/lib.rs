@@ -124,6 +124,8 @@ pub(crate) fn open_browser_window(cx: &mut App, bounds: Bounds<Pixels>, build: i
             // Tabs live in the titlebar; empty titlebar space moves the window itself.
             app_owns_titlebar_drag: true,
             window_min_size: Some(size(px(860.), px(560.))),
+            // The engine puts Liquid Glass or a wallpaper under the chrome, which paints no background of its own.
+            window_background: gpui::WindowBackgroundAppearance::Transparent,
             ..Default::default()
         },
         |_, cx| cx.new(build),

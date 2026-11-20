@@ -34,6 +34,14 @@ fn group(controls: Vec<Node>) -> Node {
     Node::Glass { radius: CAPSULE_R, child: Box::new(Node::Column { gap: 0., pad: (2., 2.), children: vec![Node::Row { gap: 2., children: controls }] }) }
 }
 
+/// A title strip button, as the dock's: its symbol in the label colour (the accent while `on`) on a round
+/// highlight that shows under the pointer, concentric with the 26pt capsule it sits 2pt into.
+fn strip_tool(action: u32, symbol: &'static str, tip: &'static str, on: bool) -> Node {
+    let glyph = Node::Glyph { name: symbol, size: 13., ink: if on { Ink::Accent } else { Ink::Primary } };
+    let item = Node::Item { height: CAPSULE_R * 2. - 4., click: Some(action), drag: None, children: vec![Node::Center(Box::new(glyph))] };
+    Node::Tip { tip: tip.into(), child: Box::new(Node::Width(28., Box::new(Node::Round { radius: PILL_R, tint: None, child: Box::new(item) }))) }
+}
+
 /// What a native reorder list holds, in its order: a window's tabs ("" for a gap a drag opened), or spaces.
 pub(crate) enum ReorderList {
     Tabs(Vec<String>),
@@ -77,7 +85,6 @@ impl BrowserWindow {
                 title_h: TITLE_H,
                 radius: WINDOW_RADIUS,
                 body: rgba(paint.secondary),
-                strip: rgba(paint.surface),
                 line: rgba(paint.border),
                 // A neutral hairline on every window: focus shows as depth and an undimmed strip, as in macOS.
                 ring: rgba(paint.border),
@@ -116,13 +123,13 @@ impl BrowserWindow {
     }
 
     /// A window's title strip, laid out as Safari's compact tab bar: back and forward, the tabs on one glass track
-    /// (the shown one standing as the address field), then bookmark, screenshot and new tab, then the window buttons;
+    /// (the shown one standing as the address field) and new tab, then bookmark and screenshot, then the window buttons;
     /// `tools` false leaves out all but the tabs and new tab button.
     #[allow(clippy::too_many_arguments)]
     fn window_row(&mut self, tab: &browser_core::Tab, members: &[&browser_core::Tab], width: f64, tools: bool, pop: &mut Pop, pills: &mut Vec<(u32, String)>, cx: &mut Context<Self>) -> Node {
         let paint = paint(cx);
         let id = tab.id.clone();
-        let tool = |pop: &mut Pop, symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| Node::Tool { symbol, tip, action: pop.act(run), on };
+        let tool = |pop: &mut Pop, symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| strip_tool(pop.act(run), symbol, tip, on);
         let mut row = Vec::new();
         if !is_terminal(&tab.url) {
             let (back, forward) = (id.clone(), id.clone());
@@ -147,15 +154,15 @@ impl BrowserWindow {
             this.click_new_tab(&new_tab, shift, cx);
         }));
         // What the buttons leave, in 16pt steps so resizing the window rebuilds the strip only now and then.
-        let room = (((width - if tools { 230. } else { 40. }) / 16.).floor() * 16.).max(120.);
+        let room = (((width - if tools { 280. } else { 100. }) / 16.).floor() * 16.).max(120.);
         row.push(Node::Spacer);
         row.push(self.tab_track(&tab.id, members, room, pop, pills, cx));
+        // Right after the last tab, as in Safari.
+        row.push(group(vec![plus]));
         row.push(Node::Spacer);
-        let (page, window) = self.window_tools(&tab.id, pop);
-        let mut page = if tools { page } else { Vec::new() };
-        page.push(plus);
-        row.push(group(page));
         if tools {
+            let (page, window) = self.window_tools(&tab.id, pop);
+            row.push(group(page));
             row.push(group(window));
         }
         Node::Row { gap: 6., children: row }
@@ -343,7 +350,7 @@ impl BrowserWindow {
         };
         let id = tab_id.to_string();
         let mut tools = Vec::new();
-        let mut tool = |symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| tools.push(Node::Tool { symbol, tip, action: pop.act(run), on });
+        let mut tool = |symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| tools.push(strip_tool(pop.act(run), symbol, tip, on));
         if peek {
             let keep = id.clone();
             tool("macwindow.badge.plus", "Keep as Window", false, Box::new(move |this, cx| {
@@ -366,7 +373,7 @@ impl BrowserWindow {
             this.open_shot_menu(shot.clone(), gpui::point(px(x as f32), px(y as f32)));
         }));
         let page = std::mem::take(&mut tools);
-        let mut tool = |symbol: &'static str, tip: &'static str, run: crate::settings::MenuAction| tools.push(Node::Tool { symbol, tip, action: pop.act(run), on: false });
+        let mut tool = |symbol: &'static str, tip: &'static str, run: crate::settings::MenuAction| tools.push(strip_tool(pop.act(run), symbol, tip, false));
         let (min, zoom, close) = (id.clone(), id.clone(), id);
         tool("minus", "Minimize", Box::new(move |this, cx| this.minimize_window(&min, cx)));
         tool(if maximized { "arrow.down.right.and.arrow.up.left" } else { "arrow.up.left.and.arrow.down.right" }, if maximized { "Restore" } else { "Maximize" }, Box::new(move |this, cx| this.toggle_maximize(&zoom, cx)));

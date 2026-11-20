@@ -37,6 +37,8 @@ pub struct Settings {
     pub inspector: bool,
     /// `#rrggbb`; empty means the theme's own accent.
     pub accent: String,
+    /// An image filling the window behind its windows; empty shows Liquid Glass.
+    pub wallpaper: String,
     pub reduce_motion: bool,
     /// Font family for the browser's own UI; empty means the system font.
     pub ui_font: String,
@@ -99,6 +101,7 @@ impl Default for Settings {
             max_live_tabs: 6,
             inspector: true,
             accent: String::new(),
+            wallpaper: String::new(),
             reduce_motion: false,
             ui_font: String::new(),
             ui_font_size: 13.0,

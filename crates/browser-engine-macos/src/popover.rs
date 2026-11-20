@@ -2044,6 +2044,8 @@ impl Build<'_> {
         scroll.setDrawsBackground(false);
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
+        // Over the rows while scrolling, as in Apple's popovers, rather than a track cutting off their right end.
+        scroll.setScrollerStyle(objc2_app_kit::NSScrollerStyle::Overlay);
         let document: Retained<NxFlippedView> = unsafe { msg_send![super(NxFlippedView::alloc(self.mtm).set_ivars(())), initWithFrame: NSRect::ZERO] };
         let inner = self.node(child);
         pin(&document, &inner, 0.);
