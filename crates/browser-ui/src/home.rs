@@ -159,13 +159,13 @@ fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bo
         chips.push(Node::Item { height: 26., click: Some(more), drag: None, children: vec![text(format!("{} more", saved.len() - BAR_MARKS), 12., Weight::Regular, Ink::Secondary)] });
     }
     let content = (width - 48.).clamp(200., 640.);
-    // Rounded so resizing the window rebuilds the page only every few points.
-    let top = ((height * 0.14 / 8.).round() * 8.).max(16.);
+    let top = (height * 0.14).round().max(16.);
     let mut page = Vec::new();
     if !chips.is_empty() {
         page.push(Node::Flow { gap: 6., center: true, children: chips });
     }
-    page.push(Node::Column { gap: 0., pad: (0., top / 2.), children: Vec::new() });
+    // A `Height`, which a resize sets on the page in place.
+    page.push(Node::Height(top, Box::new(Node::Spacer)));
     page.push(Node::Center(Box::new(Node::Width(content, Box::new(Node::Column { gap: 20., pad: (0., 0.), children: column })))));
     Node::Column { gap: 0., pad: (24., 12.), children: page }
 }

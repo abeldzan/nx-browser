@@ -28,6 +28,15 @@ pub(crate) fn drag_pill_w(slot: f64) -> f64 {
 /// What sits in a capsule (a tab, a space, a hover highlight, the address field): fully round too, and concentric
 /// with the capsule around it.
 const PILL_R: f64 = CAPSULE_R - 2.;
+/// Tab pills narrower than this show only their icon: the close and reload slots, gaps and padding need it all.
+const FULL_PILL: f64 = 96.;
+/// The narrowest a tab pill gets: its icon, padded.
+const MIN_PILL: f64 = 28.;
+
+/// A glass capsule of `buttons` 28pt strip tools, 2pt apart and 2pt in (`group`).
+fn capsule_w(buttons: usize) -> f64 {
+    if buttons == 0 { 0. } else { 30. * buttons as f64 + 2. }
+}
 
 /// `controls` on a small glass capsule, as a macOS 26 toolbar groups its buttons.
 fn group(controls: Vec<Node>) -> Node {
@@ -130,39 +139,72 @@ impl BrowserWindow {
         let paint = paint(cx);
         let id = tab.id.clone();
         let tool = |pop: &mut Pop, symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| strip_tool(pop.act(run), symbol, tip, on);
+        let badge = self.guest_profile(&tab.id);
+        let (mut page, mut window) = if tools { self.window_tools(&tab.id, pop) } else { (Vec::new(), Vec::new()) };
+        let nav_most = if tools && !is_terminal(&tab.url) { 2 } else { 0 };
+        let (page_most, window_most) = (page.len(), window.len());
+        // What fits, fullest first: as the window narrows, bookmark and screenshot go, then forward, then minimize and
+        // maximize (close stays), then new tab, so nothing runs past the strip's edge. (back/forward, page tools,
+        // window tools, new tab)
+        let levels = [
+            (nav_most, page_most, window_most, true),
+            (nav_most, 0, window_most, true),
+            (nav_most.min(1), 0, window_most, true),
+            (nav_most.min(1), 0, window_most.min(1), true),
+            (0, 0, window_most.min(1), true),
+            (0, 0, window_most.min(1), false),
+        ];
+        let badge_w = if badge.is_some() { 20. } else { 0. };
+        let fixed = |(nav, page, window, plus): (usize, usize, usize, bool)| {
+            let parts = [capsule_w(nav), badge_w, capsule_w(page), capsule_w(window), capsule_w(usize::from(plus))];
+            // The track and its two spacers besides the parts shown, all 6pt apart.
+            let shown = parts.iter().filter(|part| **part > 0.).count() + 3;
+            parts.iter().sum::<f64>() + 6. * (shown - 1) as f64
+        };
+        let count = members.len().max(1) as f64;
+        // The narrowest track that still shows every tab, as an icon.
+        let track_min = 4. + count * MIN_PILL + 2. * (count - 1.);
+        // Inside the strip's 3pt side insets, with a point to spare for rounding.
+        let avail = width - 7.;
+        let (nav, page_n, window_n, plus) = levels.into_iter().find(|level| fixed(*level) + track_min <= avail).unwrap_or(levels[5]);
         let mut row = Vec::new();
-        if !is_terminal(&tab.url) {
+        if nav > 0 {
             let (back, forward) = (id.clone(), id.clone());
-            let nav = vec![
-                tool(pop, "chevron.left", "Back", false, Box::new(move |this, cx| {
-                    this.focus_window(&back, cx);
-                    this.back();
-                })),
-                tool(pop, "chevron.right", "Forward", false, Box::new(move |this, cx| {
+            let mut buttons = vec![tool(pop, "chevron.left", "Back", false, Box::new(move |this, cx| {
+                this.focus_window(&back, cx);
+                this.back();
+            }))];
+            if nav > 1 {
+                buttons.push(tool(pop, "chevron.right", "Forward", false, Box::new(move |this, cx| {
                     this.focus_window(&forward, cx);
                     this.forward();
-                })),
-            ];
-            row.push(group(nav));
+                })));
+            }
+            row.push(group(buttons));
         }
-        if let Some(profile) = self.guest_profile(&tab.id) {
+        if let Some(profile) = badge {
             row.push(profile_badge_node(&profile, true, 20., paint));
         }
-        let new_tab = id.clone();
-        let plus = tool(pop, "plus", "New Tab", false, Box::new(move |this, cx| {
-            let shift = this.engine.shift_held();
-            this.click_new_tab(&new_tab, shift, cx);
-        }));
-        // What the buttons leave, in 16pt steps so resizing the window rebuilds the strip only now and then.
-        let room = (((width - if tools { 280. } else { 100. }) / 16.).floor() * 16.).max(120.);
+        // What the buttons leave. A resize sets the new widths on the strip's views rather than rebuilding it.
+        let room = (avail - fixed((nav, page_n, window_n, plus))).floor().max(MIN_PILL + 4.);
         row.push(Node::Spacer);
         row.push(self.tab_track(&tab.id, members, room, pop, pills, cx));
-        // Right after the last tab, as in Safari.
-        row.push(group(vec![plus]));
+        if plus {
+            let new_tab = id.clone();
+            // Right after the last tab, as in Safari.
+            row.push(group(vec![tool(pop, "plus", "New Tab", false, Box::new(move |this, cx| {
+                let shift = this.engine.shift_held();
+                this.click_new_tab(&new_tab, shift, cx);
+            }))]));
+        }
         row.push(Node::Spacer);
-        if tools {
-            let (page, window) = self.window_tools(&tab.id, pop);
+        page.truncate(page_n);
+        // Close is the last window tool, and the one that stays.
+        window.drain(..window_most - window_n);
+        if !page.is_empty() {
             row.push(group(page));
+        }
+        if !window.is_empty() {
             row.push(group(window));
         }
         Node::Row { gap: 6., children: row }
@@ -183,7 +225,7 @@ impl BrowserWindow {
         let split = |n: f64| {
             let inner = track - 4. - 2. * (n - 1.);
             if n > 1. && inner / n < want {
-                let shown = want.min(inner - 34. * (n - 1.)).max(inner / n).floor();
+                let shown = want.min(inner - MIN_PILL * (n - 1.)).max(inner / n).floor();
                 (shown, ((inner - shown) / (n - 1.)).floor())
             } else {
                 ((inner / n).floor(), (inner / n).floor())
@@ -200,14 +242,14 @@ impl BrowserWindow {
         let gap = drag.filter(|state| state.row.as_deref() == Some(group.as_str())).and_then(|state| state.order.iter().position(|id| *id == state.id));
         let slots = count - f64::from(u8::from(hide.is_some())) + f64::from(u8::from(gap.is_some()));
         let (shown_now, other_now) = split(slots.max(1.));
-        let widths = ids.iter().map(|id| if id == front { shown_now } else { other_now }.max(32.)).collect();
-        self.list_arrangements.push((list, widths, hide, clear, gap.map(|at| (at, other_now.max(32.)))));
+        let widths = ids.iter().map(|id| if id == front { shown_now } else { other_now }.max(MIN_PILL)).collect();
+        self.list_arrangements.push((list, widths, hide, clear, gap.map(|at| (at, other_now.max(MIN_PILL)))));
         let mut row = Vec::new();
         for tab in ids.iter().filter_map(|id| members.iter().find(|tab| tab.id == *id)) {
             let shown = tab.id == front;
             let width = if shown { shown_w } else { other_w };
             let node = if shown && editing { self.address_field(tab, pop) } else { self.tab_pill(tab, shown, width, pop, pills, cx) };
-            row.push(Node::Width(width.max(32.), Box::new(node)));
+            row.push(Node::Width(width.max(MIN_PILL), Box::new(node)));
         }
         let tabs = Node::Reorder { list, gap: 2., horizontal: true, children: row };
         Node::Width(track, Box::new(Node::Glass { radius: CAPSULE_R, child: Box::new(Node::Column { gap: 0., pad: (2., 2.), children: vec![tabs] }) }))
@@ -277,6 +319,38 @@ impl BrowserWindow {
             let id = id.clone();
             move |this, cx| this.close_tabs(vec![id.clone()], cx)
         });
+        let children = if width < FULL_PILL {
+            // Squeezed by a narrow window or many tabs: the icon alone, as Safari's.
+            vec![Node::Center(Box::new(self.tab_image(tab, 14., cx)))]
+        } else {
+            self.pill_content(tab, shown, width, close, pop, cx)
+        };
+        let mut pill = Node::Item { height: 22., click: Some(click), drag: None, children };
+        if shown {
+            pill = Node::Round { radius: PILL_R, tint: Some(Ink::Secondary), child: Box::new(pill) };
+        } else {
+            pill = Node::Round { radius: PILL_R, tint: None, child: Box::new(pill) };
+        }
+        if self.picked(&tab.id) {
+            pill = Node::Faded(Box::new(pill));
+        }
+        let menu = pop.act({
+            let id = id.clone();
+            move |this, _| {
+                let (x, y) = this.engine.pointer().unwrap_or_default();
+                this.open_tab_menu(id.clone(), gpui::point(px(x as f32), px(y as f32)));
+            }
+        });
+        let drag = pop.act(|_, _| {});
+        self.drag_items.push((drag, DragItem::Tab(id)));
+        let pill = Node::Tip { tip: full_title(tab), child: Box::new(pill) };
+        Node::Drag { id: drag, child: Box::new(Node::Menu { action: menu, child: Box::new(pill) }) }
+    }
+
+    /// A tab pill at full size, `width` wide: the close button on hover, icon, title cut to fit, and the shown
+    /// tab's reload.
+    fn pill_content(&mut self, tab: &browser_core::Tab, shown: bool, width: f64, close: u32, pop: &mut Pop, cx: &gpui::App) -> Vec<Node> {
+        let id = tab.id.clone();
         // As in Safari: the close button at the tab's leading edge on hover, the icon and title centred between it
         // and a slot of the same width at the trailing edge (the shown tab's reload), so nothing shifts.
         let slot = || Node::Width(18., Box::new(Node::Spacer));
@@ -318,26 +392,7 @@ impl BrowserWindow {
         }
         children.push(Node::Spacer);
         children.push(if shown && !is_terminal(&tab.url) { Node::Width(18., Box::new(Node::Center(Box::new(self.reload_tool(&tab.id, pop))))) } else { slot() });
-        let mut pill = Node::Item { height: 22., click: Some(click), drag: None, children };
-        if shown {
-            pill = Node::Round { radius: PILL_R, tint: Some(Ink::Secondary), child: Box::new(pill) };
-        } else {
-            pill = Node::Round { radius: PILL_R, tint: None, child: Box::new(pill) };
-        }
-        if self.picked(&tab.id) {
-            pill = Node::Faded(Box::new(pill));
-        }
-        let menu = pop.act({
-            let id = id.clone();
-            move |this, _| {
-                let (x, y) = this.engine.pointer().unwrap_or_default();
-                this.open_tab_menu(id.clone(), gpui::point(px(x as f32), px(y as f32)));
-            }
-        });
-        let drag = pop.act(|_, _| {});
-        self.drag_items.push((drag, DragItem::Tab(id)));
-        let pill = Node::Tip { tip: full_title(tab), child: Box::new(pill) };
-        Node::Drag { id: drag, child: Box::new(Node::Menu { action: menu, child: Box::new(pill) }) }
+        children
     }
 
     /// Bookmark and screenshot (and Keep as Window for a peek), then minimize, maximize and close.

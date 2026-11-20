@@ -168,6 +168,11 @@ pub struct BrowserWindow {
     tab_press: Option<gpui::Point<Pixels>>,
     pub(crate) stage_bounds: Option<gpui::Bounds<Pixels>>,
     layout_stage: Option<(i32, i32)>,
+    /// When the stage last changed size; layouts are saved once it has settled, and `tick` saves the last one.
+    stage_moved: Instant,
+    /// How much smaller than the window's content the stage was laid out, so `render` knows the stage's size
+    /// before layout measures it.
+    stage_inset: gpui::Size<Pixels>,
     order: Vec<String>,
     subscriptions: Vec<Subscription>,
     pub(crate) status: SharedString,
@@ -401,6 +406,8 @@ impl BrowserWindow {
             tab_press: None,
             stage_bounds: None,
             layout_stage: None,
+            stage_moved: Instant::now(),
+            stage_inset: gpui::Size::default(),
             order: Vec::new(),
             subscriptions,
             passwords,
@@ -526,6 +533,11 @@ impl BrowserWindow {
             if !already {
                 self.focus_window(&id, cx);
             }
+        }
+        // A resize ends without a frame of its own: the layout it left is saved here once the stage settles.
+        if self.stage_moved.elapsed() < STAGE_SETTLE + TICK {
+            let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
+            self.save_layouts(&tabs);
         }
         // Catches logins done without a page load (XHR); finished loads save right away.
         if self.cookies_saved.elapsed() > Duration::from_secs(10) {
@@ -1894,6 +1906,11 @@ impl BrowserWindow {
         if self.attached {
             return;
         }
+        // A live resize redraws GPUI's surface but renders no view that wasn't notified, so the pages, frames and
+        // native bars would keep their old places until the mouse came up.
+        if self.subscriptions.len() == 1 {
+            self.subscriptions.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
+        }
         if let Some(id) = self.model.detached.clone() {
             // Closed by the user (not at quit): the space goes back to the main window.
             let model = self.model.shared.clone();
@@ -2284,28 +2301,7 @@ impl Render for BrowserWindow {
         self.sync_find();
         self.sync_toast();
         self.update_dock(window);
-        // Before the window strips are built, so a click on a tab shows its address field in this very frame: a
-        // notify from inside render asks for no further frame, and the field waited for the next event.
-        self.request_address_focus(cx);
-        self.sync_bars(window, cx);
-        self.request_terminal_focus(window, cx);
-        let _subscriptions = &self.subscriptions;
-        let entity = cx.entity();
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
-        if let Some(own) = self.model.detached.clone().filter(|_| self.close_window) {
-            // Its last tab closed: the window and its space go, tabs and all.
-            forget_detached(&mut self.model.shared.lock().unwrap_or_else(PoisonError::into_inner), &own, true);
-            window.remove_window();
-        }
-        if let Some(own) = &self.model.detached {
-            // Its space was deleted (with its profile): nothing left to show.
-            if !self.model.lock().sessions.iter().any(|session| session.id == *own) {
-                window.remove_window();
-            }
-        }
-        if std::mem::take(&mut self.merge_requested) {
-            self.merge_into_main(window, cx);
-        }
         let active_session = self.model.lock().active_session_id.clone();
         let all_tabs = self.model.lock().tabs.clone();
         let colors = paint(cx);
@@ -2322,8 +2318,31 @@ impl Render for BrowserWindow {
             }
         }
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
+        // Laid out before the title strips are built, so they show this frame's frames.
+        self.sync_stage(window);
         self.prepare_frames(&tabs);
         self.sync_groups();
+        // Before the window strips are built, so a click on a tab shows its address field in this very frame: a
+        // notify from inside render asks for no further frame, and the field waited for the next event.
+        self.request_address_focus(cx);
+        self.sync_bars(window, cx);
+        self.request_terminal_focus(window, cx);
+        let _subscriptions = &self.subscriptions;
+        let entity = cx.entity();
+        if let Some(own) = self.model.detached.clone().filter(|_| self.close_window) {
+            // Its last tab closed: the window and its space go, tabs and all.
+            forget_detached(&mut self.model.shared.lock().unwrap_or_else(PoisonError::into_inner), &own, true);
+            window.remove_window();
+        }
+        if let Some(own) = &self.model.detached {
+            // Its space was deleted (with its profile): nothing left to show.
+            if !self.model.lock().sessions.iter().any(|session| session.id == *own) {
+                window.remove_window();
+            }
+        }
+        if std::mem::take(&mut self.merge_requested) {
+            self.merge_into_main(window, cx);
+        }
         self.save_layouts(&tabs);
         self.step_motion();
         if self.animating() {
@@ -2755,8 +2774,9 @@ impl BrowserWindow {
 
     /// Writes changed window layouts to the tab rows so they survive restarts.
     fn save_layouts(&mut self, tabs: &[browser_core::Tab]) {
-        // Mid-motion layouts change every frame; save once things settle instead of writing SQLite per frame.
-        if self.gesture.is_some() || self.self_test.is_some() || self.animating() {
+        // Mid-motion layouts change every frame (a window resize retiles every frame too); save once things settle
+        // instead of writing SQLite per frame.
+        if self.gesture.is_some() || self.self_test.is_some() || self.animating() || self.stage_moved.elapsed() < STAGE_SETTLE {
             return;
         }
         let Some((sw, sh)) = self.layout_stage else {
@@ -2780,13 +2800,23 @@ impl BrowserWindow {
         }
     }
 
-    fn note_stage(&mut self, bounds: gpui::Bounds<Pixels>, cx: &mut Context<Self>) -> bool {
+    /// Takes `bounds` as the stage's; true if its size changed.
+    fn note_stage(&mut self, bounds: gpui::Bounds<Pixels>) -> bool {
         let changed = self.stage_bounds.map(|old| (f64::from(old.size.width) - f64::from(bounds.size.width)).abs() > 1.0 || (f64::from(old.size.height) - f64::from(bounds.size.height)).abs() > 1.0).unwrap_or(true);
         self.stage_bounds = Some(bounds);
         if changed {
-            cx.notify();
+            self.stage_moved = Instant::now();
         }
-        self.gesture.is_some()
+        changed
+    }
+
+    /// The stage for the window's size now, before layout measures it: during a live resize the pages, frames and
+    /// title strips then move in the very frame the window does, rather than one behind.
+    fn sync_stage(&mut self, window: &Window) {
+        if let Some(stage) = self.stage_bounds {
+            let size = window.viewport_size() - self.stage_inset;
+            self.note_stage(gpui::Bounds::new(stage.origin, size));
+        }
     }
 
     fn track_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, window: &Window, cx: &mut Context<Self>) {
@@ -3250,13 +3280,22 @@ impl BrowserWindow {
         let paint_watch = entity;
         let mut stage = div().relative().flex_1().w_full().min_h(px(0.)).overflow_hidden().child(
             canvas(
-                move |bounds, _, cx| watch.update(cx, |view, cx| view.note_stage(bounds, cx)),
-                move |_, _, _, cx| {
-                    paint_watch.update(cx, |view, cx| {
-                        if view.place_windows() {
-                            cx.notify();
-                        }
-                    });
+                move |bounds, window, cx| {
+                    let inset = window.viewport_size() - bounds.size;
+                    // Measured mid-draw, after this frame laid the windows out; a notify now would be dropped, so a
+                    // stage `render` got wrong (its surroundings changed) is laid out again next frame.
+                    if watch.update(cx, |view, _| {
+                        view.stage_inset = inset;
+                        view.note_stage(bounds)
+                    }) {
+                        window.request_animation_frame();
+                    }
+                },
+                move |_, _, window, cx| {
+                    // A new tab page's area changed size: it is laid out again next frame (a notify mid-draw is dropped).
+                    if paint_watch.update(cx, |view, _| view.place_windows()) {
+                        window.request_animation_frame();
+                    }
                 },
             )
             .absolute()
@@ -4610,6 +4649,8 @@ const SLIDE_ANIM: Duration = Duration::from_millis(220);
 const WINDOW_FROM_SCALE: f32 = 0.94;
 /// How often each window polls the engine, model and terminals.
 const TICK: Duration = Duration::from_millis(250);
+/// How long the stage keeps its size before window layouts are saved.
+const STAGE_SETTLE: Duration = Duration::from_millis(300);
 const TOAST_IN: Duration = Duration::from_millis(180);
 const DOCK_ANIM: Duration = Duration::from_millis(260);
 /// The dock's resting line, in the stage's foot inset (2pt + 5pt < SNAP_INSET).

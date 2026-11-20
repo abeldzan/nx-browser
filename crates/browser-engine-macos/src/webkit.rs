@@ -1717,15 +1717,15 @@ impl MacEngine {
         }
         let fit = frame.width <= 0.;
         // A sized bar stretches to its frame, so moving or resizing it (a dragged card, the dock opening) rebuilds nothing.
-        let rebuilt = crate::popover::embed(self.window_no, &self.bar_key(key), &holder, frame.width.max(0.), !fit, content);
-        if let (true, false, Some(inner)) = (rebuilt, fit, holder.subviews().firstObject()) {
+        let embedded = crate::popover::embed(self.window_no, &self.bar_key(key), &holder, frame.width.max(0.), !fit, content);
+        if let (crate::popover::Embedded::Rebuilt, false, Some(inner)) = (embedded, fit, holder.subviews().firstObject()) {
             // Spacers fill the bar's height too (a dragged card centres its content), but content of a set height keeps it.
             let bottom = inner.bottomAnchor().constraintEqualToAnchor(&holder.bottomAnchor());
             bottom.setPriority(objc2_app_kit::NSLayoutPriorityDefaultHigh);
             bottom.setActive(true);
         }
         let width = match holder.subviews().firstObject() {
-            Some(inner) if fit && rebuilt => inner.fittingSize().width,
+            Some(inner) if fit && embedded != crate::popover::Embedded::Same => inner.fittingSize().width,
             _ if fit => placed.frame().size.width,
             _ => frame.width,
         };

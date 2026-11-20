@@ -104,7 +104,7 @@ pub enum Node {
     /// A `size` square with rounded corners, filled with `fill` (RGBA) and ringed when `selected`, `child` centred;
     /// pressing it runs `action`. A colour or icon choice, or a profile badge.
     Swatch { size: f64, fill: Option<[f64; 4]>, selected: bool, action: Option<u32>, child: Option<Box<Node>> },
-    /// Scrolls `child` once it is taller than `max`.
+    /// Scrolls `child` once it is taller than `max`; an infinite `max`, once the stretched surface runs out of room.
     Scroll { max: f64, child: Box<Node> },
 }
 
@@ -205,6 +205,112 @@ struct Surface {
     submits: HashMap<u32, u32>,
     /// Kept across rebuilds so typing survives a content change.
     fields: HashMap<u32, Retained<NSTextField>>,
+    /// An embedded surface's content less what `patches` update in place (see `flatten`).
+    shape: Node,
+    patches: Vec<Option<Patch>>,
+}
+
+/// A value `flatten` takes out of a content, and the view property it sets: a `Width` or `Height` constraint's
+/// constant, a `Text` label's string.
+enum Slot {
+    Size(f64),
+    Text(String),
+}
+
+enum Patch {
+    Size(Retained<objc2_app_kit::NSLayoutConstraint>),
+    Text(Retained<NSTextField>),
+}
+
+impl Patch {
+    /// Sets `slot`'s value; false when it is a different kind, so the views can't follow the content.
+    fn apply(&self, slot: &Slot) -> bool {
+        match (self, slot) {
+            (Patch::Size(constraint), Slot::Size(value)) => {
+                if constraint.constant() != *value {
+                    constraint.setConstant(*value);
+                }
+                true
+            }
+            (Patch::Text(label), Slot::Text(text)) => {
+                if label.stringValue().to_string() != *text {
+                    label.setStringValue(&NSString::from_str(text));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What embedding a content did to the views.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Embedded {
+    Same,
+    /// Only sizes and texts changed; they were set on the views already there.
+    Patched,
+    Rebuilt,
+}
+
+impl Node {
+    /// Its child nodes, in the order `Build` makes their views.
+    fn children_mut(&mut self) -> Vec<&mut Node> {
+        match self {
+            Node::Column { children, .. } | Node::Row { children, .. } | Node::Flow { children, .. } | Node::Reorder { children, .. } | Node::Item { children, .. } => {
+                children.iter_mut().collect()
+            }
+            Node::Overlay { child, corner } => vec![&mut **child, &mut **corner],
+            Node::Split { sidebar, content, .. } => vec![&mut **sidebar, &mut **content],
+            Node::Swatch { child, .. } => child.iter_mut().map(|child| &mut **child).collect(),
+            Node::Center(child)
+            | Node::Width(_, child)
+            | Node::Height(_, child)
+            | Node::Faded(child)
+            | Node::Hover(_, child)
+            | Node::Menu { child, .. }
+            | Node::Watch { child, .. }
+            | Node::Tip { child, .. }
+            | Node::Drag { child, .. }
+            | Node::Card { child, .. }
+            | Node::Ring { child, .. }
+            | Node::Round { child, .. }
+            | Node::Glass { child, .. }
+            | Node::Scroll { child, .. } => vec![&mut **child],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether building it reads the width it is given: wrapping text, a flow, a scroll view's document.
+    fn reads_width(&mut self) -> bool {
+        matches!(self, Node::Flow { .. } | Node::Scroll { .. } | Node::Split { .. })
+            || matches!(self, Node::Text { wrap, .. } if *wrap != Wrap::Line)
+            || self.children_mut().into_iter().any(Node::reads_width)
+    }
+}
+
+/// Takes the values a rebuild can set in place out of `node` into `out`, in the order `Build` makes their views:
+/// `Width` and `Height` sizes, `Text` strings. What is left is its shape; two contents of one shape differ only
+/// in those values.
+fn flatten(node: &mut Node, out: &mut Vec<Slot>) {
+    match node {
+        Node::Width(width, child) => {
+            out.push(Slot::Size(*width));
+            // What inside was laid out for the old width stays part of the shape.
+            if !child.reads_width() {
+                *width = 0.;
+            }
+        }
+        Node::Height(height, _) => {
+            out.push(Slot::Size(*height));
+            *height = 0.;
+        }
+        // A stepper's value is a `Text` that `Build` makes for it.
+        Node::Text { text, .. } | Node::Stepper { value: text, .. } => out.push(Slot::Text(std::mem::take(text))),
+        _ => {}
+    }
+    for child in node.children_mut() {
+        flatten(child, out);
+    }
 }
 
 thread_local! {
@@ -248,7 +354,7 @@ fn refresh(slot: &'static std::thread::LocalKey<RefCell<Option<Surface>>>, windo
         if let Some(old) = surface.host.root() {
             scroll_offsets(&old, &mut offsets);
         }
-        let (view, _) = root(mtm, content, surface.width, true, &mut surface.submits, &mut surface.fields);
+        let (view, _, _) = root(mtm, content, surface.width, true, &mut surface.submits, &mut surface.fields);
         let size = view.fittingSize();
         match &surface.host {
             Host::Popover(popover) => {
@@ -316,7 +422,7 @@ pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor:
     close();
     let mtm = MainThreadMarker::new().expect("popovers live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, _) = root(mtm, content, width, true, &mut submits, &mut fields);
+    let (view, _, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let controller = NSViewController::new(mtm);
     controller.setView(&view);
     let popover = NSPopover::new(mtm);
@@ -337,7 +443,7 @@ pub(crate) fn present(window_no: isize, content_view: &NSView, key: u64, anchor:
         (Edge::Above, false) => NSRectEdge::MaxY,
     };
     popover.showRelativeToRect_ofView_preferredEdge(rect, content_view, side);
-    POPOVER.set(Some(Surface { host: Host::Popover(popover), window_no, key, width, content: content.clone(), submits, fields }));
+    POPOVER.set(Some(Surface { host: Host::Popover(popover), window_no, key, width, content: content.clone(), submits, fields, shape: Node::Spacer, patches: Vec::new() }));
 }
 
 pub(crate) fn close() {
@@ -367,7 +473,7 @@ pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width
     close_sheet(None);
     let mtm = MainThreadMarker::new().expect("sheets live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, first) = root(mtm, content, width, true, &mut submits, &mut fields);
+    let (view, first, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
         NSPanel::alloc(mtm),
@@ -384,7 +490,7 @@ pub(crate) fn present_sheet(window_no: isize, parent: &NSWindow, key: u64, width
         panel.setInitialFirstResponder(Some(first));
     }
     parent.beginSheet_completionHandler(&panel, None);
-    SHEET.set(Some(Surface { host: Host::Sheet(panel, parent.retain()), window_no, key, width, content: content.clone(), submits, fields }));
+    SHEET.set(Some(Surface { host: Host::Sheet(panel, parent.retain()), window_no, key, width, content: content.clone(), submits, fields, shape: Node::Spacer, patches: Vec::new() }));
 }
 
 /// Closes the open sheet if browser window `owner` opened it, or whichever is open for None.
@@ -420,7 +526,7 @@ pub(crate) fn present_window(window_no: isize, parent: &NSWindow, key: u64, titl
     close_window(None);
     let mtm = MainThreadMarker::new().expect("windows live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, _) = root(mtm, content, width, true, &mut submits, &mut fields);
+    let (view, _, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -445,7 +551,7 @@ pub(crate) fn present_window(window_no: isize, parent: &NSWindow, key: u64, titl
         outer.origin.y + (outer.size.height - own.size.height) / 2.,
     ));
     window.makeKeyAndOrderFront(None);
-    WINDOW.set(Some(Surface { host: Host::Window(window), window_no, key, width, content: content.clone(), submits, fields }));
+    WINDOW.set(Some(Surface { host: Host::Window(window), window_no, key, width, content: content.clone(), submits, fields, shape: Node::Spacer, patches: Vec::new() }));
 }
 
 /// Closes the native window if browser window `owner` opened it, or whichever is open for None.
@@ -549,7 +655,7 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
     close_float(kind, None, false);
     let mtm = MainThreadMarker::new().expect("panels live on the main thread");
     let (mut submits, mut fields) = (HashMap::new(), HashMap::new());
-    let (view, first) = root(mtm, content, width, true, &mut submits, &mut fields);
+    let (view, first, _) = root(mtm, content, width, true, &mut submits, &mut fields);
     let size = view.fittingSize();
     let size = NSSize::new(size.width + 2. * GLASS_MARGIN, size.height + 2. * GLASS_MARGIN);
     let origin = float_origin(place, parent.frame(), size);
@@ -596,7 +702,7 @@ pub(crate) fn present_float(kind: Float, window_no: isize, parent: &NSWindow, ke
     if kind == Float::Toast && animate {
         fade(&panel, 1., None);
     }
-    slot.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields }));
+    slot.set(Some(Surface { host: Host::Panel(panel, parent.retain(), glass), window_no, key, width, content: content.clone(), submits, fields, shape: Node::Spacer, patches: Vec::new() }));
 }
 
 /// Where a panel `size` big (glass margin included) goes for `place` over a window framed `outer`, in screen points.
@@ -686,15 +792,32 @@ pub(crate) fn panel_owner(window: &NSWindow) -> Option<isize> {
 }
 
 /// Fills `container` with `content` for browser window `window_no`; rebuilt only when the content or width changes,
-/// which it returns. The caller places `container`. Laid out exactly `width` wide (0: as wide as it needs), or when
+/// and when only sizes and texts change, those are set on the views in place. The caller places `container`. Laid out exactly `width` wide (0: as wide as it needs), or when
 /// `stretch`, as wide as the container, following it as it resizes; `width` then only bounds wrapping and scrolling
 /// at the build, and a new one alone rebuilds nothing.
-pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64, stretch: bool, content: &Node) -> bool {
+pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64, stretch: bool, content: &Node) -> Embedded {
     let mtm = MainThreadMarker::new().expect("embedded views live on the main thread");
+    let (mut shape, mut values) = (content.clone(), Vec::new());
+    flatten(&mut shape, &mut values);
+    // A window resize changes tab widths, and the labels cut to fit them, every frame: rebuilding the views for
+    // that took most of each frame.
+    let kept = EMBEDS.with_borrow_mut(|embeds| {
+        let surface = embeds.get_mut(key).filter(|surface| stretch || surface.width == width)?;
+        if surface.content == *content {
+            return Some(Embedded::Same);
+        }
+        let fits = surface.shape == shape && surface.patches.len() == values.len();
+        (fits && surface.patches.iter().zip(&values).all(|(patch, value)| patch.as_ref().is_some_and(|patch| patch.apply(value)))).then(|| {
+            surface.content = content.clone();
+            Embedded::Patched
+        })
+    });
+    if let Some(kept) = kept {
+        return kept;
+    }
     // Out of the map while rebuilding: moving a focused field ends its editing, which calls back into this module.
-    let Some(mut surface) = EMBEDS.with_borrow_mut(|embeds| match embeds.get(key) {
-        Some(surface) if surface.content == *content && (stretch || surface.width == width) => None,
-        _ => Some(embeds.remove(key).unwrap_or(Surface {
+    let Some(mut surface) = EMBEDS.with_borrow_mut(|embeds| {
+        Some(embeds.remove(key).unwrap_or(Surface {
             host: Host::Embedded(container.retain()),
             window_no,
             key: 0,
@@ -702,12 +825,14 @@ pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64,
             content: Node::Spacer,
             submits: HashMap::new(),
             fields: HashMap::new(),
-        })),
+            shape: Node::Spacer,
+            patches: Vec::new(),
+        }))
     }) else {
-        return false;
+        return Embedded::Same;
     };
     let editing = surface.fields.iter().find(|(_, field)| field.currentEditor().is_some()).map(|(id, _)| *id);
-    let (view, _) = root(mtm, content, width, !stretch, &mut surface.submits, &mut surface.fields);
+    let (view, _, patches) = root(mtm, content, width, !stretch, &mut surface.submits, &mut surface.fields);
     for old in container.subviews().iter() {
         old.removeFromSuperview();
     }
@@ -721,11 +846,12 @@ pub(crate) fn embed(window_no: isize, key: &str, container: &NSView, width: f64,
     }
     surface.width = width;
     surface.content = content.clone();
+    (surface.shape, surface.patches) = (shape, patches);
     if let Some(field) = editing.and_then(|id| surface.fields.get(&id)) {
         focus(field);
     }
     EMBEDS.with_borrow_mut(|embeds| embeds.insert(key.to_string(), surface));
-    true
+    Embedded::Rebuilt
 }
 
 /// Where embedded surface `key`'s clickable items sit in their window (top-left origin), by their action.
@@ -1075,6 +1201,8 @@ pub(crate) fn arrange_list(window: &NSWindow, list: u32, widths: &[f64], hide: O
         if arranged.widths == widths && arranged.hide == hide && arranged.clear == clear && arranged.gap == gap {
             return;
         }
+        // Only a drag's gap and hidden item slide; new widths (a resize) take effect in the frame they arrive.
+        let dragged = (arranged.hide, arranged.clear, arranged.gap) != (hide, clear, gap);
         let spacer = arranged.spacer.clone();
         let is_spacer = |view: &NSView| spacer.as_deref().is_some_and(|spacer| std::ptr::eq(spacer, view));
         let rows = stack.arrangedSubviews().iter().filter(|row| !is_spacer(row)).collect::<Vec<_>>();
@@ -1092,6 +1220,10 @@ pub(crate) fn arrange_list(window: &NSWindow, list: u32, widths: &[f64], hide: O
             if row.alphaValue() != alpha {
                 row.setAlphaValue(alpha);
             }
+        }
+        if !dragged {
+            arranged.widths = widths.to_vec();
+            return;
         }
         if let Some(spacer) = &arranged.spacer {
             stack.removeArrangedSubview(spacer);
@@ -1516,18 +1648,18 @@ fn root(
     fixed: bool,
     submits: &mut HashMap<u32, u32>,
     fields: &mut HashMap<u32, Retained<NSTextField>>,
-) -> (Retained<NSView>, Option<Retained<NSTextField>>) {
+) -> (Retained<NSView>, Option<Retained<NSTextField>>, Vec<Option<Patch>>) {
     let mut kept = std::mem::take(fields);
     submits.clear();
     // Width 0 leaves it its natural width; wrapping text and scroll views still need some bound.
     let bound = if width > 0. { width } else { 10_000. };
-    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width: bound, first: None, reorder: None, drags: None };
+    let mut build = Build { mtm, submits, fields, kept: &mut kept, swaps: Vec::new(), width: bound, first: None, reorder: None, drags: None, patches: Vec::new() };
     let view = build.node(content);
     if fixed && width > 0. {
         view.widthAnchor().constraintEqualToConstant(width).setActive(true);
     }
     view.layoutSubtreeIfNeeded();
-    (view, build.first)
+    (view, build.first, build.patches)
 }
 
 struct Build<'a> {
@@ -1546,6 +1678,8 @@ struct Build<'a> {
     reorder: Option<Vec<Retained<NxPopoverItem>>>,
     /// The innermost `Drag` id, while inside one.
     drags: Option<u32>,
+    /// What later contents of the same shape set in place, in the order `flatten` takes their values out.
+    patches: Vec<Option<Patch>>,
 }
 
 impl Build<'_> {
@@ -1608,6 +1742,7 @@ impl Build<'_> {
                 };
                 label.setFont(Some(&font(*size, *weight)));
                 label.setTextColor(Some(&color(*ink)));
+                self.patches.push(Some(Patch::Text(label.clone())));
                 Retained::into_super(Retained::into_super(label))
             }
             Node::Image { path, letter, rgb, size, radius } => {
@@ -1845,16 +1980,25 @@ impl Build<'_> {
                 Retained::into_super(row)
             }
             Node::Width(width, child) => {
+                // Its place comes before its child's, as `flatten` takes values out.
+                let slot = self.patches.len();
+                self.patches.push(None);
                 let outer = self.width;
                 self.width = *width;
                 let view = self.node(child);
                 self.width = outer;
-                view.widthAnchor().constraintEqualToConstant(*width).setActive(true);
+                let constraint = view.widthAnchor().constraintEqualToConstant(*width);
+                constraint.setActive(true);
+                self.patches[slot] = Some(Patch::Size(constraint));
                 view
             }
             Node::Height(height, child) => {
+                let slot = self.patches.len();
+                self.patches.push(None);
                 let view = self.node(child);
-                view.heightAnchor().constraintEqualToConstant(*height).setActive(true);
+                let constraint = view.heightAnchor().constraintEqualToConstant(*height);
+                constraint.setActive(true);
+                self.patches[slot] = Some(Patch::Size(constraint));
                 view
             }
             Node::Menu { action, child } => {
@@ -2054,8 +2198,12 @@ impl Build<'_> {
         // A fixed width, not the clip view's: that has none until the popover is on screen, which squashed the rows.
         document.widthAnchor().constraintEqualToConstant(self.width).setActive(true);
         document.layoutSubtreeIfNeeded();
-        let height = if exact { height } else { document.fittingSize().height.min(height) };
-        scroll.heightAnchor().constraintEqualToConstant(height).setActive(true);
+        let fit = scroll.heightAnchor().constraintEqualToConstant(if exact { height } else { document.fittingSize().height.min(height) });
+        if height.is_infinite() {
+            // Below the stretched surface's foot pin (`set_bar`), above a `Spacer`: slack goes to the spacer, a shortfall to the scroll.
+            fit.setPriority(objc2_app_kit::NSLayoutPriorityDefaultLow);
+        }
+        fit.setActive(true);
         scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
         Retained::into_super(scroll)
     }
@@ -2153,4 +2301,41 @@ fn symbol(name: &str, size: f64) -> Option<Retained<NSImage>> {
     let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)?;
     let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(size, unsafe { NSFontWeightRegular });
     image.imageWithSymbolConfiguration(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label(text: &str) -> Node {
+        Node::Text { text: text.into(), size: 12., weight: Weight::Regular, ink: Ink::Primary, wrap: Wrap::Line, shrink: false }
+    }
+
+    fn flat(node: &Node) -> (Node, Vec<String>) {
+        let (mut shape, mut values) = (node.clone(), Vec::new());
+        flatten(&mut shape, &mut values);
+        let values = values.into_iter().map(|slot| match slot {
+            Slot::Size(size) => size.to_string(),
+            Slot::Text(text) => text,
+        });
+        (shape, values.collect())
+    }
+
+    #[test]
+    fn sizes_and_texts_come_out_in_build_order_leaving_one_shape() {
+        let strip = |track: f64, tab: &str| Node::Row {
+            gap: 6.,
+            children: vec![Node::Width(track, Box::new(Node::Row { gap: 2., children: vec![Node::Width(track - 40., Box::new(label(tab))), Node::Height(22., Box::new(Node::Spacer))] })), label("x")],
+        };
+        let (wide, values) = flat(&strip(300., "Wikipedia"));
+        assert_eq!(values, ["300", "260", "Wikipedia", "22", "x"]);
+        let (narrow, _) = flat(&strip(200., "Wiki…"));
+        assert_eq!(wide, narrow);
+    }
+
+    #[test]
+    fn a_width_that_text_wraps_or_tiles_flow_at_stays_in_the_shape() {
+        let flow = |width: f64| Node::Width(width, Box::new(Node::Flow { gap: 4., center: false, children: vec![label("a")] }));
+        assert_ne!(flat(&flow(300.)).0, flat(&flow(200.)).0);
+    }
 }

@@ -8,7 +8,7 @@ use browser_engine::{EngineEvent, LogicalRect, Phase};
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSCursor, NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEvent, NSEventModifierFlags,
+    NSCursor, NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEvent, NSEventModifierFlags,
     NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView,
 };
 use objc2_quartz_core::CACornerMask;
@@ -50,6 +50,10 @@ pub(crate) struct FrameIvars {
     strip: Retained<NSView>,
     /// The loading bar along the strip's foot.
     load: Retained<NSView>,
+    /// The 1pt ring along the shell's edge and the body-coloured one just inside it: layer borders, not a drawn
+    /// bitmap the size of the window, so a resize costs no redraw.
+    ring: Retained<NSView>,
+    edge: Retained<NSView>,
     /// The edges of the press under way (0: a move), if any.
     press: Cell<Option<u8>>,
 }
@@ -65,22 +69,6 @@ define_class!(
         #[unsafe(method(isFlipped))]
         fn is_flipped(&self) -> bool {
             true
-        }
-
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            let style = self.ivars().style.borrow();
-            let shell = self.shell_rect(&style);
-            let r = style.radius;
-            // The page sits 1pt in (and the GPUI terminal screen over it): only that edge is body, not the page area.
-            let edge = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset(shell, 1.5), r - 1.5, r - 1.5);
-            edge.setLineWidth(1.);
-            rgba(style.body).setStroke();
-            edge.stroke();
-            let ring = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(inset(shell, 0.5), r - 0.5, r - 0.5);
-            ring.setLineWidth(1.);
-            rgba(style.ring).setStroke();
-            ring.stroke();
         }
 
         /// The strip's controls take their own presses; its empty space and the rims are this view's; the page
@@ -213,14 +201,35 @@ impl NxFrameView {
         let strip = NSView::new(mtm);
         let load = NSView::new(mtm);
         load.setWantsLayer(true);
-        let ivars = FrameIvars { key: key.to_string(), window_no, style: RefCell::new(style), material: material.clone(), strip: strip.clone(), load: load.clone(), press: Cell::new(None) };
+        let [ring, edge] = [(); 2].map(|_| {
+            let view = NSView::new(mtm);
+            view.setWantsLayer(true);
+            if let Some(layer) = view.layer() {
+                layer.setBorderWidth(1.);
+            }
+            view
+        });
+        let ivars = FrameIvars {
+            key: key.to_string(),
+            window_no,
+            style: RefCell::new(style.clone()),
+            material: material.clone(),
+            strip: strip.clone(),
+            load: load.clone(),
+            ring: ring.clone(),
+            edge: edge.clone(),
+            press: Cell::new(None),
+        };
         let this: Retained<Self> = unsafe { msg_send![super(Self::alloc(mtm).set_ivars(ivars)), initWithFrame: NSRect::ZERO] };
+        this.addSubview(&ring);
+        this.addSubview(&edge);
         this.addSubview(&material);
         this.addSubview(&strip);
         this.addSubview(&load);
         let options = NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveInKeyWindow | NSTrackingAreaOptions::InVisibleRect;
         let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(&this), None) };
         this.addTrackingArea(&area);
+        this.paint_rings(&style);
         this
     }
 
@@ -281,7 +290,20 @@ impl NxFrameView {
             }
         }
         if resized {
-            self.setNeedsDisplay(true);
+            self.paint_rings(&self.ivars().style.borrow());
+        }
+    }
+
+    fn paint_rings(&self, style: &FrameStyle) {
+        let shell = self.shell_rect(style);
+        // The page sits 1pt in (and the GPUI terminal screen over it): only that edge is body, not the page area.
+        for (view, rect, radius, color) in [(&self.ivars().ring, shell, style.radius, style.ring), (&self.ivars().edge, inset(shell, 1.), style.radius - 1., style.body)] {
+            view.setFrame(rect);
+            if let Some(layer) = view.layer() {
+                let [red, green, blue, alpha] = color;
+                layer.setCornerRadius(radius.max(0.));
+                layer.setBorderColor(Some(&CGColor::new_srgb(red, green, blue, alpha)));
+            }
         }
     }
 
@@ -328,10 +350,6 @@ impl NxFrameView {
         let key = self.ivars().key.clone();
         crate::webkit::send_event(self.ivars().window_no, EngineEvent::WindowGesture { key, phase, x, y, edges, shift });
     }
-}
-
-fn rgba([red, green, blue, alpha]: [f64; 4]) -> Retained<NSColor> {
-    NSColor::colorWithSRGBRed_green_blue_alpha(red, green, blue, alpha)
 }
 
 fn inset(rect: NSRect, by: f64) -> NSRect {

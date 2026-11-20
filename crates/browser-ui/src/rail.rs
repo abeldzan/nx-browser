@@ -78,23 +78,21 @@ impl BrowserWindow {
             downloads_tool = Node::Overlay { child: Box::new(downloads_tool), corner: Box::new(dot) };
         }
         let (_, settings) = tool(pop, "gearshape", self.settings_open, |this, cx| this.toggle_settings(cx));
-        let content = Node::Height(
-            height,
-            Box::new(Node::Column {
-                gap: 6.,
-                pad: ((width - BADGE) / 2., 6.),
-                children: vec![
-                    // Room for the lights: the column's padding and gap come on top.
-                    Node::Height(lights - 12., Box::new(Node::Spacer)),
-                    Node::Scroll { max: height - TOOLS_H - 12. - lights, child: Box::new(Node::Reorder { list: RAIL_LIST, gap: 8., horizontal: false, children: badges }) },
-                    Node::Spacer,
-                    Node::Separator,
-                    new_profile,
-                    downloads_tool,
-                    settings,
-                ],
-            }),
-        );
+        // No height in the content: the sidebar stretches it, so resizing the window rebuilds nothing.
+        let content = Node::Column {
+            gap: 6.,
+            pad: ((width - BADGE) / 2., 6.),
+            children: vec![
+                // Room for the lights: the column's padding and gap come on top.
+                Node::Height(lights - 12., Box::new(Node::Spacer)),
+                Node::Scroll { max: f64::INFINITY, child: Box::new(Node::Reorder { list: RAIL_LIST, gap: 8., horizontal: false, children: badges }) },
+                Node::Spacer,
+                Node::Separator,
+                new_profile,
+                downloads_tool,
+                settings,
+            ],
+        };
         let frame = LogicalRect { x: 0., y: 0., width, height };
         self.engine.set_sidebar("rail", frame, &content);
         bars.push("rail");
