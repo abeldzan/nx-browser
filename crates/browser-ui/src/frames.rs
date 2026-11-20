@@ -6,11 +6,12 @@ use super::*;
 use crate::native::{text, title, Initial, Ink, Node, Pop, Weight, ADDRESS_QUERY, SPACE_NAME};
 use browser_engine::Phase;
 use browser_engine_macos::FrameStyle;
+use crate::geom::{point, size, Bounds, Point};
 
-/// A press, drag or hover on native chrome, waiting for `render` (which has the GPUI window) to act on it.
+/// A press, drag or hover on native chrome, waiting for the next frame to act on it.
 pub(crate) enum NativeInput {
-    Gesture { key: String, phase: Phase, at: gpui::Point<Pixels>, edges: u8, shift: bool },
-    Drag { id: u32, phase: Phase, at: gpui::Point<Pixels> },
+    Gesture { key: String, phase: Phase, at: Point, edges: u8, shift: bool },
+    Drag { id: u32, phase: Phase, at: Point },
 }
 
 /// What a native drag id stands for.
@@ -62,12 +63,12 @@ const SPACES_H: f64 = 26.;
 
 impl BrowserWindow {
     /// Builds every shown window's frame for this frame, and records where its tab pills landed.
-    pub(crate) fn sync_frames(&mut self, pop: &mut Pop, tabs: &[browser_core::Tab], cx: &mut Context<Self>) {
+    pub(crate) fn sync_frames(&mut self, pop: &mut Pop, tabs: &[browser_core::Tab]) {
         let Some(stage) = self.stage_bounds.filter(|_| !self.tab_window && self.self_test.is_none()) else {
             self.engine.keep_window_frames(&[]);
             return;
         };
-        let paint = paint(cx);
+        let paint = paint();
         let (ox, oy) = (f64::from(stage.origin.x), f64::from(stage.origin.y));
         let carried = self.carried().map(|(id, _)| id);
         let shown = self.shown_tabs(tabs).into_iter().cloned().collect::<Vec<_>>();
@@ -106,7 +107,7 @@ impl BrowserWindow {
             let strip = match self.chrome.get(&tab.id).and_then(|chrome| chrome.panel.clone()) {
                 Some(ext) => self.panel_strip(&tab.id, &ext, pop),
                 None => {
-                    let row = self.window_row(tab, &members, shell.width, true, pop, &mut pills, cx);
+                    let row = self.window_row(tab, &members, shell.width, true, pop, &mut pills);
                     // The 26pt glass capsules 2pt in from the top and 3pt in from the sides, nesting in the window's
                     // 16pt corners.
                     Node::Column { gap: 0., pad: (3., 2.), children: vec![row] }
@@ -135,8 +136,8 @@ impl BrowserWindow {
     /// (the shown one standing as the address field) and new tab, then bookmark and screenshot, then the window buttons;
     /// `tools` false leaves out all but the tabs and new tab button.
     #[allow(clippy::too_many_arguments)]
-    fn window_row(&mut self, tab: &browser_core::Tab, members: &[&browser_core::Tab], width: f64, tools: bool, pop: &mut Pop, pills: &mut Vec<(u32, String)>, cx: &mut Context<Self>) -> Node {
-        let paint = paint(cx);
+    fn window_row(&mut self, tab: &browser_core::Tab, members: &[&browser_core::Tab], width: f64, tools: bool, pop: &mut Pop, pills: &mut Vec<(u32, String)>) -> Node {
+        let paint = paint();
         let id = tab.id.clone();
         let tool = |pop: &mut Pop, symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| strip_tool(pop.act(run), symbol, tip, on);
         let badge = self.guest_profile(&tab.id);
@@ -170,13 +171,13 @@ impl BrowserWindow {
         let mut row = Vec::new();
         if nav > 0 {
             let (back, forward) = (id.clone(), id.clone());
-            let mut buttons = vec![tool(pop, "chevron.left", "Back", false, Box::new(move |this, cx| {
-                this.focus_window(&back, cx);
+            let mut buttons = vec![tool(pop, "chevron.left", "Back", false, Box::new(move |this| {
+                this.focus_window(&back);
                 this.back();
             }))];
             if nav > 1 {
-                buttons.push(tool(pop, "chevron.right", "Forward", false, Box::new(move |this, cx| {
-                    this.focus_window(&forward, cx);
+                buttons.push(tool(pop, "chevron.right", "Forward", false, Box::new(move |this| {
+                    this.focus_window(&forward);
                     this.forward();
                 })));
             }
@@ -188,13 +189,13 @@ impl BrowserWindow {
         // What the buttons leave. A resize sets the new widths on the strip's views rather than rebuilding it.
         let room = (avail - fixed((nav, page_n, window_n, plus))).floor().max(MIN_PILL + 4.);
         row.push(Node::Spacer);
-        row.push(self.tab_track(&tab.id, members, room, pop, pills, cx));
+        row.push(self.tab_track(&tab.id, members, room, pop, pills));
         if plus {
             let new_tab = id.clone();
             // Right after the last tab, as in Safari.
-            row.push(group(vec![tool(pop, "plus", "New Tab", false, Box::new(move |this, cx| {
+            row.push(group(vec![tool(pop, "plus", "New Tab", false, Box::new(move |this| {
                 let shift = this.engine.shift_held();
-                this.click_new_tab(&new_tab, shift, cx);
+                this.click_new_tab(&new_tab, shift);
             }))]));
         }
         row.push(Node::Spacer);
@@ -212,7 +213,7 @@ impl BrowserWindow {
 
     /// The window's tabs on one glass track at most `room` wide, in its order (with the gap a drag opened): each as
     /// wide as the others, as in Safari, the shown one standing as the address field.
-    fn tab_track(&mut self, front: &str, members: &[&browser_core::Tab], room: f64, pop: &mut Pop, pills: &mut Vec<(u32, String)>, cx: &gpui::App) -> Node {
+    fn tab_track(&mut self, front: &str, members: &[&browser_core::Tab], room: f64, pop: &mut Pop, pills: &mut Vec<(u32, String)>) -> Node {
         let ids = members.iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let group = self.group_id(front);
         let count = ids.len().max(1) as f64;
@@ -232,7 +233,7 @@ impl BrowserWindow {
             }
         };
         let (shown_w, other_w) = split(count);
-        let list = pop.act(|_, _| {});
+        let list = pop.act(|_| {});
         self.reorder_lists.push((list, ReorderList::Tabs(ids.clone())));
         // A tab dragged over the row: its own slot closes and a gap opens where it would land; a dropped one keeps
         // its slot unseen while its pill glides into it. The engine slides the row there; the row stays as built.
@@ -248,7 +249,7 @@ impl BrowserWindow {
         for tab in ids.iter().filter_map(|id| members.iter().find(|tab| tab.id == *id)) {
             let shown = tab.id == front;
             let width = if shown { shown_w } else { other_w };
-            let node = if shown && editing { self.address_field(tab, pop) } else { self.tab_pill(tab, shown, width, pop, pills, cx) };
+            let node = if shown && editing { self.address_field(tab, pop) } else { self.tab_pill(tab, shown, width, pop, pills) };
             row.push(Node::Width(width.max(MIN_PILL), Box::new(node)));
         }
         let tabs = Node::Reorder { list, gap: 2., horizontal: true, children: row };
@@ -257,12 +258,12 @@ impl BrowserWindow {
 
     /// The shown tab while its address is typed: a ringed field with a clear button and reload, as Safari's.
     fn address_field(&mut self, tab: &browser_core::Tab, pop: &mut Pop) -> Node {
-        let clear = pop.act(|this, cx| {
+        let clear = pop.act(|this| {
             this.set_typed(ADDRESS_QUERY, String::new());
             this.suggestions.clear();
             this.suggestion = None;
             this.address_caret = true;
-            cx.notify();
+            this.notify();
         });
         let field = Node::Search { field: ADDRESS_QUERY, value: Initial(self.typed(ADDRESS_QUERY)), placeholder: "Search or enter website name".into(), size: 12. };
         let row = Node::Row { gap: 4., children: vec![Node::Tool { symbol: "xmark.circle.fill", tip: "Clear", action: clear, on: false }, field, self.reload_tool(&tab.id, pop)] };
@@ -273,8 +274,8 @@ impl BrowserWindow {
     fn reload_tool(&self, tab_id: &str, pop: &mut Pop) -> Node {
         let loading = self.engine.progress(tab_id).is_some();
         let reload = tab_id.to_string();
-        let action = pop.act(move |this, cx| {
-            this.focus_window(&reload, cx);
+        let action = pop.act(move |this| {
+            this.focus_window(&reload);
             match this.engine.progress(&reload) {
                 Some(_) => this.engine.stop(&reload),
                 None => this.reload(),
@@ -284,13 +285,13 @@ impl BrowserWindow {
     }
 
     /// The tab's site icon, or for a terminal running a coding agent, the agent's logo with its status dot.
-    pub(crate) fn tab_image(&self, tab: &browser_core::Tab, size: f64, cx: &gpui::App) -> Node {
+    pub(crate) fn tab_image(&self, tab: &browser_core::Tab, size: f64) -> Node {
         use terminal::Status;
-        let Some(state) = terminal::agent(&tab.id, cx).filter(|_| is_terminal(&tab.url)) else {
+        let Some(state) = terminal::agent(&tab.id).filter(|_| is_terminal(&tab.url)) else {
             return site_image(&tab.url, size);
         };
         let agent = state.agent;
-        let [red, green, blue] = crate::native::rgb(agent.color().map_or(gpui::rgb(0x8E8E93).into(), |color| gpui::rgb(color).into()));
+        let [red, green, blue] = crate::native::rgb(crate::window::hex(agent.color().unwrap_or(0x8E8E93)));
         let letter = agent.name().chars().take(1).collect::<String>();
         let logo = match agent.icon().and_then(crate::native::asset) {
             Some(data) => Node::Svg { data, size, ink: Ink::Primary },
@@ -308,22 +309,22 @@ impl BrowserWindow {
 
     /// A tab on the track, `width` wide. The shown one stands as the address field at rest: on a card, its site's
     /// host and a reload button. The others show their icon (a close button on hover, as in Safari) and title.
-    fn tab_pill(&mut self, tab: &browser_core::Tab, shown: bool, width: f64, pop: &mut Pop, pills: &mut Vec<(u32, String)>, cx: &gpui::App) -> Node {
+    fn tab_pill(&mut self, tab: &browser_core::Tab, shown: bool, width: f64, pop: &mut Pop, pills: &mut Vec<(u32, String)>) -> Node {
         let id = tab.id.clone();
         let click = pop.act({
             let id = id.clone();
-            move |this, cx| this.click_tab(&id, cx)
+            move |this| this.click_tab(&id)
         });
         pills.push((click, id.clone()));
         let close = pop.act({
             let id = id.clone();
-            move |this, cx| this.close_tabs(vec![id.clone()], cx)
+            move |this| this.close_tabs(vec![id.clone()])
         });
         let children = if width < FULL_PILL {
             // Squeezed by a narrow window or many tabs: the icon alone, as Safari's.
-            vec![Node::Center(Box::new(self.tab_image(tab, 14., cx)))]
+            vec![Node::Center(Box::new(self.tab_image(tab, 14.)))]
         } else {
-            self.pill_content(tab, shown, width, close, pop, cx)
+            self.pill_content(tab, shown, width, close, pop)
         };
         let mut pill = Node::Item { height: 22., click: Some(click), drag: None, children };
         if shown {
@@ -336,12 +337,12 @@ impl BrowserWindow {
         }
         let menu = pop.act({
             let id = id.clone();
-            move |this, _| {
+            move |this| {
                 let (x, y) = this.engine.pointer().unwrap_or_default();
-                this.open_tab_menu(id.clone(), gpui::point(px(x as f32), px(y as f32)));
+                this.open_tab_menu(id.clone(), point(x as f32, y as f32));
             }
         });
-        let drag = pop.act(|_, _| {});
+        let drag = pop.act(|_| {});
         self.drag_items.push((drag, DragItem::Tab(id)));
         let pill = Node::Tip { tip: full_title(tab), child: Box::new(pill) };
         Node::Drag { id: drag, child: Box::new(Node::Menu { action: menu, child: Box::new(pill) }) }
@@ -349,7 +350,7 @@ impl BrowserWindow {
 
     /// A tab pill at full size, `width` wide: the close button on hover, icon, title cut to fit, and the shown
     /// tab's reload.
-    fn pill_content(&mut self, tab: &browser_core::Tab, shown: bool, width: f64, close: u32, pop: &mut Pop, cx: &gpui::App) -> Vec<Node> {
+    fn pill_content(&mut self, tab: &browser_core::Tab, shown: bool, width: f64, close: u32, pop: &mut Pop) -> Vec<Node> {
         let id = tab.id.clone();
         // As in Safari: the close button at the tab's leading edge on hover, the icon and title centred between it
         // and a slot of the same width at the trailing edge (the shown tab's reload), so nothing shifts.
@@ -358,7 +359,7 @@ impl BrowserWindow {
             Node::Hover(true, Box::new(Node::Width(18., Box::new(Node::Center(Box::new(Node::Tool { symbol: "xmark", tip: "Close Tab", action: close, on: false })))))),
             Node::Hover(false, Box::new(slot())),
             Node::Spacer,
-            self.tab_image(tab, 14., cx),
+            self.tab_image(tab, 14.),
         ];
         // The shown tab names its site, as Safari's field does; the others their page. Cut to fit, down to the icon.
         let label = match () {
@@ -382,10 +383,10 @@ impl BrowserWindow {
         if muted || self.playing.contains(&tab.id) {
             let toggle = pop.act({
                 let id = id.clone();
-                move |this, cx| {
+                move |this| {
                     let mute = !this.engine.is_muted(&id);
                     this.engine.set_muted(&id, mute);
-                    cx.notify();
+                    this.notify();
                 }
             });
             children.push(Node::Tool { symbol: if muted { "speaker.slash.fill" } else { "speaker.wave.2.fill" }, tip: if muted { "Unmute" } else { "Mute" }, action: toggle, on: false });
@@ -408,31 +409,31 @@ impl BrowserWindow {
         let mut tool = |symbol: &'static str, tip: &'static str, on: bool, run: crate::settings::MenuAction| tools.push(strip_tool(pop.act(run), symbol, tip, on));
         if peek {
             let keep = id.clone();
-            tool("macwindow.badge.plus", "Keep as Window", false, Box::new(move |this, cx| {
+            tool("macwindow.badge.plus", "Keep as Window", false, Box::new(move |this| {
                 // Placed afresh like any new window: tiled, or cascaded in a free space.
                 if let Some(entry) = this.chrome.get_mut(&keep) {
                     (entry.peek, entry.frame) = (false, None);
                 }
-                this.focus_window(&keep, cx);
+                this.focus_window(&keep);
             }));
         }
         let mark = id.clone();
-        tool(if bookmarked { "star.fill" } else { "star" }, "Bookmark", bookmarked, Box::new(move |this, cx| {
-            this.focus_window(&mark, cx);
+        tool(if bookmarked { "star.fill" } else { "star" }, "Bookmark", bookmarked, Box::new(move |this| {
+            this.focus_window(&mark);
             this.bookmark();
         }));
         let shot = id.clone();
-        tool("camera", "Screenshot", false, Box::new(move |this, cx| {
-            this.focus_window(&shot, cx);
+        tool("camera", "Screenshot", false, Box::new(move |this| {
+            this.focus_window(&shot);
             let (x, y) = this.engine.pointer().unwrap_or_default();
-            this.open_shot_menu(shot.clone(), gpui::point(px(x as f32), px(y as f32)));
+            this.open_shot_menu(shot.clone(), point(x as f32, y as f32));
         }));
         let page = std::mem::take(&mut tools);
         let mut tool = |symbol: &'static str, tip: &'static str, run: crate::settings::MenuAction| tools.push(strip_tool(pop.act(run), symbol, tip, false));
         let (min, zoom, close) = (id.clone(), id.clone(), id);
-        tool("minus", "Minimize", Box::new(move |this, cx| this.minimize_window(&min, cx)));
-        tool(if maximized { "arrow.down.right.and.arrow.up.left" } else { "arrow.up.left.and.arrow.down.right" }, if maximized { "Restore" } else { "Maximize" }, Box::new(move |this, cx| this.toggle_maximize(&zoom, cx)));
-        tool("xmark", "Close Window", Box::new(move |this, cx| this.close_window(&close, cx)));
+        tool("minus", "Minimize", Box::new(move |this| this.minimize_window(&min)));
+        tool(if maximized { "arrow.down.right.and.arrow.up.left" } else { "arrow.up.left.and.arrow.down.right" }, if maximized { "Restore" } else { "Maximize" }, Box::new(move |this| this.toggle_maximize(&zoom)));
+        tool("xmark", "Close Window", Box::new(move |this| this.close_window(&close)));
         (page, tools)
     }
 
@@ -440,7 +441,7 @@ impl BrowserWindow {
     fn panel_strip(&self, tab_id: &str, ext: &str, pop: &mut Pop) -> Node {
         let meta = self.ext_meta.get(ext).cloned().unwrap_or_default();
         let id = tab_id.to_string();
-        let close = pop.act(move |this, cx| this.close_tabs(vec![id.clone()], cx));
+        let close = pop.act(move |this| this.close_tabs(vec![id.clone()]));
         let row = Node::Row {
             gap: 8.,
             children: vec![
@@ -454,8 +455,8 @@ impl BrowserWindow {
     }
 
     /// The title bar's centre: this space's chips on glass, or a torn-off window's own tabs.
-    pub(crate) fn sync_spaces(&mut self, pop: &mut Pop, bars: &mut Vec<&'static str>, tabs: &[browser_core::Tab], window: &Window, cx: &mut Context<Self>) {
-        let width = f64::from(window.viewport_size().width);
+    pub(crate) fn sync_spaces(&mut self, pop: &mut Pop, bars: &mut Vec<&'static str>, tabs: &[browser_core::Tab]) {
+        let width = f64::from(self.viewport().width);
         let content = if self.tab_window {
             let session = self.model.lock().active_session_id.clone();
             let Some((front, _)) = self.window_front(tabs, &session) else {
@@ -467,10 +468,10 @@ impl BrowserWindow {
             let group = self.group_id(&front);
             let members = tabs.iter().filter(|other| self.group_of(&other.id) == group).collect::<Vec<_>>();
             let mut pills = Vec::new();
-            let row = self.window_row(&tab, &members, width * 0.6, false, pop, &mut pills, cx);
+            let row = self.window_row(&tab, &members, width * 0.6, false, pop, &mut pills);
             // Its own glass capsules straight on the title bar, 2pt in, level with the tools on the right.
             let content = Node::Column { gap: 0., pad: (0., 2.), children: vec![row] };
-            self.place_spaces(&content, width, false, window, bars);
+            self.place_spaces(&content, width, false, bars);
             for (list, widths, hide, clear, gap) in std::mem::take(&mut self.list_arrangements) {
                 self.engine.arrange_list(list, &widths, hide, clear, gap);
             }
@@ -484,7 +485,7 @@ impl BrowserWindow {
             self.space_chips_row(pop, tabs)
         };
         let switches = content.1;
-        self.place_spaces(&content.0, width, true, window, bars);
+        self.place_spaces(&content.0, width, true, bars);
         for (action, rect) in self.engine.bar_items("spaces") {
             if let Some((_, id)) = switches.iter().find(|(switch, _)| *switch == action) {
                 self.space_chips.push((id.clone(), bounds(&rect)));
@@ -497,9 +498,9 @@ impl BrowserWindow {
 
     /// Puts `content` at the dock's left end in the main window, or centred in a torn-off window's title bar, from
     /// the width it took last time: on a glass capsule, or (`glass` off) bare, the title bar's full height.
-    fn place_spaces(&mut self, content: &Node, width: f64, glass: bool, window: &Window, bars: &mut Vec<&'static str>) {
+    fn place_spaces(&mut self, content: &Node, width: f64, glass: bool, bars: &mut Vec<&'static str>) {
         let height = if glass { SPACES_H } else { f64::from(self.titlebar_h()) };
-        let (right, top) = match self.dock_at(window) {
+        let (right, top) = match self.dock_at() {
             Some((right, top, _)) => (right - self.toolbar_w - crate::window::DOCK_GAP, top),
             None => ((width + self.spaces_w) / 2., (f64::from(self.titlebar_h()) - height) / 2.),
         };
@@ -524,20 +525,20 @@ impl BrowserWindow {
         let tears = closable || (self.model.detached.is_some() && !self.tab_window);
         let mut chips = Vec::new();
         let mut switches = Vec::new();
-        let list = pop.act(|_, _| {});
+        let list = pop.act(|_| {});
         self.reorder_lists.push((list, ReorderList::Spaces(sessions.iter().map(|session| session.id.clone()).collect())));
         for session in &sessions {
             let id = session.id.clone();
             if self.space_rename.as_deref() == Some(id.as_str()) {
                 let rename = pop.act({
                     let id = id.clone();
-                    move |this, cx| {
+                    move |this| {
                         if this.space_rename.take().is_some() {
                             let name = this.typed(SPACE_NAME);
                             this.with_model(|model| {
                                 let _ = model.rename_session(&id, &name);
                             });
-                            cx.notify();
+                            this.notify();
                         }
                     }
                 });
@@ -547,20 +548,20 @@ impl BrowserWindow {
             }
             let switch = pop.act({
                 let id = id.clone();
-                move |this, cx| {
+                move |this| {
                     // A double-click renames it; the first click already switched to it.
                     if this.engine.last_clicks() == 2 {
                         let name = this.model.lock().sessions.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
                         this.popover_texts.insert(SPACE_NAME, name);
                         this.space_rename = Some(id.clone());
                         this.space_caret = true;
-                        cx.notify();
+                        this.notify();
                         return;
                     }
                     this.with_model(|model| {
                         let _ = model.switch_session(&id);
                     });
-                    this.refresh_url(cx);
+                    this.refresh_url();
                 }
             });
             switches.push((switch, id.clone()));
@@ -569,11 +570,11 @@ impl BrowserWindow {
             if closable {
                 let close = pop.act({
                     let id = id.clone();
-                    move |this, cx| {
+                    move |this| {
                         this.with_model(|model| {
                             let _ = model.delete_session(&id);
                         });
-                        this.refresh_url(cx);
+                        this.refresh_url();
                     }
                 });
                 children.push(Node::Hover(true, Box::new(Node::Tool { symbol: "xmark", tip: "Close Space", action: close, on: false })));
@@ -585,7 +586,7 @@ impl BrowserWindow {
                 chip = Node::Round { radius: PILL_R, tint: None, child: Box::new(chip) };
             }
             if tears {
-                let drag = pop.act(|_, _| {});
+                let drag = pop.act(|_| {});
                 self.drag_items.push((drag, DragItem::Space(id)));
                 chip = Node::Drag { id: drag, child: Box::new(chip) };
             }
@@ -593,11 +594,11 @@ impl BrowserWindow {
         }
         let mut row = vec![Node::Reorder { list, gap: 4., horizontal: true, children: chips }];
         if self.model.detached.is_none() {
-            let new_space = pop.act(|this, cx| {
+            let new_space = pop.act(|this| {
                 this.with_model(|model| {
                     let _ = model.create_session();
                 });
-                this.refresh_url(cx);
+                this.refresh_url();
             });
             row.push(Node::Tool { symbol: "plus", tip: "New Space", action: new_space, on: false });
         }
@@ -606,7 +607,7 @@ impl BrowserWindow {
     }
 
     /// What follows the pointer while dragging: the snap target, a carried window, a tab pill or a space chip.
-    pub(crate) fn sync_drag_views(&mut self, bars: &mut Vec<&'static str>, tabs: &[browser_core::Tab], cx: &gpui::App) {
+    pub(crate) fn sync_drag_views(&mut self, bars: &mut Vec<&'static str>, tabs: &[browser_core::Tab]) {
         let pill_h = f64::from(self.pill_h());
         let snap = self.drop_preview().zip(self.stage_bounds).map(|((_, frame), stage)| LogicalRect {
             x: f64::from(stage.origin.x) + f64::from(frame.x),
@@ -614,7 +615,7 @@ impl BrowserWindow {
             width: f64::from(frame.w),
             height: f64::from(frame.h),
         });
-        let accent = rgba(paint(cx).accent);
+        let accent = rgba(paint().accent);
         self.engine.set_snap(snap, WINDOW_RADIUS, accent);
         if let Some((id, frame)) = self.carried() {
             // A glass card with the window's sites and title; it holds no size of its own, so as it shrinks and
@@ -669,7 +670,7 @@ impl BrowserWindow {
     }
 
     /// Acts on the presses, drags and hovers native chrome reported since the last frame.
-    pub(crate) fn run_native_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn run_native_input(&mut self) {
         for input in std::mem::take(&mut self.native_input) {
             match input {
                 NativeInput::Gesture { key, phase, at, edges, shift } => {
@@ -680,21 +681,21 @@ impl BrowserWindow {
                     match phase {
                         Phase::Begin if edges != 0 => {
                             let edges = Edges { left: edges & 1 != 0, right: edges & 2 != 0, top: edges & 4 != 0, bottom: edges & 8 != 0 };
-                            self.begin_resize(&id, edges, at, cx);
+                            self.begin_resize(&id, edges, at);
                         }
-                        Phase::Begin => self.begin_move(&id, at, window, cx),
-                        Phase::Move if self.gesture.is_some() => self.track_gesture(at, shift, window, cx),
+                        Phase::Begin => self.begin_move(&id, at),
+                        Phase::Move if self.gesture.is_some() => self.track_gesture(at, shift),
                         Phase::End if self.gesture.is_some() => {
-                            self.track_gesture(at, shift, window, cx);
+                            self.track_gesture(at, shift);
                             // Released past the window's edge: the window leaves the app for an OS window of its own.
-                            let out = torn_off(window, at).then(|| window.bounds().origin + at);
-                            self.finish_gesture(out, window, cx);
+                            let out = self.torn_off(at).then(|| self.screen_origin() + at);
+                            self.finish_gesture(out);
                         }
                         Phase::Enter => {
                             let hover = !self.active_tab_id().is_some_and(|active| self.group_of(&active) == key) && self.model.lock().settings.focus_on_hover;
                             // Not mid-drag, nor while typing an address, which passing over another window would cut off.
                             if hover && self.gesture.is_none() && self.tab_drag.is_none() && !self.palette_open && !self.address_editing {
-                                self.focus_window(&id, cx);
+                                self.focus_window(&id);
                             }
                         }
                         _ => {}
@@ -704,20 +705,20 @@ impl BrowserWindow {
                 // belongs to whatever it started on.
                 NativeInput::Drag { phase, at, .. } if phase != Phase::Begin && self.tab_drag.is_some() => {
                     let tab = self.tab_drag.as_ref().map(|(tab, _)| tab.id.clone()).unwrap_or_default();
-                    self.drag_tab(&tab, phase, at, window, cx);
+                    self.drag_tab(&tab, phase, at);
                 }
                 NativeInput::Drag { phase, at, .. } if phase != Phase::Begin && self.space_drag.is_some() => {
                     let space = self.space_drag.clone().unwrap_or_default();
-                    self.drag_space(&space, phase, at, window, cx);
+                    self.drag_space(&space, phase, at);
                 }
                 NativeInput::Drag { id, phase, at } => match self.drag_items.iter().find(|(drag, _)| *drag == id).map(|(_, item)| item) {
                     Some(DragItem::Tab(tab)) => {
                         let tab = tab.clone();
-                        self.drag_tab(&tab, phase, at, window, cx);
+                        self.drag_tab(&tab, phase, at);
                     }
                     Some(DragItem::Space(space)) => {
                         let space = space.clone();
-                        self.drag_space(&space, phase, at, window, cx);
+                        self.drag_space(&space, phase, at);
                     }
                     None => {}
                 },
@@ -725,13 +726,13 @@ impl BrowserWindow {
         }
     }
 
-    fn drag_tab(&mut self, id: &str, phase: Phase, at: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn drag_tab(&mut self, id: &str, phase: Phase, at: Point) {
         match phase {
             Phase::Begin => {
                 let Some(tab) = self.model.lock().tabs.iter().find(|tab| tab.id == id).cloned() else {
                     return;
                 };
-                let grab = self.slots.get(id).map_or(gpui::point(px(20.), px(10.)), |slot| at - slot.origin);
+                let grab = self.slots.get(id).map_or(point(20., 10.), |slot| at - slot.origin);
                 self.tab_grab.set(grab);
                 self.tab_press = Some(at);
                 self.tab_drag = Some((tab, at));
@@ -747,23 +748,23 @@ impl BrowserWindow {
             }
             Phase::End => {
                 self.tab_drag = None;
-                if torn_off(window, at) {
+                if self.torn_off(at) {
                     self.reorder = None;
-                    self.detach_tabs(&[id.to_string()], window.bounds().origin + at, cx);
+                    self.detach_tabs(&[id.to_string()], self.screen_origin() + at);
                 } else if let Some(target) = self.window_under(at) {
-                    self.drop_tab_on(id, &target, at, cx);
+                    self.drop_tab_on(id, &target, at);
                 } else {
                     // Dropped on empty stage: a window of its own.
                     self.reorder = None;
-                    self.detach_tab(id, at, cx);
+                    self.detach_tab(id, at);
                 }
             }
             Phase::Enter => {}
         }
-        cx.notify();
+        self.notify();
     }
 
-    fn drag_space(&mut self, space: &str, phase: Phase, at: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn drag_space(&mut self, space: &str, phase: Phase, at: Point) {
         match phase {
             Phase::Begin | Phase::Move => {
                 self.space_drag = Some(space.to_string());
@@ -772,26 +773,26 @@ impl BrowserWindow {
             Phase::End => {
                 self.space_drag = None;
                 self.space_drag_at = None;
-                let inside = gpui::Bounds::new(gpui::Point::default(), window.viewport_size()).contains(&at);
-                let screen = window.bounds().origin + at;
+                let inside = Bounds::new(Point::default(), self.viewport()).contains(&at);
+                let screen = self.screen_origin() + at;
                 match (inside, self.model.detached.is_some()) {
                     (true, _) => {}
                     // A torn-off space goes back only when dropped on the main window's bar.
                     (false, true) => {
-                        if over_main_bar(screen, cx) {
-                            self.merge_into_main(window, cx);
+                        if over_main_bar(screen) {
+                            self.merge_into_main();
                         }
                     }
-                    (false, false) => self.open_space_window(space, false, screen, cx),
+                    (false, false) => self.open_space_window(space, false, screen),
                 }
             }
             Phase::Enter => {}
         }
-        cx.notify();
+        self.notify();
     }
 
     /// Moves the item a native reorder `list` dropped from slot `from` to slot `to`.
-    pub(crate) fn reorder_list(&mut self, list: u32, from: usize, to: usize, cx: &mut Context<Self>) {
+    pub(crate) fn reorder_list(&mut self, list: u32, from: usize, to: usize) {
         let Some((_, items)) = self.reorder_lists.iter().find(|(id, _)| *id == list) else {
             return;
         };
@@ -818,11 +819,11 @@ impl BrowserWindow {
                 });
             }
         }
-        cx.notify();
+        self.notify();
     }
 
     /// The front tab of the frontmost window under `at` (window coordinates).
-    fn window_under(&self, at: gpui::Point<Pixels>) -> Option<String> {
+    fn window_under(&self, at: Point) -> Option<String> {
         let stage = self.stage_bounds?;
         let local = at - stage.origin;
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
@@ -836,11 +837,10 @@ impl BrowserWindow {
     }
 }
 
-fn rgba(color: gpui::Hsla) -> [f64; 4] {
-    let [red, green, blue] = crate::native::rgb(color);
-    [red, green, blue, f64::from(color.a)]
+fn rgba(color: crate::window::Color) -> [f64; 4] {
+    color
 }
 
-fn bounds(rect: &LogicalRect) -> gpui::Bounds<Pixels> {
-    gpui::Bounds::new(gpui::point(px(rect.x as f32), px(rect.y as f32)), gpui::size(px(rect.width as f32), px(rect.height as f32)))
+fn bounds(rect: &LogicalRect) -> Bounds {
+    Bounds::new(point(rect.x as f32, rect.y as f32), size(rect.width as f32, rect.height as f32))
 }

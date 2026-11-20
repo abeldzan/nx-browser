@@ -1,5 +1,4 @@
-//! The app menu's "Check for Updates…" item. GPUI menus are off (see `defuse_gpui_menu_handlers`), so the
-//! item has its own target object and calls back into the UI.
+//! The app menu's "Check for Updates…" item, with its own target object that calls back into the UI.
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;

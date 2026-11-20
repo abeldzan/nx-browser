@@ -1,4 +1,4 @@
-//! A browser window's frame inside the app window, stacked just above its page and below the GPUI view: the
+//! A browser window's frame inside the app window, stacked just above its page and below the root view: the
 //! border, the title strip holding native controls, and the rims that resize it. Presses on the strip's empty
 //! space and on the rims, and the pointer coming over the window, become `EngineEvent::WindowGesture`.
 
@@ -11,8 +11,8 @@ use objc2_app_kit::{
     NSCursor, NSCursorFrameResizeDirections, NSCursorFrameResizePosition, NSEvent, NSEventModifierFlags,
     NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView,
 };
-use objc2_quartz_core::CACornerMask;
-use objc2_core_graphics::CGColor;
+use objc2_quartz_core::{kCAFillRuleEvenOdd, CACornerMask, CAShapeLayer, CATransaction};
+use objc2_core_graphics::{CGColor, CGMutablePath, CGPath};
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 
 /// How a window frame is drawn and where; colours are sRGB with alpha.
@@ -54,6 +54,8 @@ pub(crate) struct FrameIvars {
     /// bitmap the size of the window, so a resize costs no redraw.
     ring: Retained<NSView>,
     edge: Retained<NSView>,
+    /// The window's shadow on the stage, masked to fall only outside the shell (its page covers the inside).
+    shadow: Retained<NSView>,
     /// The edges of the press under way (0: a move), if any.
     press: Cell<Option<u8>>,
 }
@@ -72,7 +74,7 @@ define_class!(
         }
 
         /// The strip's controls take their own presses; its empty space and the rims are this view's; the page
-        /// area passes through to the page (or the GPUI terminal) beneath.
+        /// area passes through to the page (or the terminal) beneath.
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, point: NSPoint) -> *mut NSView {
             let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
@@ -164,7 +166,7 @@ define_class!(
 );
 
 define_class!(
-    /// Holds native chrome over the GPUI view, passing presses on anything but its controls through to it.
+    /// Holds native chrome over the root view, passing presses on anything but its controls through to it.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "NxPassView"]
@@ -209,6 +211,11 @@ impl NxFrameView {
             }
             view
         });
+        let shadow = NSView::new(mtm);
+        shadow.setWantsLayer(true);
+        if let Some(layer) = shadow.layer() {
+            layer.setShadowColor(Some(&CGColor::new_srgb(0., 0., 0., 1.)));
+        }
         let ivars = FrameIvars {
             key: key.to_string(),
             window_no,
@@ -218,9 +225,11 @@ impl NxFrameView {
             load: load.clone(),
             ring: ring.clone(),
             edge: edge.clone(),
+            shadow: shadow.clone(),
             press: Cell::new(None),
         };
         let this: Retained<Self> = unsafe { msg_send![super(Self::alloc(mtm).set_ivars(ivars)), initWithFrame: NSRect::ZERO] };
+        this.addSubview(&shadow);
         this.addSubview(&ring);
         this.addSubview(&edge);
         this.addSubview(&material);
@@ -296,7 +305,7 @@ impl NxFrameView {
 
     fn paint_rings(&self, style: &FrameStyle) {
         let shell = self.shell_rect(style);
-        // The page sits 1pt in (and the GPUI terminal screen over it): only that edge is body, not the page area.
+        // The page sits 1pt in (and the terminal screen over it): only that edge is body, not the page area.
         for (view, rect, radius, color) in [(&self.ivars().ring, shell, style.radius, style.ring), (&self.ivars().edge, inset(shell, 1.), style.radius - 1., style.body)] {
             view.setFrame(rect);
             if let Some(layer) = view.layer() {
@@ -305,6 +314,37 @@ impl NxFrameView {
                 layer.setBorderColor(Some(&CGColor::new_srgb(red, green, blue, alpha)));
             }
         }
+        self.paint_shadow(style, shell);
+    }
+
+    /// Deep under the focused window, as macOS gives the key window, and faint under the rest.
+    fn paint_shadow(&self, style: &FrameStyle, shell: NSRect) {
+        let view = &self.ivars().shadow;
+        view.setFrame(shell);
+        let Some(layer) = view.layer() else {
+            return;
+        };
+        let (offset, blur, opacity) = if style.active { (10., 30., 0.38) } else { (2., 8., 0.16) };
+        let local = NSRect::new(NSPoint::ZERO, shell.size);
+        let radius = style.radius.max(0.);
+        // A standalone mask layer would animate its new path in; this lands with the resize.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        unsafe {
+            layer.setShadowPath(Some(&CGPath::with_rounded_rect(local, radius, radius, std::ptr::null())));
+            let cut = CGMutablePath::new();
+            let reach = blur * 2. + offset;
+            CGMutablePath::add_rect(Some(&cut), std::ptr::null(), NSRect::new(NSPoint::new(-reach, -reach), NSSize::new(shell.size.width + 2. * reach, shell.size.height + 2. * reach)));
+            CGMutablePath::add_rounded_rect(Some(&cut), std::ptr::null(), local, radius, radius);
+            let mask = CAShapeLayer::new();
+            mask.setPath(Some(&cut));
+            mask.setFillRule(kCAFillRuleEvenOdd);
+            layer.setMask(Some(&mask));
+        }
+        layer.setShadowOffset(NSSize::new(0., -offset));
+        layer.setShadowRadius(blur / 2.);
+        layer.setShadowOpacity(opacity);
+        CATransaction::commit();
     }
 
     fn shell_rect(&self, style: &FrameStyle) -> NSRect {

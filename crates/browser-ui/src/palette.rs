@@ -6,7 +6,6 @@ use crate::window::{favicon_path, site_host, site_image, BrowserWindow, Popover}
 use browser_core::{bang_home, calc, find_bang, normalize_url, spawn_favicon, Settings, BANGS};
 use crate::shortcuts::{keys, label};
 use browser_engine::{Shortcut, SHORTCUTS};
-use gpui::Context;
 
 /// A settings switch the palette flips in place.
 type Toggle = fn(&mut Settings);
@@ -100,7 +99,7 @@ fn format_number(value: f64) -> String {
 }
 
 impl BrowserWindow {
-    pub(crate) fn open_palette(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_palette(&mut self) {
         self.palette_open = !self.palette_open;
         self.palette_index = 0;
         self.palette_bang = None;
@@ -116,11 +115,11 @@ impl BrowserWindow {
         } else {
             self.focus_active_content();
         }
-        cx.notify();
+        self.notify();
     }
 
     /// Turns a finished `!trigger ` in the input into the pill, leaving only the query in the input.
-    pub(crate) fn absorb_bang(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn absorb_bang(&mut self) {
         if self.palette_bang.is_some() {
             return;
         }
@@ -135,17 +134,17 @@ impl BrowserWindow {
         }
         self.palette_bang = Some(bang);
         self.set_typed(PALETTE_QUERY, query);
-        cx.notify();
+        self.notify();
     }
 
-    pub(crate) fn close_palette(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_palette(&mut self) {
         if self.palette_open {
             self.palette_open = false;
-            cx.notify();
+            self.notify();
         }
     }
 
-    fn palette_items(&self, cx: &Context<Self>) -> Vec<Item> {
+    fn palette_items(&self) -> Vec<Item> {
         let typed = self.typed(PALETTE_QUERY).trim().to_string();
         let (only, query) = scope(&typed);
         let wants = |section: &str| only.is_none_or(|only| only == section);
@@ -208,7 +207,7 @@ impl BrowserWindow {
             ] {
                 add(label, item("Actions", label, "", run));
             }
-            if let crate::update::Status::Ready { version, .. } = crate::update::status(cx) {
+            if let crate::update::Status::Ready { version, .. } = crate::update::status() {
                 add("Restart to update", item("Actions", "Restart to update", format!("NxBrowser {version}"), Run::RestartToUpdate));
             }
             // Zen-style toggles; the label says what picking it will do.
@@ -288,7 +287,7 @@ impl BrowserWindow {
         items
     }
 
-    fn run_palette(&mut self, entry: Item, new_tab: bool, cx: &mut Context<Self>) {
+    fn run_palette(&mut self, entry: Item, new_tab: bool) {
         self.palette_open = false;
         let mut keep_focus = false;
         match entry.run {
@@ -297,24 +296,24 @@ impl BrowserWindow {
                     shortcut,
                     Shortcut::Find | Shortcut::Settings | Shortcut::FocusUrl | Shortcut::NewTab | Shortcut::Downloads | Shortcut::Bookmarks | Shortcut::History
                 );
-                self.on_shortcut(shortcut, cx);
+                self.on_shortcut(shortcut);
             }
             Run::Extensions => (self.popover, keep_focus) = (Some(Popover::Extensions), true),
             Run::Duplicate => {
                 let tab = self.model.lock().active_tab().map(|tab| (tab.id.clone(), tab.url.clone()));
                 if let Some((id, url)) = tab {
-                    self.new_tab_in(&id, Some(&url), cx);
+                    self.new_tab_in(&id, Some(&url));
                 }
             }
             Run::CloseOthers => {
                 let active = self.active_tab_id();
                 let others = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone())
                     .filter(|id| Some(id) != active.as_ref()).collect::<Vec<_>>();
-                self.close_tabs(others, cx);
+                self.close_tabs(others);
             }
             Run::CloseAll => {
                 let all = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect();
-                self.close_tabs(all, cx);
+                self.close_tabs(all);
             }
             Run::ToggleMute => {
                 if let Some(id) = self.active_tab_id() {
@@ -324,48 +323,48 @@ impl BrowserWindow {
                 }
             }
             Run::NewPrivate => self.with_model(|model| { let _ = model.create_private_profile(); }),
-            Run::CheckUpdates => crate::update::check(true, cx),
-            Run::RestartToUpdate => crate::update::restart(cx),
-            Run::Pref(change) => self.set_pref(cx, change),
-            Run::Tab(id) => self.focus_window(&id, cx),
+            Run::CheckUpdates => crate::update::check(true),
+            Run::RestartToUpdate => crate::update::restart(),
+            Run::Pref(change) => self.set_pref(change),
+            Run::Tab(id) => self.focus_window(&id),
             Run::Closed(url) => match self.with_model(|model| model.reopen_closed_url(Some(&url))) {
-                Ok(Some(id)) => self.focus_window(&id, cx),
+                Ok(Some(id)) => self.focus_window(&id),
                 _ => self.status = "That tab is no longer in recently closed".into(),
             },
             Run::Space(id) => self.with_model(|model| { let _ = model.switch_session(&id); }),
             Run::Profile(id) => self.with_model(|model| { let _ = model.switch_profile(&id); }),
             Run::Extension(id) => {
-                let at = self.stage_bounds.map_or(0., |bounds| f32::from(bounds.center().x));
-                self.open_extension(&id, at, cx);
+                let at = self.stage_bounds.map_or(0., |bounds| bounds.center().x);
+                self.open_extension(&id, at);
                 keep_focus = true;
             }
             Run::Open(url) => match self.active_tab_id().filter(|_| new_tab) {
-                Some(id) => self.new_tab_in(&id, Some(&url), cx),
+                Some(id) => self.new_tab_in(&id, Some(&url)),
                 None => self.with_model(|model| { let _ = model.navigate_active(&url); }),
             },
             Run::Copy(text) => {
-                self.status = format!("Copied {text}").into();
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.status = format!("Copied {text}");
+                browser_engine_macos::set_clipboard_text(&text);
             }
             Run::Fill(text) => {
                 self.palette_open = true;
                 self.palette_index = 0;
                 self.set_typed(PALETTE_QUERY, text);
-                self.absorb_bang(cx);
-                cx.notify();
+                self.absorb_bang();
+                self.notify();
                 return;
             }
         }
         if !keep_focus {
             self.focus_active_content();
         }
-        self.refresh_url(cx);
-        cx.notify();
+        self.refresh_url();
+        self.notify();
     }
 
     /// A list key from the search field (`EngineEvent::PopoverKey`); → arrives only with the caret at the end.
-    pub(crate) fn palette_key(&mut self, key: &str, cx: &mut Context<Self>) {
-        let items = self.palette_items(cx);
+    pub(crate) fn palette_key(&mut self, key: &str) {
+        let items = self.palette_items();
         let count = items.len();
         let at = self.palette_index.min(count.saturating_sub(1));
         match key {
@@ -373,10 +372,10 @@ impl BrowserWindow {
             "up" if count > 0 => self.palette_index = (at + count - 1) % count,
             "enter" | "cmd-enter" => {
                 if let Some(entry) = items.get(at).cloned() {
-                    self.run_palette(entry, key == "cmd-enter", cx);
+                    self.run_palette(entry, key == "cmd-enter");
                 }
             }
-            "escape" => self.open_palette(cx),
+            "escape" => self.open_palette(),
             // Vivaldi-style autocomplete: Tab (or → at the end) copies the selected row into the input.
             "tab" | "right" if count > 0 => {
                 let entry = &items[at];
@@ -387,18 +386,18 @@ impl BrowserWindow {
                 };
                 self.palette_index = 0;
                 self.set_typed(PALETTE_QUERY, text);
-                self.absorb_bang(cx);
+                self.absorb_bang();
             }
             // Backspace in an empty input drops the pill, as in Arc and Kagi.
             "backspace" => self.palette_bang = None,
             _ => {}
         }
-        cx.notify();
+        self.notify();
     }
 
     /// The palette's glass panel: the search field (with an active bang's pill), then the ranked rows.
-    pub(crate) fn palette_node(&self, pop: &mut Pop, cx: &Context<Self>) -> Node {
-        let items = self.palette_items(cx);
+    pub(crate) fn palette_node(&self, pop: &mut Pop) -> Node {
+        let items = self.palette_items();
         let bang = self.palette_bang;
         let selected = self.palette_index.min(items.len().saturating_sub(1));
         let mut search = Vec::new();
@@ -423,9 +422,9 @@ impl BrowserWindow {
                 let mut row = Vec::new();
                 row.extend(entry.icon.map(|url| site_image(url, 16.)));
                 row.extend([title(entry.label.clone(), 13., Weight::Regular, Ink::Primary), Node::Spacer, title(entry.hint.clone(), 11., Weight::Regular, Ink::Secondary)]);
-                let run = pop.act(move |this, cx| {
+                let run = pop.act(move |this| {
                     let new_tab = this.engine.command_held();
-                    this.run_palette(entry.clone(), new_tab, cx);
+                    this.run_palette(entry.clone(), new_tab);
                 });
                 let row = Node::Item { height: 30., click: Some(run), drag: None, children: row };
                 rows.push(if index == selected { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });

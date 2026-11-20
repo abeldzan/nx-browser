@@ -4,7 +4,6 @@ use crate::native::{text, title, Initial, Ink, Node, Pop, Weight, HOME_QUERY};
 use crate::window::{paint, site_host, site_image, BrowserWindow, Popover};
 use browser_core::Bookmark;
 use browser_engine::WebEngine;
-use gpui::Context;
 use std::collections::HashSet;
 
 /// Bookmarks along the top before the rest collapse into "N more".
@@ -12,9 +11,16 @@ const BAR_MARKS: usize = 12;
 
 impl BrowserWindow {
     /// Builds the new tab page of every blank tab in this space, and drops the ones no longer blank.
-    pub(crate) fn sync_homes(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_homes(&mut self) {
         let blank = self.model.lock().session_tabs().into_iter().filter(|tab| crate::window::is_blank(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        self.engine.keep_homes(&blank);
+        // Terminal screens go where pages would, as new tab pages do.
+        let terminals = self.model.lock().session_tabs().into_iter().filter(|tab| crate::terminal::is_terminal(&tab.url)).map(|tab| (tab.id.clone(), tab.url.clone())).collect::<Vec<_>>();
+        self.engine.keep_homes(&blank.iter().cloned().chain(terminals.iter().map(|(id, _)| id.clone())).collect::<Vec<_>>());
+        for (id, url) in &terminals {
+            if let Some(screen) = crate::terminal::screen_for(id, url) {
+                self.engine.set_screen(id, &screen);
+            }
+        }
         if blank.is_empty() {
             self.home_actions.clear();
             return;
@@ -28,7 +34,7 @@ impl BrowserWindow {
             (bookmarks, recent)
         };
         let (pinned, saved): (Vec<_>, Vec<_>) = bookmarks.into_iter().partition(|b| b.pinned);
-        let [r, g, b] = crate::native::rgb(paint(cx).bg);
+        let [r, g, b] = crate::native::rgb(paint().bg);
         let mut pop = Pop::home();
         for id in blank {
             let (width, height) = self.page_sizes.get(&id).copied().unwrap_or((800., 600.));
@@ -41,7 +47,7 @@ impl BrowserWindow {
     }
 
     /// Arrows, Return, Tab and Esc in a new tab page's search field.
-    pub(crate) fn home_key(&mut self, key: &str, cx: &mut Context<Self>) {
+    pub(crate) fn home_key(&mut self, key: &str) {
         let count = self.suggestions.len();
         match key {
             "down" if count > 0 => self.suggestion = Some(self.suggestion.map_or(0, |at| (at + 1) % count)),
@@ -51,20 +57,20 @@ impl BrowserWindow {
                 let typed = self.typed(HOME_QUERY);
                 if let Some(target) = picked.or_else(|| (!typed.trim().is_empty()).then_some(typed)) {
                     self.set_typed(HOME_QUERY, String::new());
-                    self.commit_navigation(&target, cx);
+                    self.commit_navigation(&target);
                 }
             }
             // Tab fills the picked suggestion, or the first, into the field to edit before going.
             "tab" if count > 0 => {
                 let text = self.suggestions[self.suggestion.unwrap_or(0).min(count - 1)].0.clone();
                 self.set_typed(HOME_QUERY, text.clone());
-                self.update_suggestions(text, cx);
+                self.update_suggestions(text);
             }
             "escape" if count > 0 => self.suggestions.clear(),
             "escape" => self.engine.focus_chrome(),
             _ => return,
         }
-        cx.notify();
+        self.notify();
     }
 }
 
@@ -72,15 +78,15 @@ impl BrowserWindow {
 fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bookmark], recent: &[(String, String)], pop: &mut Pop) -> Node {
     let open = |pop: &mut Pop, url: &str| {
         let (id, url) = (id.to_string(), url.to_string());
-        pop.act(move |this, cx| {
-            this.focus_window(&id, cx);
-            this.commit_navigation(&url, cx);
+        pop.act(move |this| {
+            this.focus_window(&id);
+            this.commit_navigation(&url);
         })
     };
     // A click anywhere on the pill, not just on the line of text, starts typing.
     let start = {
         let id = id.to_string();
-        pop.act(move |this, _| this.engine.focus_home(&id))
+        pop.act(move |this| this.engine.focus_home(&id))
     };
     let field = Node::Card {
         tint: Ink::Tertiary,
@@ -99,11 +105,11 @@ fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bo
         let edit = bookmark.clone();
         let unpin = bookmark.clone();
         let tools = vec![
-            Node::Tool { symbol: "pencil", tip: "Edit", action: pop.act(move |this, cx| this.open_bookmark_editor(Some(&edit), cx)), on: false },
+            Node::Tool { symbol: "pencil", tip: "Edit", action: pop.act(move |this| this.open_bookmark_editor(Some(&edit))), on: false },
             Node::Tool {
                 symbol: "xmark",
                 tip: "Unpin",
-                action: pop.act(move |this, _| {
+                action: pop.act(move |this| {
                     let _ = this.model.lock().save_bookmark(Some(&unpin.id), &unpin.url, &unpin.title, false);
                 }),
                 on: false,
@@ -115,7 +121,7 @@ fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bo
         88.,
         Box::new(Node::Item {
             height: 74.,
-            click: Some(pop.act(|this, cx| this.open_bookmark_editor(None, cx))),
+            click: Some(pop.act(|this| this.open_bookmark_editor(None))),
             drag: None,
             children: vec![Node::Column {
                 gap: 6.,
@@ -133,7 +139,7 @@ fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bo
             .iter()
             .map(|(url, name)| {
                 let (pin_url, pin_title) = (url.clone(), name.clone());
-                let pin = pop.act(move |this, _| {
+                let pin = pop.act(move |this| {
                     let _ = this.model.lock().save_bookmark(None, &pin_url, &pin_title, true);
                 });
                 tile(open(pop, url), url, name, vec![Node::Tool { symbol: "pin", tip: "Pin", action: pin, on: false }])
@@ -152,9 +158,9 @@ fn home_page(id: &str, width: f64, height: f64, pinned: &[Bookmark], saved: &[Bo
         })
         .collect::<Vec<_>>();
     if saved.len() > BAR_MARKS {
-        let more = pop.act(|this, cx| {
+        let more = pop.act(|this| {
             this.popover = Some(Popover::Bookmarks);
-            cx.notify();
+            this.notify();
         });
         chips.push(Node::Item { height: 26., click: Some(more), drag: None, children: vec![text(format!("{} more", saved.len() - BAR_MARKS), 12., Weight::Regular, Ink::Secondary)] });
     }

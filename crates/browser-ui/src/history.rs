@@ -1,7 +1,6 @@
 use crate::native::{button, empty, field, header, section, sheet, text, title, Ink, Key, Node, Pop, Style, Weight, HISTORY_QUERY};
 use crate::window::{site_host, site_image, BrowserWindow};
 use browser_core::{now_secs, HistoryEntry};
-use gpui::Context;
 
 const POPUP_LIMIT: usize = 12;
 /// Width of the native popovers.
@@ -18,7 +17,7 @@ impl BrowserWindow {
         } else {
             Node::Scroll { max: 340., child: Box::new(Node::Column { gap: 0., pad: (6., 4.), children: history_rows(&entries, pop) }) }
         };
-        let all = pop.act(|this, cx| this.open_history_modal(cx));
+        let all = pop.act(|this| this.open_history_modal());
         Node::Column {
             gap: 0.,
             pad: (0., 0.),
@@ -41,22 +40,22 @@ impl BrowserWindow {
         } else {
             Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 0., pad: (0., 0.), children: history_rows(&entries, pop) }) }
         };
-        let done = pop.act(|this, cx| this.close_history_modal(cx));
+        let done = pop.act(|this| this.close_history_modal());
         // Return in the search box opens nothing; the list is clicked.
-        let search = pop.act(|_, _| {});
+        let search = pop.act(|_| {});
         sheet("History", vec![field(HISTORY_QUERY, "", "Search history", search), list], vec![button("Done", done, Style::Primary, Key::Escape)])
     }
 
-    pub(crate) fn open_history_modal(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_history_modal(&mut self) {
         self.popover_texts.remove(&HISTORY_QUERY);
         self.popover = None;
         self.history_modal = true;
-        cx.notify();
+        self.notify();
     }
 
-    pub(crate) fn close_history_modal(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_history_modal(&mut self) {
         self.history_modal = false;
-        cx.notify();
+        self.notify();
     }
 
 }
@@ -76,7 +75,7 @@ fn history_rows(entries: &[HistoryEntry], pop: &mut Pop) -> Vec<Node> {
         let name = if entry.title.is_empty() { host.clone() } else { entry.title.clone() };
         rows.push(Node::Item {
             height: f64::from(ROW_H),
-            click: Some(pop.act(move |this, cx| this.open_history_url(&url, cx))),
+            click: Some(pop.act(move |this| this.open_history_url(&url))),
             drag: None,
             children: vec![
                 site_image(&entry.url, 16.),

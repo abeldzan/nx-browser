@@ -8,9 +8,11 @@ mod pty;
 mod view;
 
 use browser_core::Settings;
-use gpui::{App, AppContext, Entity, Global};
+use browser_engine_macos::TermSurface;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 pub use agent::{AgentState, Status};
 pub use view::TerminalView;
 
@@ -66,72 +68,94 @@ fn families() -> &'static (Vec<String>, Vec<String>) {
     })
 }
 
-/// The user's terminal settings, readable from any window's terminals.
-#[derive(Default)]
-struct Prefs(Settings);
-
-impl Global for Prefs {}
-
-/// The app's current settings, kept here for terminals and read by `paint` for the interface font size.
-pub(crate) fn prefs(cx: &App) -> &Settings {
-    cx.try_global::<Prefs>().map_or_else(|| default_settings(), |prefs| &prefs.0)
+thread_local! {
+    /// The app's current settings, for terminals and for `paint`'s interface font size.
+    static PREFS: RefCell<Option<Settings>> = const { RefCell::new(None) };
+    /// The theme's foreground, background and accent (sRGB with alpha), set by the windows.
+    static COLORS: std::cell::Cell<[[f64; 4]; 3]> = const { std::cell::Cell::new([[0.9, 0.9, 0.9, 1.], [0.1, 0.1, 0.1, 1.], [0.2, 0.5, 1., 1.]]) };
+    /// Live terminals by tab id. App-wide, so a tab torn off into another OS window keeps its shell.
+    static TERMINALS: RefCell<HashMap<String, Rc<RefCell<TerminalView>>>> = RefCell::default();
 }
 
-fn default_settings() -> &'static Settings {
-    static DEFAULT: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
-    DEFAULT.get_or_init(Settings::default)
+/// The app's current settings, kept here for terminals and read by `paint` for the interface font size.
+pub(crate) fn prefs() -> Settings {
+    PREFS.with_borrow(|prefs| prefs.clone()).unwrap_or_default()
 }
 
 /// Hands changed settings to every open terminal (font, size, cursor and scrollback apply right away).
-pub fn set_prefs(settings: &Settings, cx: &mut App) {
-    if cx.try_global::<Prefs>().is_some_and(|prefs| prefs.0 == *settings) {
+pub fn set_prefs(settings: &Settings) {
+    if PREFS.with_borrow(|prefs| prefs.as_ref() == Some(settings)) {
         return;
     }
-    cx.set_global(Prefs(settings.clone()));
-    let views = cx.try_global::<Terminals>().map(|terminals| terminals.0.values().cloned().collect::<Vec<_>>()).unwrap_or_default();
-    for view in views {
-        view.update(cx, |view, cx| {
-            view.apply_prefs(settings);
-            cx.notify();
-        });
+    PREFS.set(Some(settings.clone()));
+    for view in all() {
+        view.borrow_mut().apply_prefs(settings);
     }
 }
 
-/// Live terminals by tab id. App-wide, so a tab torn off into another OS window keeps its shell.
-#[derive(Default)]
-struct Terminals(HashMap<String, Entity<TerminalView>>);
+/// The theme's foreground, background and accent, for drawing terminals.
+fn colors() -> [[f64; 4]; 3] {
+    COLORS.get()
+}
 
-impl Global for Terminals {}
+/// Repaints every terminal in the theme's foreground, background and accent when they change.
+pub fn set_colors(colors: [[f64; 4]; 3]) {
+    if COLORS.replace(colors) != colors {
+        for view in all() {
+            view.borrow().redraw();
+        }
+    }
+}
+
+fn all() -> Vec<Rc<RefCell<TerminalView>>> {
+    TERMINALS.with_borrow(|terminals| terminals.values().cloned().collect())
+}
 
 /// The tab's terminal, starting its shell on first use.
-pub fn terminal_for(tab_id: &str, url: &str, cx: &mut App) -> Entity<TerminalView> {
-    if let Some(view) = get(tab_id, cx) {
+pub fn terminal_for(tab_id: &str, url: &str) -> Rc<RefCell<TerminalView>> {
+    if let Some(view) = get(tab_id) {
         return view;
     }
-    let cwd = cwd_of(url);
-    let settings = prefs(cx).clone();
-    let view = cx.new(|cx| TerminalView::new(&cwd, &settings, cx));
-    cx.default_global::<Terminals>().0.insert(tab_id.to_string(), view.clone());
+    let view = Rc::new(RefCell::new(TerminalView::new(tab_id, &cwd_of(url), &prefs())));
+    TERMINALS.with_borrow_mut(|terminals| terminals.insert(tab_id.to_string(), view.clone()));
     view
 }
 
-pub fn get(tab_id: &str, cx: &App) -> Option<Entity<TerminalView>> {
-    cx.try_global::<Terminals>().and_then(|terminals| terminals.0.get(tab_id).cloned())
+/// The tab's terminal screen for the engine to place, starting its shell on first use.
+pub fn screen_for(tab_id: &str, url: &str) -> Option<Rc<TermSurface>> {
+    terminal_for(tab_id, url).borrow().surface.clone()
+}
+
+pub fn get(tab_id: &str) -> Option<Rc<RefCell<TerminalView>>> {
+    TERMINALS.with_borrow(|terminals| terminals.get(tab_id).cloned())
+}
+
+/// Runs `f` on the tab's terminal, unless it is gone or already in use further up the stack.
+fn with<T>(tab_id: &str, f: impl FnOnce(&mut TerminalView) -> T) -> Option<T> {
+    let view = get(tab_id)?;
+    let mut view = view.try_borrow_mut().ok()?;
+    Some(f(&mut view))
+}
+
+/// Feeds shell output to the tab's terminal on the main thread.
+fn feed(tab_id: &str, bytes: Vec<u8>) {
+    if get(tab_id).is_some_and(|view| view.try_borrow_mut().is_err()) {
+        // Busy further up the stack: output must not be dropped, so it waits for the next turn.
+        let id = tab_id.to_string();
+        dispatch2::DispatchQueue::main().exec_async(move || feed(&id, bytes));
+        return;
+    }
+    with(tab_id, |view| view.feed(&bytes));
 }
 
 /// The coding agent running in the tab's terminal and its status.
-pub fn agent(tab_id: &str, cx: &App) -> Option<AgentState> {
-    get(tab_id, cx)?.read(cx).agent()
+pub fn agent(tab_id: &str) -> Option<AgentState> {
+    get(tab_id)?.borrow().agent()
 }
 
 /// Ends shells whose tab is gone or now shows a web page (the PTY is killed when the view drops).
-pub fn retain(mut keep: impl FnMut(&str) -> bool, cx: &mut App) {
-    if let Some(terminals) = cx.try_global::<Terminals>() {
-        if terminals.0.keys().all(|id| keep(id)) {
-            return;
-        }
-    }
-    cx.default_global::<Terminals>().0.retain(|id, _| keep(id));
+pub fn retain(mut keep: impl FnMut(&str) -> bool) {
+    TERMINALS.with_borrow_mut(|terminals| terminals.retain(|id, _| keep(id)));
 }
 
 #[cfg(test)]

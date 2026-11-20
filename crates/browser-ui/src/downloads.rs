@@ -44,22 +44,22 @@ impl BrowserWindow {
             ];
             if fraction.is_some() {
                 let id = entry.id.clone();
-                children.push(Node::Tool { symbol: "xmark", tip: "Stop", action: pop.act(move |this, _| this.cancel_download(&id)), on: false });
+                children.push(Node::Tool { symbol: "xmark", tip: "Stop", action: pop.act(move |this| this.cancel_download(&id)), on: false });
             }
             if done {
                 let reveal = entry.path.clone();
-                children.push(Node::Hover(true, Box::new(Node::Tool { symbol: "magnifyingglass", tip: "Show in Finder", action: pop.act(move |_, _| open_path(&reveal, true)), on: false })));
+                children.push(Node::Hover(true, Box::new(Node::Tool { symbol: "magnifyingglass", tip: "Show in Finder", action: pop.act(move |_| open_path(&reveal, true)), on: false })));
             }
             let path = entry.path.clone();
             rows.push(Node::Item {
                 height: f64::from(ROW_H),
-                click: done.then(|| pop.act(move |_, _| open_path(&path, false))),
+                click: done.then(|| pop.act(move |_| open_path(&path, false))),
                 // Dragging the row out drops the file on a page (or anywhere) as from Finder.
                 drag: done.then(|| entry.path.clone().into()),
                 children,
             });
         }
-        let clear = pop.act(|this, _| {
+        let clear = pop.act(|this| {
             let _ = this.model.lock().clear_finished_downloads();
         });
         let actions = if empty_list { Vec::new() } else { vec![Node::Link { title: "Clear".into(), action: clear }] };

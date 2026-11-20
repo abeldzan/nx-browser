@@ -1,7 +1,6 @@
 use crate::native::{button, empty, field, header, label, sheet, title, Ink, Key, Node, Pop, Style, Weight, BOOKMARK_TITLE, BOOKMARK_URL};
 use crate::window::{site_host, site_image, BrowserWindow};
 use browser_core::{normalize_url, Bookmark};
-use gpui::Context;
 
 const ROW_H: f32 = 30.;
 
@@ -19,15 +18,15 @@ impl BrowserWindow {
     }
 
     /// `None` adds a new pinned site; otherwise edits that bookmark.
-    pub(crate) fn open_bookmark_editor(&mut self, bookmark: Option<&Bookmark>, cx: &mut Context<Self>) {
+    pub(crate) fn open_bookmark_editor(&mut self, bookmark: Option<&Bookmark>) {
         let (title, url) = bookmark.map(|b| (b.title.clone(), b.url.clone())).unwrap_or_default();
         self.popover_texts.insert(BOOKMARK_TITLE, title);
         self.popover_texts.insert(BOOKMARK_URL, url);
         self.bookmark_edit = Some(bookmark.map_or((None, true), |b| (Some(b.id.clone()), b.pinned)));
-        cx.notify();
+        self.notify();
     }
 
-    pub(crate) fn save_bookmark_edit(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_bookmark_edit(&mut self) {
         let Some((id, pinned)) = self.bookmark_edit.clone() else {
             return;
         };
@@ -43,19 +42,19 @@ impl BrowserWindow {
         let title = if title.is_empty() { site_host(&url) } else { title };
         let _ = self.model.lock().save_bookmark(id.as_deref(), &url, &title, pinned);
         self.bookmark_edit = None;
-        cx.notify();
+        self.notify();
     }
 
     pub(crate) fn bookmark_sheet(&self, pop: &mut Pop) -> Node {
         let id = self.bookmark_edit.clone().and_then(|(id, _)| id);
-        let save = pop.act(|this, cx| this.save_bookmark_edit(cx));
-        let cancel = pop.act(|this, _| this.bookmark_edit = None);
+        let save = pop.act(|this| this.save_bookmark_edit());
+        let cancel = pop.act(|this| this.bookmark_edit = None);
         let mut buttons = Vec::new();
         if let Some(id) = &id {
             let id = id.clone();
             buttons.push(button(
                 "Remove",
-                pop.act(move |this, _| {
+                pop.act(move |this| {
                     let _ = this.model.lock().delete_bookmark(&id);
                     this.bookmark_edit = None;
                 }),
@@ -87,7 +86,7 @@ fn bookmark_row(bookmark: &Bookmark, pop: &mut Pop) -> Node {
         Node::Tool {
             symbol: if bookmark.pinned { "pin.fill" } else { "pin" },
             tip: if bookmark.pinned { "Unpin from Start Page" } else { "Pin to Start Page" },
-            action: pop.act(move |this, _| {
+            action: pop.act(move |this| {
                 let _ = this.model.lock().save_bookmark(Some(&pin.id), &pin.url, &pin.title, !pin.pinned);
             }),
             on: bookmark.pinned,
@@ -95,16 +94,16 @@ fn bookmark_row(bookmark: &Bookmark, pop: &mut Pop) -> Node {
         Node::Tool {
             symbol: "pencil",
             tip: "Edit",
-            action: pop.act(move |this, cx| {
+            action: pop.act(move |this| {
                 this.popover = None;
-                this.open_bookmark_editor(Some(&edit), cx);
+                this.open_bookmark_editor(Some(&edit));
             }),
             on: false,
         },
         Node::Tool {
             symbol: "xmark",
             tip: "Remove",
-            action: pop.act(move |this, _| {
+            action: pop.act(move |this| {
                 let _ = this.model.lock().delete_bookmark(&remove);
             }),
             on: false,
@@ -112,9 +111,9 @@ fn bookmark_row(bookmark: &Bookmark, pop: &mut Pop) -> Node {
     ];
     Node::Item {
         height: f64::from(ROW_H),
-        click: Some(pop.act(move |this, cx| {
+        click: Some(pop.act(move |this| {
             this.popover = None;
-            this.open_history_url(&open, cx);
+            this.open_history_url(&open);
         })),
         drag: None,
         children: vec![

@@ -5,14 +5,14 @@
 //! way Zed's terminal mappings do.
 
 use alacritty_terminal::term::TermMode;
-use gpui::{KeyDownEvent, Modifiers, MouseButton};
+pub use browser_engine_macos::{Keystroke, Modifiers, MouseButton};
 
-/// Map a GPUI keystroke to the bytes a TTY expects. Returns None for
+/// Map a keystroke to the bytes a TTY expects. Returns None for
 /// chords the app still owns (`Cmd+Q`, `Cmd+,`) and for copy/paste,
 /// which the terminal view handles itself.
-pub fn key_bytes(event: &KeyDownEvent, mode: TermMode) -> Option<Vec<u8>> {
-    let key = event.keystroke.key.as_str();
-    let m = &event.keystroke.modifiers;
+pub fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+    let key = keystroke.key.as_str();
+    let m = &keystroke.modifiers;
     if m.platform {
         if m.shift || m.control || m.alt || m.function {
             return None;
@@ -103,10 +103,10 @@ pub fn key_bytes(event: &KeyDownEvent, mode: TermMode) -> Option<Vec<u8>> {
                     vec![code]
                 }
             } else if m.alt {
-                let typed = event.keystroke.key_char.as_deref().unwrap_or(key);
+                let typed = keystroke.key_char.as_deref().unwrap_or(key);
                 esc(typed.as_bytes())
             } else {
-                event.keystroke.key_char.clone()?.into_bytes()
+                keystroke.key_char.clone()?.into_bytes()
             }
         }
         _ => {
@@ -114,7 +114,7 @@ pub fn key_bytes(event: &KeyDownEvent, mode: TermMode) -> Option<Vec<u8>> {
             if m.control || m.alt {
                 return None;
             }
-            let text = event.keystroke.key_char.clone().filter(|t| !t.is_empty())?;
+            let text = keystroke.key_char.clone().filter(|t| !t.is_empty())?;
             text.into_bytes()
         }
     };
@@ -210,7 +210,6 @@ pub fn mouse_bytes(
         MouseButton::Left => 0u16,
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
-        _ => 0,
     };
     let (mut code, release) = match action {
         MouseAction::Press(b) => (button(b), false),
@@ -255,12 +254,14 @@ pub fn mouse_bytes(
 mod tests {
     use super::*;
 
-    fn key(name: &str) -> KeyDownEvent {
-        KeyDownEvent {
-            keystroke: gpui::Keystroke::parse(name).unwrap(),
-            is_held: false,
-            prefer_character_input: false,
-        }
+    /// `ctrl-alt-a` as a keystroke; a single character types itself.
+    fn key(name: &str) -> Keystroke {
+        let mut parts = name.split('-').collect::<Vec<_>>();
+        let key = parts.pop().unwrap_or_default().to_string();
+        let has = |m: &str| parts.contains(&m);
+        let modifiers = Modifiers { shift: has("shift"), control: has("ctrl"), alt: has("alt"), platform: has("cmd"), function: has("fn") };
+        let key_char = (key.chars().count() == 1).then(|| key.clone());
+        Keystroke { key, key_char, modifiers }
     }
 
     fn bytes(name: &str) -> Option<Vec<u8>> {
@@ -330,14 +331,14 @@ mod tests {
     fn alt_prefixes_escape_and_keeps_non_ascii_whole() {
         assert_eq!(bytes("alt-b"), Some(b"\x1bb".to_vec()));
         let mut event = key("alt-a");
-        event.keystroke.key_char = Some("å".into());
+        event.key_char = Some("å".into());
         assert_eq!(
             key_bytes(&event, TermMode::empty()),
             Some("\u{1b}å".as_bytes().to_vec())
         );
         let mut composed = key("a");
-        composed.keystroke.key = "é".into();
-        composed.keystroke.key_char = Some("é".into());
+        composed.key = "é".into();
+        composed.key_char = Some("é".into());
         assert_eq!(
             key_bytes(&composed, TermMode::empty()),
             Some("é".as_bytes().to_vec())

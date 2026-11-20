@@ -1,11 +1,9 @@
 //! App-wide update state: checks GitHub in the background, stages the new app, and restarts into it.
 //! Every window observes `Updates`, so the title bar's "Restart to Update" appears everywhere at once.
 
-use crate::window::BrowserWindow;
 use crate::SharedModel;
 use browser_core::update;
-use futures::StreamExt;
-use gpui::{App, BorrowAppContext, Global, SharedString};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::PoisonError;
 use std::time::Duration;
@@ -26,134 +24,121 @@ pub(crate) enum Status {
     Failed(String),
 }
 
-#[derive(Default)]
-pub(crate) struct Updates {
-    pub(crate) status: Status,
+thread_local! {
+    static STATUS: RefCell<Status> = RefCell::default();
 }
 
-impl Global for Updates {}
-
-/// Sets up the global; with `enabled`, also the menu item and the periodic background check.
-pub(crate) fn init(model: SharedModel, enabled: bool, cx: &mut App) {
-    cx.set_global(Updates::default());
+/// Sets up the status; with `enabled`, also the menu item and the periodic background check.
+pub(crate) fn init(model: SharedModel, enabled: bool) {
     if !enabled || update::installed_bundle().is_none() {
         return;
     }
-    cx.global_mut::<Updates>().status = Status::Idle;
+    STATUS.set(Status::Idle);
     std::thread::spawn(update::clear_staging);
-
-    let (ask_tx, mut asks) = futures::channel::mpsc::unbounded::<()>();
-    browser_engine_macos::on_check_for_updates(move || {
-        let _ = ask_tx.unbounded_send(());
-    });
-    cx.spawn(async move |cx| {
-        while asks.next().await.is_some() {
-            cx.update(|cx| check(true, cx));
-        }
-    })
-    .detach();
-
-    cx.spawn(async move |cx| {
-        cx.background_executor().timer(FIRST_CHECK).await;
+    browser_engine_macos::on_check_for_updates(|| check(true));
+    std::thread::spawn(move || {
+        std::thread::sleep(FIRST_CHECK);
         loop {
             if model.lock().unwrap_or_else(PoisonError::into_inner).settings.auto_update {
-                cx.update(|cx| check(false, cx));
+                dispatch2::DispatchQueue::main().exec_async(|| check(false));
             }
-            cx.background_executor().timer(CHECK_EVERY).await;
+            std::thread::sleep(CHECK_EVERY);
         }
-    })
-    .detach();
+    });
 }
 
-pub(crate) fn status(cx: &App) -> &Status {
-    &cx.global::<Updates>().status
+pub(crate) fn status() -> Status {
+    STATUS.with_borrow(Status::clone)
 }
 
 /// Looks for a newer release and downloads it. `manual` checks report back in a toast; background ones stay quiet.
-pub(crate) fn check(manual: bool, cx: &mut App) {
-    match status(cx) {
+pub(crate) fn check(manual: bool) {
+    match status() {
         Status::Unavailable => {
             if manual {
-                toast("Updates are available in the installed app only", cx);
+                toast("Updates are available in the installed app only");
             }
             return;
         }
         Status::Checking => return,
         Status::Downloading(version) => {
             if manual {
-                toast(format!("Downloading NxBrowser {version}…"), cx);
+                toast(format!("Downloading NxBrowser {version}…"));
             }
             return;
         }
         Status::Ready { version, .. } => {
             if manual {
-                toast(format!("NxBrowser {version} is ready. Restart to update."), cx);
+                toast(format!("NxBrowser {version} is ready. Restart to update."));
             }
             return;
         }
         Status::Idle | Status::Failed(_) => {}
     }
-    set(Status::Checking, cx);
-    cx.spawn(async move |cx| {
-        let status = match join(update::check()).await {
+    set(Status::Checking);
+    let main = dispatch2::DispatchQueue::main();
+    std::thread::spawn(move || {
+        let status = match join(update::check()) {
             Ok(None) => {
                 if manual {
-                    cx.update(|cx| toast("NxBrowser is up to date", cx));
+                    main.exec_async(|| toast("NxBrowser is up to date"));
                 }
                 Status::Idle
             }
             Ok(Some(release)) => {
                 let version = release.version.clone();
-                cx.update(|cx| {
-                    set(Status::Downloading(version.clone()), cx);
+                let shown = version.clone();
+                main.exec_async(move || {
+                    set(Status::Downloading(shown.clone()));
                     if manual {
-                        toast(format!("Downloading NxBrowser {version}…"), cx);
+                        toast(format!("Downloading NxBrowser {shown}…"));
                     }
                 });
-                match join(update::prepare(release)).await {
+                match join(update::prepare(release)) {
                     Ok(app) => Status::Ready { version, app },
                     Err(error) => Status::Failed(error.to_string()),
                 }
             }
             Err(error) => Status::Failed(error.to_string()),
         };
-        cx.update(|cx| {
+        main.exec_async(move || {
             if let (true, Status::Failed(message)) = (manual, &status) {
-                toast(message.clone(), cx);
+                toast(message.clone());
             }
-            set(status, cx);
+            set(status);
         });
-    })
-    .detach();
+    });
 }
 
 /// Quits into the staged update; the helper swaps it in and opens it.
-pub(crate) fn restart(cx: &mut App) {
-    let Status::Ready { app, .. } = status(cx) else {
+pub(crate) fn restart() {
+    let Status::Ready { app, .. } = status() else {
         return;
     };
-    match update::relaunch_into(app) {
-        Ok(()) => cx.quit(),
-        Err(error) => toast(error.to_string(), cx),
+    match update::relaunch_into(&app) {
+        Ok(()) => browser_engine_macos::quit(),
+        Err(error) => toast(error.to_string()),
     }
 }
 
-fn set(status: Status, cx: &mut App) {
-    cx.update_global::<Updates, _>(|updates, _| updates.status = status);
+/// Every window's title bar shows "Restart to Update", so all of them redraw.
+fn set(status: Status) {
+    STATUS.set(status);
+    crate::notify_all();
 }
 
 /// A background task's result, its panic or cancellation included.
-async fn join<T, E: std::error::Error + Send + Sync + 'static>(task: impl std::future::Future<Output = Result<anyhow::Result<T>, E>>) -> anyhow::Result<T> {
-    task.await?
+fn join<T, E: std::error::Error + Send + Sync + 'static>(task: impl std::future::Future<Output = Result<anyhow::Result<T>, E>>) -> anyhow::Result<T> {
+    futures::executor::block_on(task)?
 }
 
-fn toast(message: impl Into<SharedString>, cx: &mut App) {
-    let Some(window) = cx.active_window().and_then(|window| window.downcast::<BrowserWindow>()) else {
+fn toast(message: impl Into<String>) {
+    let Some(no) = browser_engine_macos::key_window().or_else(crate::main_window) else {
         return;
     };
     let message = message.into();
-    let _ = window.update(cx, |view, _, cx| {
+    crate::update(no, |view| {
         view.status = message;
-        cx.notify();
+        view.notify();
     });
 }

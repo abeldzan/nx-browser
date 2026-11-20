@@ -1,7 +1,7 @@
 //! Terminal emulation for terminal tabs (ported from kubenx).
 //!
 //! Wraps `alacritty_terminal`'s grid and parser without its PTY or event
-//! loop: bytes come from the PTY reader, replies go back to the PTY. No gpui
+//! loop: bytes come from the PTY reader, replies go back to the PTY. No AppKit
 //! types here so the behaviour is unit-testable.
 
 use std::cell::RefCell;

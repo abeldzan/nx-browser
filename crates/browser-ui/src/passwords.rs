@@ -5,7 +5,6 @@ use crate::native::{
 use crate::window::{site_image, BrowserWindow};
 use browser_core::passwords::{self, site_of};
 use browser_engine_macos::{authenticate, vault_key};
-use gpui::Context;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -74,7 +73,7 @@ impl BrowserWindow {
                 true
             }
             Err(error) => {
-                self.status = format!("Passwords unavailable: {error}").into();
+                self.status = format!("Passwords unavailable: {error}");
                 false
             }
         }
@@ -87,7 +86,7 @@ impl BrowserWindow {
 
     /// Answers the page's password script; the page waits on every message until it gets a reply.
     /// Everything is scoped to the profile of the tab that sent it.
-    pub(crate) fn on_password_message(&mut self, tab_id: &str, origin: &str, request: u64, message: &str, cx: &mut Context<Self>) {
+    pub(crate) fn on_password_message(&mut self, tab_id: &str, origin: &str, request: u64, message: &str) {
         let profile = self.model.lock().tab_profile(tab_id).map(|profile| (profile.id.clone(), profile.is_private()));
         let (Ok(message), Some((profile_id, private))) = (serde_json::from_str::<PageMessage>(message), profile) else {
             return self.engine.answer_passwords(request, "null");
@@ -114,7 +113,7 @@ impl BrowserWindow {
             "generate" => serde_json::to_string(&passwords::generate()).unwrap_or_default(),
             "submit" => {
                 if offer && !private {
-                    self.offer_save(profile_id, origin, message, cx);
+                    self.offer_save(profile_id, origin, message);
                 }
                 "null".into()
             }
@@ -123,7 +122,7 @@ impl BrowserWindow {
         self.engine.answer_passwords(request, &reply);
     }
 
-    fn offer_save(&mut self, profile_id: String, origin: &str, message: PageMessage, cx: &mut Context<Self>) {
+    fn offer_save(&mut self, profile_id: String, origin: &str, message: PageMessage) {
         let current = message.password;
         let password = message.new_password.filter(|p| !p.is_empty()).unwrap_or_else(|| current.clone());
         if password.is_empty() || self.model.lock().is_never_save(&profile_id, origin).unwrap_or(false) || !self.load_vault_key() {
@@ -147,7 +146,7 @@ impl BrowserWindow {
         let prompt = SavePrompt { profile_id, origin: origin.to_string(), username, password, existing };
         // One prompt at a time: the newest submission is the one the user is looking at.
         self.passwords.prompt = Some(prompt);
-        cx.notify();
+        self.notify();
     }
 
     /// "Save password for site?" under the title bar after a sign-in form is sent; it stays until answered.
@@ -157,22 +156,22 @@ impl BrowserWindow {
         let update = prompt.existing.is_some();
         let save = {
             let prompt = prompt.clone();
-            pop.act(move |this, _| {
+            pop.act(move |this| {
                 let saved =
                     this.model.lock().save_login(&prompt.profile_id, prompt.existing.as_deref(), &prompt.origin, &prompt.username, &prompt.password, "");
                 this.status = match saved {
                     Ok(()) => "Password saved".into(),
-                    Err(error) => format!("Password not saved: {error}").into(),
+                    Err(error) => format!("Password not saved: {error}"),
                 };
                 this.passwords.prompt = None;
             })
         };
-        let not_now = pop.act(|this, _| this.passwords.prompt = None);
+        let not_now = pop.act(|this| this.passwords.prompt = None);
         let username = if prompt.username.is_empty() { "No username".to_string() } else { prompt.username.clone() };
         let dots = "•".repeat(prompt.password.chars().count().min(16));
         let mut buttons = Vec::new();
         if !update {
-            let never = pop.act(move |this, _| {
+            let never = pop.act(move |this| {
                 let _ = this.model.lock().never_save(&prompt.profile_id, &prompt.origin);
                 this.passwords.prompt = None;
             });
@@ -193,34 +192,28 @@ impl BrowserWindow {
     }
 
     /// Runs `then` after Touch ID or the Mac password, or straight away within `UNLOCK_FOR` of the last check.
-    fn with_unlock(&mut self, reason: &str, cx: &mut Context<Self>, then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static) {
+    fn with_unlock(&mut self, reason: &str, then: impl FnOnce(&mut Self) + 'static) {
         if self.passwords.unlocked() {
             if self.load_vault_key() {
-                then(self, cx);
+                then(self);
             }
             return;
         }
-        let (sender, receiver) = futures::channel::oneshot::channel();
+        let (no, then) = (self.shell.number(), crate::SendAnyway(then));
+        // The answer comes on another thread; `then` only ever runs back on the main thread.
         authenticate(reason, move |ok| {
-            let _ = sender.send(ok);
-        });
-        cx.spawn(async move |this, cx| {
-            if receiver.await != Ok(true) {
-                let _ = this.update(cx, |this, cx| {
+            crate::later(no, move |this| {
+                let then = then;
+                if !ok {
                     this.settings_note = Some("Passwords stay locked".into());
-                    cx.notify();
-                });
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
+                    return;
+                }
                 this.passwords.unlocked_until = Some(Instant::now() + UNLOCK_FOR);
                 if this.load_vault_key() {
-                    then(this, cx);
+                    (then.0)(this);
                 }
-                cx.notify();
             });
-        })
-        .detach();
+        });
     }
 
     /// Settings → Passwords, below the two switches.
@@ -233,10 +226,10 @@ impl BrowserWindow {
         // Counted over this profile's logins: `health` may still hold another profile's results (ids never collide).
         let checks: Vec<(bool, bool)> = logins.iter().filter_map(|login| self.passwords.health.get(&login.id).copied()).collect();
         let (weak, reused) = checks.iter().fold((0, 0), |(w, r), &(weak, reused)| (w + weak as usize, r + reused as usize));
-        let add = pop.act(|this, cx| this.open_login_editor(None, cx));
-        let import = pop.act(|this, cx| this.import_logins(cx));
-        let export = pop.act(|this, cx| this.with_unlock("export your saved passwords", cx, |this, cx| this.export_logins(cx)));
-        let check = pop.act(|this, cx| this.with_unlock("check your saved passwords", cx, |this, cx| this.check_logins(cx)));
+        let add = pop.act(|this| this.open_login_editor(None));
+        let import = pop.act(|this| this.import_logins());
+        let export = pop.act(|this| this.with_unlock("export your saved passwords", |this| this.export_logins()));
+        let check = pop.act(|this| this.with_unlock("check your saved passwords", |this| this.check_logins()));
         let summary = if logins.is_empty() {
             "No saved passwords yet. They are kept on this Mac only, encrypted with a key in your Keychain.".to_string()
         } else if checks.is_empty() {
@@ -267,7 +260,7 @@ impl BrowserWindow {
             .filter(|login| query.is_empty() || login.origin.to_lowercase().contains(&query) || login.username.to_lowercase().contains(&query))
             .collect();
         if !logins.is_empty() {
-            let search = pop.act(|_, _| {});
+            let search = pop.act(|_| {});
             page.push(Node::Row { gap: 0., children: vec![Node::Width(260., Box::new(field(PASSWORD_SEARCH, "", "Search sites and usernames", search))), Node::Spacer] });
         }
         if !logins.is_empty() && shown.is_empty() {
@@ -295,31 +288,31 @@ impl BrowserWindow {
                     children.push(Node::Card { tint: Ink::Secondary, child: Box::new(Node::Column { gap: 0., pad: (6., 1.), children: vec![text(badge, 10.5, Weight::Regular, Ink::Secondary)] }) });
                 }
             }
-            let reveal = pop.act(move |this, cx| {
+            let reveal = pop.act(move |this| {
                 if this.passwords.unlocked() && this.passwords.revealed.remove(&reveal).is_some() {
                     return;
                 }
                 let id = reveal.clone();
-                this.with_unlock("show a saved password", cx, move |this, cx| {
+                this.with_unlock("show a saved password", move |this| {
                     let profile_id = this.manager_profile();
                     if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
                         this.passwords.revealed.insert(id, password);
                     }
-                    cx.notify();
+                    this.notify();
                 });
             });
-            let copy = pop.act(move |this, cx| {
+            let copy = pop.act(move |this| {
                 let id = copy.clone();
-                this.with_unlock("copy a saved password", cx, move |this, cx| {
+                this.with_unlock("copy a saved password", move |this| {
                     let profile_id = this.manager_profile();
                     if let Ok(Some(password)) = this.model.lock().login_password(&profile_id, &id, None) {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(password));
+                        browser_engine_macos::set_clipboard_text(&password);
                         this.settings_note = Some("Password copied".into());
                     }
-                    cx.notify();
+                    this.notify();
                 });
             });
-            let edit = pop.act(move |this, cx| this.open_login_editor(Some(edit.clone()), cx));
+            let edit = pop.act(move |this| this.open_login_editor(Some(edit.clone())));
             children.extend([
                 Node::Width(140., Box::new(title(revealed.cloned().unwrap_or_else(|| "••••••••".into()), 12., Weight::Regular, Ink::Secondary))),
                 Node::Tool {
@@ -337,7 +330,7 @@ impl BrowserWindow {
         page
     }
 
-    fn check_logins(&mut self, cx: &mut Context<Self>) {
+    fn check_logins(&mut self) {
         let profile_id = self.manager_profile();
         let rows = self.model.lock().logins_with_passwords(&profile_id).unwrap_or_default();
         let reused = passwords::reused(&rows);
@@ -345,25 +338,22 @@ impl BrowserWindow {
             .iter()
             .map(|(login, password)| (login.id.clone(), (passwords::is_weak(password), reused.contains(&login.id))))
             .collect();
-        cx.notify();
+        self.notify();
     }
 
-    fn import_logins(&mut self, cx: &mut Context<Self>) {
-        // gpui's sheet, not runModal: a modal loop inside this click lets the search field's blink timer re-enter gpui and abort.
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            if let Some(path) = paths.into_iter().next() {
-                let _ = this.update(cx, |this, cx| this.import_logins_from(&path, cx));
+    fn import_logins(&mut self) {
+        let no = self.shell.number();
+        browser_engine_macos::choose_path(no, false, move |path| {
+            if let Some(path) = path {
+                crate::update(no, |this| this.import_logins_from(&path));
             }
-        })
-        .detach();
+        });
     }
 
-    fn import_logins_from(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+    fn import_logins_from(&mut self, path: &std::path::Path) {
         if !self.load_vault_key() {
             self.settings_note = Some(self.status.clone());
-            return cx.notify();
+            return self.notify();
         }
         let imported = std::fs::read_to_string(path)
             .map_err(anyhow::Error::from)
@@ -374,51 +364,50 @@ impl BrowserWindow {
                 Ok((self.model.lock().import_logins(&profile_id, rows)?, total))
             });
         self.settings_note = Some(match imported {
-            Ok((taken, total)) if taken == total => format!("Imported {taken} passwords").into(),
-            Ok((taken, total)) => format!("Imported {taken} of {total} passwords; the rest had no web address or password").into(),
-            Err(error) => format!("Import failed: {error}").into(),
+            Ok((taken, total)) if taken == total => format!("Imported {taken} passwords"),
+            Ok((taken, total)) => format!("Imported {taken} of {total} passwords; the rest had no web address or password"),
+            Err(error) => format!("Import failed: {error}"),
         });
         self.passwords.health.clear();
-        cx.notify();
+        self.notify();
     }
 
-    fn export_logins(&mut self, cx: &mut Context<Self>) {
+    fn export_logins(&mut self) {
         let profile_id = self.manager_profile();
         let rows = match self.model.lock().logins_with_passwords(&profile_id) {
             Ok(rows) => rows,
             Err(error) => {
-                self.settings_note = Some(format!("Export failed: {error}").into());
-                return cx.notify();
+                self.settings_note = Some(format!("Export failed: {error}"));
+                return self.notify();
             }
         };
-        // Same re-entrancy as import: gpui's save sheet instead of runModal.
-        let path = cx.prompt_for_new_path(&browser_core::downloads_dir(), Some("Passwords.csv"));
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(path))) = path.await else { return };
-            let _ = this.update(cx, |this, cx| this.write_logins(&path, &rows, cx));
-        })
-        .detach();
+        let no = self.shell.number();
+        browser_engine_macos::save_path(no, &browser_core::downloads_dir(), Some("Passwords.csv"), move |path| {
+            if let Some(path) = path {
+                crate::update(no, |this| this.write_logins(&path, &rows));
+            }
+        });
     }
 
-    fn write_logins(&mut self, path: &std::path::Path, rows: &[(passwords::Login, String)], cx: &mut Context<Self>) {
+    fn write_logins(&mut self, path: &std::path::Path, rows: &[(passwords::Login, String)]) {
         let written = write_private(path, passwords::to_csv(rows).as_bytes());
         self.settings_note = Some(match written {
-            Ok(()) => format!("Exported {} passwords to {}. Anyone who can open that file can read them.", rows.len(), path.display()).into(),
-            Err(error) => format!("Export failed: {error}").into(),
+            Ok(()) => format!("Exported {} passwords to {}. Anyone who can open that file can read them.", rows.len(), path.display()),
+            Err(error) => format!("Export failed: {error}"),
         });
-        cx.notify();
+        self.notify();
     }
 
     /// `None` adds a login; editing shows the password, so it asks for Touch ID first.
-    fn open_login_editor(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+    fn open_login_editor(&mut self, id: Option<String>) {
         let Some(id) = id else {
             for field in [LOGIN_SITE, LOGIN_USER, LOGIN_PASSWORD, LOGIN_NOTE] {
                 self.popover_texts.remove(&field);
             }
             self.passwords.edit = Some(None);
-            return cx.notify();
+            return self.notify();
         };
-        self.with_unlock("edit a saved password", cx, move |this, cx| {
+        self.with_unlock("edit a saved password", move |this| {
             let (login, password) = {
                 let model = this.model.lock();
                 let profile_id = model.active_profile_id.clone();
@@ -433,11 +422,11 @@ impl BrowserWindow {
                 this.popover_texts.insert(field, value);
             }
             this.passwords.edit = Some(Some(id));
-            cx.notify();
+            this.notify();
         });
     }
 
-    pub(crate) fn save_login_edit(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_login_edit(&mut self) {
         let Some(id) = self.passwords.edit.clone() else {
             return;
         };
@@ -447,34 +436,34 @@ impl BrowserWindow {
         let origin = passwords::origin_of(site).or_else(|| passwords::origin_of(&format!("https://{site}")));
         let (Some(origin), false) = (origin, password.is_empty()) else {
             self.settings_note = Some("A login needs a web address and a password".into());
-            return cx.notify();
+            return self.notify();
         };
         if !self.load_vault_key() {
-            return cx.notify();
+            return self.notify();
         }
         let profile_id = self.manager_profile();
         match self.model.lock().save_login(&profile_id, id.as_deref(), &origin, &username, &password, &note) {
             Ok(()) => self.settings_note = Some("Password saved".into()),
-            Err(error) => self.settings_note = Some(format!("Password not saved: {error}").into()),
+            Err(error) => self.settings_note = Some(format!("Password not saved: {error}")),
         }
         self.passwords.edit = None;
         self.passwords.health.clear();
         self.passwords.revealed.clear();
-        cx.notify();
+        self.notify();
     }
 
     pub(crate) fn login_sheet(&self, pop: &mut Pop) -> Node {
         let id = self.passwords.edit.clone().flatten();
-        let save = pop.act(|this, cx| this.save_login_edit(cx));
-        let cancel = pop.act(|this, _| this.passwords.edit = None);
-        let generate = pop.act(|this, _| {
+        let save = pop.act(|this| this.save_login_edit());
+        let cancel = pop.act(|this| this.passwords.edit = None);
+        let generate = pop.act(|this| {
             let password = passwords::generate();
             this.engine.set_popover_field(LOGIN_PASSWORD, &password);
             this.popover_texts.insert(LOGIN_PASSWORD, password);
         });
         let mut buttons = Vec::new();
         if let Some(id) = id.clone() {
-            let delete = pop.act(move |this, _| {
+            let delete = pop.act(move |this| {
                 let profile_id = this.manager_profile();
                 let _ = this.model.lock().delete_login(&profile_id, &id);
                 this.passwords.edit = None;

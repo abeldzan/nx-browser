@@ -146,10 +146,9 @@ mod tests {
 
     #[test]
     fn every_agent_logo_is_bundled() {
-        use gpui::AssetSource;
         for agent in [Agent::Claude, Agent::Codex, Agent::OpenCode, Agent::Gemini, Agent::Cursor, Agent::Copilot, Agent::Amp] {
             if let Some(path) = agent.icon() {
-                assert!(crate::Assets.load(path).ok().flatten().is_some(), "{agent:?}'s logo {path} is missing from Assets::load in lib.rs");
+                assert!(crate::native::asset(path).is_some(), "{agent:?}'s logo {path} is missing from native::asset");
             }
         }
     }

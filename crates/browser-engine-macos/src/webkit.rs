@@ -15,7 +15,7 @@ use crate::extensions::{Extensions, TabNotifier, SCHEME};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
-use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSTrackingArea, NSTrackingAreaOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSBox, NSBoxType, NSFont, NSGlassEffectView, NSImage, NSResponder, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask};
+use objc2_app_kit::{NSAppearance, NSDragOperation, NSPasteboard, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSAutoresizingMaskOptions, NSEvent, NSMenu, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPrintInfo, NSWorkspace, NSEventMask, NSEventModifierFlags, NSEventType, NSBox, NSBoxType, NSFont, NSGlassEffectView, NSImage, NSResponder, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectView, NSView, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask};
 use objc2_core_graphics::{CGColor, CGMutablePath};
 use objc2_security::SecTrust;
 use objc2_quartz_core::{kCAFillRuleEvenOdd, kCAGravityResizeAspectFill, CACornerMask, CAShapeLayer, CATransaction};
@@ -41,7 +41,7 @@ thread_local! {
     static POPUPS: RefCell<HashMap<String, Retained<WKWebView>>> = RefCell::new(HashMap::new());
     /// Muted tabs, kept across windows and page re-creation (a suspended tab comes back muted).
     static MUTED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
-    /// App shortcuts by gpui keystroke (`cmd-shift-t`), shared by every window's key monitor.
+    /// App shortcuts by keystroke (`cmd-shift-t`), shared by every window's key monitor.
     static KEYMAP: RefCell<HashMap<String, Shortcut>> = RefCell::new(HashMap::new());
     /// The page-first shortcut of the last key handed to a page, fired if the page reports it unhandled.
     /// shortcut: a second key pressed before the page's reply overwrites it; key the reply by event if that bites.
@@ -768,7 +768,7 @@ pub struct MacEngine {
     homes: HashMap<String, Retained<NSView>>,
     /// Where each home was last placed (content coordinates), for one made after its first placement.
     home_frames: HashMap<String, Option<NSRect>>,
-    /// Native chrome by key (the rail, …), over the GPUI view: the view placed, and the one holding the content.
+    /// Native chrome by key (the rail, …), over the root view: the view placed, and the one holding the content.
     bars: HashMap<String, (Retained<NSView>, Retained<NSView>)>,
     /// Browser window frames by key, each stacked just above its page.
     frames: HashMap<String, Retained<crate::frame::NxFrameView>>,
@@ -949,7 +949,11 @@ impl MacEngine {
     /// Makes the tab's page first responder, so keys and page shortcuts reach it without a click.
     pub fn focus_page(&mut self, tab_id: &str) {
         // A blank tab's hidden page would take the keys from its new tab page.
-        if self.homes.contains_key(tab_id) {
+        if let Some(home) = self.homes.get(tab_id) {
+            if let (Some(window), true) = (home.window(), home.isKindOfClass(crate::term::NxTermView::class())) {
+                window.makeFirstResponder(Some(home));
+                return;
+            }
             return crate::popover::focus_embed(tab_id);
         }
         let Some(live) = self.tabs.get(tab_id) else {
@@ -1002,7 +1006,7 @@ impl MacEngine {
         }
         let y = if content.isFlipped() { at.1 } else { content.bounds().size.height - at.1 };
         let window_no = self.window_no;
-        // Off the run loop: a menu's tracking loop inside GPUI's event dispatch lets its timers re-enter and abort.
+        // Off the run loop: a menu's tracking loop inside an event handler would re-enter the UI.
         let show = RcBlock::new(move || {
             CONTEXT_MENU_WINDOW.set(window_no);
             menu.popUpMenuPositioningItem_atLocation_inView(None, NSPoint::new(at.0, y), Some(&content));
@@ -1126,13 +1130,13 @@ impl MacEngine {
         unsafe { live.view.isLoading() }.then(|| unsafe { live.view.estimatedProgress() })
     }
 
-    /// Fades the page view; it is a native view, so GPUI opacity does not reach it.
+    /// Fades the page view.
     pub fn set_alpha(&mut self, tab_id: &str, alpha: f64) {
         // Runs every frame for every page; most frames change nothing.
         if let Some(live) = self.tabs.get(tab_id).filter(|live| live.view.alphaValue() != alpha) {
             live.view.setAlphaValue(alpha);
         }
-        if let Some(home) = self.homes.get(tab_id).filter(|home| home.alphaValue() != alpha) {
+        if let Some(home) = self.homes.get(tab_id).filter(|home| home.alphaValue() != alpha && self.owns(home)) {
             home.setAlphaValue(alpha);
         }
     }
@@ -1383,7 +1387,7 @@ impl MacEngine {
         }
         let rects = placed.iter().map(|hole| hole.rect).collect::<Vec<_>>();
         with_window(self.window_no, |state| state.holes = placed);
-        // Mask changes must land in the same frame as the GPUI paint, not animate in.
+        // Mask changes must land in the same frame as the layout, not animate in.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         unsafe {
@@ -1427,7 +1431,7 @@ impl MacEngine {
         CATransaction::commit();
     }
 
-    /// Orders windows back to front, directly below the GPUI chrome view: each one's page (by tab id), then its
+    /// Orders windows back to front, directly below the root view: each one's page (by tab id), then its
     /// frame (by frame key) over it.
     pub fn stack_tabs(&mut self, windows: &[(String, String)]) {
         let ids = windows.iter().flat_map(|(page, frame)| [page.clone(), frame.clone()]).collect::<Vec<_>>();
@@ -1438,7 +1442,9 @@ impl MacEngine {
         self.stacked = ids;
         for (page, frame) in windows {
             if let Some(home) = self.homes.get(page) {
-                self.insert_below_chrome(home);
+                if self.owns(home) {
+                    self.insert_below_chrome(home);
+                }
             } else if let Some(live) = self.tabs.get(page) {
                 self.insert_below_chrome(&live.view);
             }
@@ -1592,11 +1598,34 @@ impl MacEngine {
         crate::popover::embed(self.window_no, tab_id, &container, width, true, content);
     }
 
+    /// Shows `screen` as terminal tab `tab_id`'s page; it goes where `place_tab` puts the tab, like a new tab page.
+    /// A terminal outlives its window (a torn-off tab keeps its shell), so its screen moves into this one.
+    pub fn set_screen(&mut self, tab_id: &str, screen: &crate::TermSurface) {
+        let view = screen.view(tab_id);
+        if self.homes.get(tab_id).is_some_and(|home| *home == view) && self.owns(&view) {
+            return;
+        }
+        if !self.owns(&view) {
+            view.removeFromSuperview();
+        }
+        round_bottom_corners(&view);
+        view.setHidden(true);
+        self.homes.insert(tab_id.to_string(), view.clone());
+        if let Some(Some(frame)) = self.home_frames.get(tab_id).copied() {
+            self.show_home(&view, frame);
+        }
+    }
+
+    /// Whether `view` is in this window, or in none: a terminal's screen another window took over is that one's.
+    fn owns(&self, view: &NSView) -> bool {
+        view.window().is_none_or(|window| window.windowNumber() == self.window_no)
+    }
+
     /// Drops the new tab pages of tabs not in `keep` (navigated away, closed, or in another space).
     pub fn keep_homes(&mut self, keep: &[String]) {
         let gone = self.homes.keys().filter(|id| !keep.contains(id)).cloned().collect::<Vec<_>>();
         for id in gone {
-            if let Some(container) = self.homes.remove(&id) {
+            if let Some(container) = self.homes.remove(&id).filter(|container| self.owns(container)) {
                 container.removeFromSuperview();
             }
             self.home_frames.remove(&id);
@@ -1626,7 +1655,7 @@ impl MacEngine {
         }
     }
 
-    /// Shows `content` as native chrome `key` at `frame` (top-left origin), over the GPUI view; on Liquid Glass
+    /// Shows `content` as native chrome `key` at `frame` (top-left origin), over the root view; on Liquid Glass
     /// with corner `radius` when given. A `frame` 0 wide fits the content, ending at `frame.x`. Rebuilt only when the
     /// content or size changes; returns the width it took.
     /// Puts the window's close, minimize and zoom buttons in a row whose top-left is `at`, or in a column whose
@@ -1687,7 +1716,7 @@ impl MacEngine {
             Some(bar) => bar.clone(),
             None => {
                 let holder = NSView::new(mtm);
-                // Presses on its empty space go on to the GPUI view beneath (the title bar's drag area).
+                // Presses on its empty space go on to the root view beneath (the title bar's drag area).
                 let placed = crate::frame::NxPassView::new(mtm);
                 let inner = match radius {
                     Some(radius) => {
@@ -1759,7 +1788,7 @@ impl MacEngine {
             side.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(frame.width, frame.height)));
             holder.setFrame(side.bounds());
             line.setFrame(NSRect::new(NSPoint::new(frame.width - 1., 0.), NSSize::new(1., frame.height)));
-            // Presses on its empty space go on to the GPUI view beneath, which moves the window.
+            // Presses on its empty space go on to the root view beneath, which moves the window.
             let placed = crate::frame::NxPassView::new(mtm);
             placed.addSubview(&side);
             let placed = Retained::into_super(placed);
@@ -1776,6 +1805,13 @@ impl MacEngine {
     pub fn arrange_list(&self, list: u32, widths: &[f64], hide: Option<usize>, clear: Option<usize>, gap: Option<(usize, f64)>) {
         if let Some(window) = self.content.as_ref().and_then(|view| view.window()) {
             crate::popover::arrange_list(&window, list, widths, hide, clear, gap);
+        }
+    }
+
+    /// Fades native chrome `key` (placed with `set_bar`) to `alpha`.
+    pub fn set_bar_alpha(&self, key: &str, alpha: f64) {
+        if let Some((placed, _)) = self.bars.get(key).filter(|(placed, _)| placed.alphaValue() != alpha) {
+            placed.setAlphaValue(alpha);
         }
     }
 
@@ -1880,8 +1916,8 @@ impl Drop for MacEngine {
 impl WebEngine for MacEngine {
     fn attach(&mut self, ns_view: *mut c_void) -> anyhow::Result<()> {
         let chrome = unsafe { Retained::retain(ns_view as *mut NSView) }
-            .ok_or_else(|| anyhow::anyhow!("GPUI view pointer was null"))?;
-        let window = chrome.window().ok_or_else(|| anyhow::anyhow!("GPUI view has no window"))?;
+            .ok_or_else(|| anyhow::anyhow!("root view pointer was null"))?;
+        let window = chrome.window().ok_or_else(|| anyhow::anyhow!("root view has no window"))?;
         self.window_no = window.windowNumber();
         let events = self.events_tx.clone();
         with_window(self.window_no, |state| state.events = Some(events));
@@ -1891,7 +1927,6 @@ impl WebEngine for MacEngine {
         install_hit_proxy(&chrome);
         if let Some(mtm) = MainThreadMarker::new() {
             install_menu_bar(mtm);
-            track_mouse_moves(&chrome, mtm);
         }
         self.chrome = Some(chrome);
         self.content = Some(content);
@@ -1998,7 +2033,7 @@ impl WebEngine for MacEngine {
                 NSRect::new(NSPoint::new(bounds.x, height - bounds.y - bounds.height.max(1.0)), NSSize::new(bounds.width.max(1.0), bounds.height.max(1.0)))
             });
             self.home_frames.insert(tab_id.to_string(), frame);
-            if let Some(container) = self.homes.get(tab_id).cloned() {
+            if let Some(container) = self.homes.get(tab_id).cloned().filter(|container| self.owns(container)) {
                 match frame {
                     Some(frame) => self.show_home(&container, frame),
                     None if !container.isHidden() => container.setHidden(true),
@@ -2728,16 +2763,6 @@ fn install_page_clicks() -> Option<Retained<AnyObject>> {
     monitor
 }
 
-/// AppKit sends mouse-moved events only to the first responder, so once a page took focus GPUI saw no
-/// moves and its hover states (the window dock, buttons) went dead. A tracking area delivers them regardless.
-fn track_mouse_moves(chrome: &NSView, mtm: MainThreadMarker) {
-    let options = NSTrackingAreaOptions::MouseMoved | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect;
-    let area = unsafe {
-        NSTrackingArea::initWithRect_options_owner_userInfo(mtm.alloc(), NSRect::ZERO, options, Some(chrome), None)
-    };
-    chrome.addTrackingArea(&area);
-}
-
 static CHROME_CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
 
 fn install_hit_proxy(chrome: &NSView) {
@@ -2767,7 +2792,7 @@ fn install_hit_proxy(chrome: &NSView) {
     }
 }
 
-/// The chrome takes file drags except over a page showing through it; GPUI handles them on the window.
+/// The chrome takes link drags except over a page showing through it.
 extern "C-unwind" fn drag_hit_test(this: &AnyObject, _cmd: Sel, point: *mut NSPoint, _types: *mut AnyObject) -> *mut AnyObject {
     let view = unsafe { &*std::ptr::from_ref(this).cast::<NSView>() };
     let (Some(window), Some(point)) = (view.window(), unsafe { point.as_ref() }) else {
@@ -2794,7 +2819,7 @@ fn dragged_link(this: &AnyObject, info: *mut AnyObject) -> Option<(isize, String
     let window = drag_window(this)?;
     let content = window.contentView()?;
     let pasteboard: Retained<NSPasteboard> = unsafe { msg_send![info, draggingPasteboard] };
-    // Files keep going to GPUI's window handlers.
+    // Files go to whatever takes them beneath (a page or a terminal).
     if pasteboard.types().is_some_and(|types| types.containsObject(ns_string!("public.file-url"))) {
         return None;
     }
@@ -2867,7 +2892,7 @@ extern "C-unwind" fn hit_test(this: &AnyObject, _cmd: Sel, point: NSPoint) -> *m
     result
 }
 
-/// AppKit offers Cmd-key combos to every view, so GPUI took Cmd+Z/C/V/D… even while a page had focus.
+/// AppKit offers Cmd-key combos to every view, so the chrome took Cmd+Z/C/V/D… even while a page had focus.
 /// While a page is focused they go to the page (and the Edit menu) instead.
 extern "C-unwind" fn key_equivalent(this: &AnyObject, _cmd: Sel, event: &NSEvent) -> Bool {
     if crate::extensions::perform_command(event) {
@@ -2898,7 +2923,7 @@ fn page_has_focus(event: &NSEvent) -> bool {
     false
 }
 
-/// The event's keys in gpui keystroke form (`ctrl-alt-cmd-shift-key`); None without Cmd or Ctrl,
+/// The event's keys in keystroke form (`ctrl-alt-cmd-shift-key`); None without Cmd or Ctrl,
 /// so plain typing never reaches the keymap.
 fn combo(event: &NSEvent) -> Option<String> {
     let flags = event.modifierFlags();
@@ -2915,7 +2940,7 @@ fn combo(event: &NSEvent) -> Option<String> {
         36 => "enter".into(),
         49 => "space".into(),
         51 => "backspace".into(),
-        // Unshifted, as gpui names keys: Shift+[ is `shift-[`, not `{`.
+        // Unshifted: Shift+[ is `shift-[`, not `{`.
         _ => ns_string(&*event.charactersByApplyingModifiers(NSEventModifierFlags::empty())?).to_lowercase(),
     };
     let mut out = String::new();
@@ -3065,10 +3090,9 @@ thread_local! {
     };
 }
 
-/// GPUI sets no menu bar, and WebKit's copy/paste/undo/select-all only run as Edit menu actions,
-/// so pages never got them. Edit items have no target: they go to whatever has focus.
+/// The menu bar. WebKit's copy/paste/undo/select-all only run as Edit menu actions; Edit items have no target, so
+/// they go to whatever has focus.
 fn install_menu_bar(mtm: MainThreadMarker) {
-    defuse_gpui_menu_handlers();
     let app = NSApplication::sharedApplication(mtm);
     let main = app.mainMenu().unwrap_or_else(|| {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
@@ -3162,7 +3186,7 @@ fn refresh_menu_keys(mtm: MainThreadMarker) {
     }
 }
 
-/// A gpui keystroke (`ctrl-cmd-shift-left`) as an AppKit key equivalent; empty for keys a menu can't show.
+/// A keystroke (`ctrl-cmd-shift-left`) as an AppKit key equivalent; empty for keys a menu can't show.
 fn menu_keys(keys: &str) -> (String, NSEventModifierFlags) {
     let (mut rest, mut mask) = (keys, NSEventModifierFlags::empty());
     let prefixes = [
@@ -3188,30 +3212,6 @@ fn menu_keys(keys: &str) -> (String, NSEventModifierFlags) {
         _ => return (String::new(), NSEventModifierFlags::empty()),
     };
     (key.to_string(), mask)
-}
-
-/// GPUI's app delegate answers `validateMenuItem:` and the edit actions by looking the item's tag up in
-/// its own menu actions, and on a miss locks its platform mutex a second time: a deadlock. We set no
-/// GPUI menus, so it always misses, and the app froze whenever our Edit menu landed on the delegate
-/// (focus outside a web view, or macOS validating the menu bar in the background). Here they disable
-/// the item and do nothing, which is all GPUI could have done for them.
-fn defuse_gpui_menu_handlers() {
-    extern "C-unwind" fn disabled(_: &AnyObject, _: Sel, _: *mut AnyObject) -> Bool {
-        Bool::NO
-    }
-    extern "C-unwind" fn ignore(_: &AnyObject, _: Sel, _: *mut AnyObject) {}
-    let Some(class) = AnyClass::get(c"GPUIApplicationDelegate") else {
-        return;
-    };
-    let class = std::ptr::from_ref(class).cast_mut();
-    unsafe {
-        let disabled: objc2::runtime::Imp = std::mem::transmute(disabled as extern "C-unwind" fn(_, _, _) -> _);
-        objc2::ffi::class_replaceMethod(class, sel!(validateMenuItem:), disabled, c"c@:@".as_ptr());
-        let ignore: objc2::runtime::Imp = std::mem::transmute(ignore as extern "C-unwind" fn(_, _, _));
-        for action in [sel!(cut:), sel!(copy:), sel!(paste:), sel!(selectAll:), sel!(undo:), sel!(redo:), sel!(handleGPUIMenuItem:)] {
-            objc2::ffi::class_replaceMethod(class, action, ignore, c"v@:@".as_ptr());
-        }
-    }
 }
 
 fn menu_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str, shift: bool) -> Retained<NSMenuItem> {

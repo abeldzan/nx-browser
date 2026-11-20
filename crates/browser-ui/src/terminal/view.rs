@@ -1,8 +1,9 @@
-//! A terminal tab's screen: PTY in, alacritty grid + kitty images out (ported from kubenx's workloads.rs).
+//! A terminal tab's screen: PTY in, alacritty grid + kitty images out (ported from kubenx's workloads.rs), drawn by
+//! the engine's native screen view.
 
 use super::agent::{self, Agent, AgentState};
 use super::emu::Emulator;
-use super::input::{key_bytes, mouse_bytes, reports_mouse, MouseAction};
+use super::input::{key_bytes, mouse_bytes, reports_mouse, Keystroke, Modifiers, MouseAction, MouseButton};
 use super::kitty::{Delete, Graphics, Piece, Show, Splitter};
 use super::pty::{self, Pty};
 use alacritty_terminal::grid::Dimensions;
@@ -13,22 +14,24 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
-use futures::StreamExt;
-use gpui::{div, prelude::*, px, App, ClipboardItem, Context, FocusHandle, Focusable, RenderImage, SharedString, Task, Window};
 use browser_core::Settings;
-use gpuikit::theme::{ActiveTheme, Themeable};
+use browser_engine_macos::{TermHost, TermImage, TermInput, TermPaint, TermSpan, TermSurface};
+use futures::StreamExt;
 use portable_pty::PtySize;
-use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
-/// Cell size before the first paint measures the font.
+/// Cell size before the font is measured.
 const CELL_GUESS: (f32, f32) = (7.2, 16.);
+/// Room between the screen's edge and the grid.
+const PAD: f32 = 6.;
 /// Prefix of the hyperlink id that pins an image row to a grid cell, so images move with the text.
 const ANCHOR: &str = "nxkitty:";
 /// shortcut: placements are only forgotten past this count (oldest first), not when their rows leave history.
 const MAX_PLACEMENTS: usize = 512;
+
+/// sRGB with alpha.
+type Rgba = [f64; 4];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PointerGrab {
@@ -38,12 +41,12 @@ enum PointerGrab {
     Report,
 }
 
-/// Pointer state shared with the paint-time event handlers.
 struct Pointer {
-    bounds: Option<gpui::Bounds<gpui::Pixels>>,
     cell: (f32, f32),
     scale: f32,
-    held: Option<(gpui::MouseButton, PointerGrab)>,
+    /// The screen's size in points.
+    size: (f32, f32),
+    held: Option<(MouseButton, PointerGrab)>,
     last_cell: Option<(u16, u16)>,
     /// Wheel lines not yet applied, so slow trackpad swipes still scroll.
     wheel_remainder: f32,
@@ -60,7 +63,7 @@ struct PointerEffect {
 struct Placement {
     key: u64,
     image_id: u32,
-    image: Arc<RenderImage>,
+    image: Rc<TermImage>,
     /// Drawn size in logical pixels.
     size: (f32, f32),
 }
@@ -72,27 +75,38 @@ pub struct TerminalView {
     graphics: Graphics,
     placements: Vec<Placement>,
     next_placement: u64,
-    focus: FocusHandle,
-    pointer: Rc<RefCell<Pointer>>,
-    /// Last grid size applied from the pane, so an unchanged frame does not resize.
-    measured: Rc<Cell<(u16, u16)>>,
+    pointer: Pointer,
     osc_title: Option<String>,
     /// The foreground process group when the title was set (`None`: the shell), so a title dies with its program.
     title_owner: Option<libc::pid_t>,
     /// The coding agent in the foreground and its status, refreshed by the window each tick.
     agent: Option<AgentState>,
-    font: SharedString,
+    font: String,
     font_size: f32,
     line_height: f32,
     /// The shell exited (or never started); the window closes the tab.
     pub exited: bool,
     /// A link Cmd-clicked in the output, for the window to open in a new tab.
     pub open_url: Option<String>,
-    _reader: Option<Task<()>>,
+    /// The native view showing it; shared so the engine can place it without the terminal borrowed.
+    pub(super) surface: Option<Rc<TermSurface>>,
+}
+
+/// Reaches tab `.0`'s terminal from its screen view.
+struct Link(String);
+
+impl TermHost for Link {
+    fn input(&self, input: TermInput) -> bool {
+        super::with(&self.0, |view| view.on_input(input)).unwrap_or(false)
+    }
+
+    fn paint(&self) -> Option<TermPaint> {
+        super::with(&self.0, |view| view.paint())
+    }
 }
 
 impl TerminalView {
-    pub fn new(cwd: &Path, settings: &Settings, cx: &mut Context<Self>) -> Self {
+    pub fn new(tab_id: &str, cwd: &Path, settings: &Settings) -> Self {
         let (rows, cols) = (24, 80);
         let mut view = Self {
             pty: None,
@@ -101,50 +115,36 @@ impl TerminalView {
             graphics: Graphics::default(),
             placements: Vec::new(),
             next_placement: 1,
-            focus: cx.focus_handle(),
-            pointer: Rc::new(RefCell::new(Pointer {
-                bounds: None,
-                cell: CELL_GUESS,
-                scale: 2.,
-                held: None,
-                last_cell: None,
-                wheel_remainder: 0.,
-            })),
-            measured: Rc::new(Cell::new((rows, cols))),
+            pointer: Pointer { cell: CELL_GUESS, scale: 2., size: (0., 0.), held: None, last_cell: None, wheel_remainder: 0. },
             osc_title: None,
             title_owner: None,
             agent: None,
-            font: SharedString::default(),
+            font: String::new(),
             font_size: 0.,
             line_height: 0.,
             exited: false,
             open_url: None,
-            _reader: None,
+            surface: TermSurface::new(Box::new(Link(tab_id.to_string()))).map(Rc::new),
         };
         view.apply_prefs(settings);
         match pty::spawn(&settings.terminal_shell, cwd, view.pty_size(rows, cols)) {
             Ok((pty, mut output)) => {
                 view.pty = Some(pty);
-                view._reader = Some(cx.spawn(async move |this, cx| {
-                    while let Some(mut bytes) = output.next().await {
-                        // Coalesce what already arrived so a flood of output costs one repaint.
+                let id = tab_id.to_string();
+                std::thread::spawn(move || {
+                    while let Some(mut bytes) = futures::executor::block_on(output.next()) {
+                        // Coalesce what already arrived so a flood of output costs one feed.
                         while let Ok(more) = output.try_recv() {
                             bytes.extend_from_slice(&more);
                         }
-                        if this.update(cx, |view, cx| {
-                            view.feed(&bytes);
-                            cx.notify();
-                        })
-                        .is_err()
-                        {
-                            return;
-                        }
+                        let id = id.clone();
+                        // Waits for the main thread, so a flood waits on the screen as it waits on the shell.
+                        dispatch2::DispatchQueue::main().exec_sync(move || super::feed(&id, bytes));
                     }
-                    let _ = this.update(cx, |view, cx| {
-                        view.exited = true;
-                        cx.notify();
+                    dispatch2::DispatchQueue::main().exec_async(move || {
+                        super::with(&id, |view| view.exited = true);
                     });
-                }));
+                });
             }
             Err(error) => {
                 view.emu.feed(format!("Could not start a shell: {error}\r\n").as_bytes());
@@ -154,10 +154,10 @@ impl TerminalView {
         view
     }
 
-    /// Font, cursor and scrollback from settings; the next paint re-measures cells and resizes the grid.
+    /// Font, cursor and scrollback from settings; cells are measured again and the grid refitted.
     pub fn apply_prefs(&mut self, settings: &Settings) {
         let font = settings.terminal_font.trim();
-        self.font = SharedString::from(if font.is_empty() { "Menlo".to_string() } else { font.to_string() });
+        self.font = if font.is_empty() { "Menlo".to_string() } else { font.to_string() };
         self.font_size = (settings.terminal_font_size as f32).clamp(6., 48.);
         self.line_height = (settings.terminal_line_height as f32).clamp(1., 3.);
         let cursor = match settings.terminal_cursor.as_str() {
@@ -166,6 +166,10 @@ impl TerminalView {
             _ => CursorShape::Block,
         };
         self.emu.set_options(settings.terminal_scrollback.clamp(100, 1_000_000), cursor);
+        let (width, height) = browser_engine_macos::cell_size(&self.font, f64::from(self.font_size), f64::from(self.line_height));
+        self.pointer.cell = (width as f32, height as f32);
+        self.fit();
+        self.redraw();
     }
 
     /// What the tab should say: the title the program in front set (an agent's session name), else the agent
@@ -201,9 +205,14 @@ impl TerminalView {
         self.pty.as_ref().and_then(Pty::cwd)
     }
 
+    pub(super) fn redraw(&self) {
+        if let Some(surface) = &self.surface {
+            surface.redraw();
+        }
+    }
+
     fn pty_size(&self, rows: u16, cols: u16) -> PtySize {
-        let pointer = self.pointer.borrow();
-        let (w, h) = (pointer.cell.0 * pointer.scale, pointer.cell.1 * pointer.scale);
+        let (w, h) = (self.pointer.cell.0 * self.pointer.scale, self.pointer.cell.1 * self.pointer.scale);
         // Pixel sizes let icat and yazi size images to the window.
         PtySize { rows, cols, pixel_width: (f32::from(cols) * w) as u16, pixel_height: (f32::from(rows) * h) as u16 }
     }
@@ -215,7 +224,7 @@ impl TerminalView {
     }
 
     /// Runs output through the image filter and the emulator, answering whatever the program asked.
-    fn feed(&mut self, bytes: &[u8]) {
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
         for piece in self.splitter.split(bytes) {
             match piece {
                 Piece::Text(text) => {
@@ -230,27 +239,23 @@ impl TerminalView {
                     let outcome = self.graphics.handle(&command);
                     self.send(&outcome.reply);
                     match outcome.delete {
-                        Some(Delete::All) => {
-                            let gone = std::mem::take(&mut self.placements);
-                            self.graphics.retired.extend(gone.into_iter().map(|placement| placement.image));
-                        }
+                        Some(Delete::All) => self.placements.clear(),
                         Some(Delete::Id(id)) => self.placements.retain(|placement| placement.image_id != id),
                         None => {}
                     }
                     if let Some(show) = outcome.show {
                         self.place(show);
                     }
+                    self.graphics.retired.clear();
                 }
             }
         }
+        self.redraw();
     }
 
     /// Pins an image at the cursor: each row it covers gets an anchor cell, then the cursor moves past it.
     fn place(&mut self, show: Show) {
-        let (cell, scale) = {
-            let pointer = self.pointer.borrow();
-            (pointer.cell, pointer.scale)
-        };
+        let (cell, scale) = (self.pointer.cell, self.pointer.scale);
         let natural = (show.size.0 as f32 / scale, show.size.1 as f32 / scale);
         let aspect = natural.1 / natural.0.max(1.);
         let size = match (show.cols, show.rows) {
@@ -284,9 +289,19 @@ impl TerminalView {
         }
         self.placements.push(Placement { key, image_id: show.image_id, image: show.image, size });
         if self.placements.len() > MAX_PLACEMENTS {
-            let old = self.placements.remove(0);
-            self.graphics.retired.push(old.image);
+            self.placements.remove(0);
         }
+    }
+
+    /// Fits the grid to the screen's size.
+    fn fit(&mut self) {
+        let ((width, height), (cell_w, cell_h)) = (self.pointer.size, self.pointer.cell);
+        if width <= 0. || height <= 0. {
+            return;
+        }
+        let cols = ((width - 2. * PAD) / cell_w).floor().clamp(2., 500.) as u16;
+        let rows = ((height - 2. * PAD) / cell_h).floor().clamp(2., 200.) as u16;
+        self.resize(rows, cols);
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -302,24 +317,60 @@ impl TerminalView {
         }
     }
 
-    fn on_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
-        let keys = &event.keystroke;
+    /// Handles what the screen view reports; false if it went unused.
+    fn on_input(&mut self, input: TermInput) -> bool {
+        let effect = match input {
+            TermInput::Key(keystroke) => return self.on_key(&keystroke),
+            TermInput::Down { button, x, y, clicks, modifiers } => self.mouse_down(button, (x, y), clicks, &modifiers),
+            TermInput::Drag { x, y, modifiers, .. } => self.mouse_drag((x, y), &modifiers),
+            TermInput::Up { button, x, y, modifiers } => self.mouse_up(button, (x, y), &modifiers),
+            TermInput::Move { x, y, modifiers } => self.mouse_move((x, y), &modifiers),
+            TermInput::Scroll { dy, precise, x, y, modifiers } => self.scroll_wheel(dy as f32, precise, (x, y), &modifiers),
+            // Dropped files arrive as typed paths, like Terminal.app; CLI agents spot image paths and attach them.
+            TermInput::Drop(paths) => {
+                let bytes = paste_bytes(&dropped_paths(&paths), self.emu.bracketed_paste());
+                self.write_input(&bytes);
+                return true;
+            }
+            TermInput::Copy => {
+                self.copy();
+                return true;
+            }
+            TermInput::Paste => {
+                self.paste();
+                return true;
+            }
+            TermInput::Resize { width, height, scale } => {
+                self.pointer.size = (width as f32, height as f32);
+                self.pointer.scale = scale as f32;
+                self.fit();
+                PointerEffect { redraw: true, consumed: true }
+            }
+        };
+        if effect.redraw {
+            self.redraw();
+        }
+        effect.consumed
+    }
+
+    fn on_key(&mut self, keys: &Keystroke) -> bool {
         let m = &keys.modifiers;
         let copy = (m.platform && !m.shift && keys.key == "c") || (m.control && m.shift && keys.key == "c");
         let paste = (m.platform && !m.shift && keys.key == "v") || (m.control && m.shift && keys.key == "v");
         if copy {
-            self.copy(cx);
-            cx.stop_propagation();
-            return;
+            self.copy();
+            return true;
         }
         if paste {
-            self.paste(cx);
-            cx.stop_propagation();
-            return;
+            self.paste();
+            return true;
         }
-        if let Some(bytes) = key_bytes(event, self.emu.mode()) {
-            self.write_input(&bytes, cx);
-            cx.stop_propagation();
+        match key_bytes(keys, self.emu.mode()) {
+            Some(bytes) => {
+                self.write_input(&bytes);
+                true
+            }
+            None => false,
         }
     }
 
@@ -327,55 +378,52 @@ impl TerminalView {
         self.emu.selection_range().is_some()
     }
 
-    pub fn copy(&mut self, cx: &mut Context<Self>) {
+    pub fn copy(&mut self) {
         if let Some(text) = self.emu.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            browser_engine_macos::set_clipboard_text(&text);
         }
     }
 
-    pub fn paste(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            match item.text() {
-                Some(text) => {
-                    let bytes = paste_bytes(&text, self.emu.bracketed_paste());
-                    self.write_input(&bytes, cx);
-                }
-                // An image (a screenshot): Ctrl+V makes agent CLIs read it from the clipboard and attach it.
-                None => self.write_input(&[0x16], cx),
+    pub fn paste(&mut self) {
+        match browser_engine_macos::clipboard_text() {
+            Ok(text) => {
+                let bytes = paste_bytes(&text, self.emu.bracketed_paste());
+                self.write_input(&bytes);
             }
+            // An image (a screenshot): Ctrl+V makes agent CLIs read it from the clipboard and attach it.
+            Err(true) => self.write_input(&[0x16]),
+            Err(false) => {}
         }
     }
 
     /// Wipes the screen and scrollback, then sends Ctrl+L so the shell redraws its prompt at the top.
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
+    pub fn clear(&mut self) {
         // A full-screen program (vim, htop) owns the screen and would just be redrawn over.
         if self.emu.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
         self.feed(b"\x1b[H\x1b[2J\x1b[3J");
-        self.write_input(&[0x0c], cx);
+        self.write_input(&[0x0c]);
     }
 
-    fn write_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    fn write_input(&mut self, bytes: &[u8]) {
         self.emu.clear_selection();
         self.emu.scroll_to_bottom();
         self.send(bytes);
-        cx.notify();
+        self.redraw();
     }
 
-    /// The viewport cell under a window position and which half of it,
+    /// The viewport cell under a screen position and which half of it,
     /// clamped to the grid so a drag past an edge keeps extending.
-    fn cell_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<(u16, u16, Side)> {
-        let pointer = self.pointer.borrow();
-        let bounds = pointer.bounds?;
-        let (cell_w, cell_h) = pointer.cell;
+    fn cell_at(&self, (x, y): (f64, f64)) -> (u16, u16, Side) {
+        let (cell_w, cell_h) = self.pointer.cell;
         let (rows, cols) = self.emu.size();
-        let x = f32::from(position.x - bounds.left()) / cell_w;
-        let y = f32::from(position.y - bounds.top()) / cell_h;
+        let x = (x as f32 - PAD) / cell_w;
+        let y = (y as f32 - PAD) / cell_h;
         let col = x.floor().clamp(0., f32::from(cols - 1)) as u16;
         let row = y.floor().clamp(0., f32::from(rows - 1)) as u16;
         let side = if x >= f32::from(cols) || (x >= 0. && x.fract() >= 0.5) { Side::Right } else { Side::Left };
-        Some((row, col, side))
+        (row, col, side)
     }
 
     /// The http(s) link under a cell: an OSC 8 hyperlink, else a URL in the text (following wrapped lines).
@@ -393,108 +441,92 @@ impl TerminalView {
     }
 
     /// Mouse reports go to the program unless Shift forces local selection.
-    fn reports(&self, action: MouseAction, modifiers: &gpui::Modifiers) -> bool {
+    fn reports(&self, action: MouseAction, modifiers: &Modifiers) -> bool {
         !self.exited && !modifiers.shift && reports_mouse(self.emu.mode(), action)
     }
 
-    fn mouse_down(&mut self, event: &gpui::MouseDownEvent) -> PointerEffect {
-        let Some((row, col, side)) = self.cell_at(event.position) else {
-            return PointerEffect::default();
-        };
+    fn mouse_down(&mut self, button: MouseButton, at: (f64, f64), clicks: isize, modifiers: &Modifiers) -> PointerEffect {
+        let (row, col, side) = self.cell_at(at);
         // Before mouse reporting, so links open inside vim or tmux too.
-        if event.button == gpui::MouseButton::Left && event.modifiers.platform {
+        if button == MouseButton::Left && modifiers.platform {
             if let Some(url) = self.url_at(row, col) {
                 self.open_url = Some(url);
                 return PointerEffect { redraw: true, consumed: true };
             }
         }
-        let press = MouseAction::Press(event.button);
-        if self.reports(press, &event.modifiers) {
-            if let Some(bytes) = mouse_bytes(press, row, col, &event.modifiers, self.emu.mode()) {
+        let press = MouseAction::Press(button);
+        if self.reports(press, modifiers) {
+            if let Some(bytes) = mouse_bytes(press, row, col, modifiers, self.emu.mode()) {
                 self.send(&bytes);
             }
-            let mut pointer = self.pointer.borrow_mut();
-            pointer.held = Some((event.button, PointerGrab::Report));
-            pointer.last_cell = Some((row, col));
+            self.pointer.held = Some((button, PointerGrab::Report));
+            self.pointer.last_cell = Some((row, col));
             return PointerEffect { redraw: false, consumed: true };
         }
-        if event.button != gpui::MouseButton::Left {
+        if button != MouseButton::Left {
             return PointerEffect::default();
         }
-        let kind = match event.click_count {
+        let kind = match clicks {
             0 | 1 => SelectionType::Simple,
             2 => SelectionType::Semantic,
             _ => SelectionType::Lines,
         };
         self.emu.start_selection(kind, row, col, side);
-        self.pointer.borrow_mut().held = Some((event.button, PointerGrab::Select));
+        self.pointer.held = Some((button, PointerGrab::Select));
         PointerEffect { redraw: true, consumed: true }
     }
 
-    fn mouse_move(&mut self, event: &gpui::MouseMoveEvent) -> PointerEffect {
-        let held = self.pointer.borrow().held;
-        let Some((button, grab)) = held else {
-            // Hover motion only matters to programs that asked for it.
-            let inside = self.pointer.borrow().bounds.is_some_and(|bounds| bounds.contains(&event.position));
-            if inside && self.reports(MouseAction::Move, &event.modifiers) {
-                if let Some((row, col, _)) = self.cell_at(event.position) {
-                    self.report_motion(MouseAction::Move, row, col, &event.modifiers);
-                }
-            }
-            return PointerEffect::default();
-        };
-        if event.pressed_button.is_none() {
-            // The release happened outside the window.
-            self.pointer.borrow_mut().held = None;
-            return PointerEffect::default();
+    /// Hover motion only matters to programs that asked for it.
+    fn mouse_move(&mut self, at: (f64, f64), modifiers: &Modifiers) -> PointerEffect {
+        if self.pointer.held.is_none() && self.reports(MouseAction::Move, modifiers) {
+            let (row, col, _) = self.cell_at(at);
+            self.report_motion(MouseAction::Move, row, col, modifiers);
         }
-        let Some((row, col, side)) = self.cell_at(event.position) else {
+        PointerEffect::default()
+    }
+
+    fn mouse_drag(&mut self, at: (f64, f64), modifiers: &Modifiers) -> PointerEffect {
+        let Some((button, grab)) = self.pointer.held else {
             return PointerEffect::default();
         };
+        let (row, col, side) = self.cell_at(at);
         match grab {
             PointerGrab::Select => {
                 self.emu.update_selection(row, col, side);
                 PointerEffect { redraw: true, consumed: true }
             }
             PointerGrab::Report => {
-                self.report_motion(MouseAction::Drag(button), row, col, &event.modifiers);
+                self.report_motion(MouseAction::Drag(button), row, col, modifiers);
                 PointerEffect { redraw: false, consumed: true }
             }
         }
     }
 
     /// Motion is reported once per cell, not once per pixel.
-    fn report_motion(&mut self, action: MouseAction, row: u16, col: u16, modifiers: &gpui::Modifiers) {
-        if self.pointer.borrow().last_cell == Some((row, col)) {
+    fn report_motion(&mut self, action: MouseAction, row: u16, col: u16, modifiers: &Modifiers) {
+        if self.pointer.last_cell == Some((row, col)) {
             return;
         }
-        self.pointer.borrow_mut().last_cell = Some((row, col));
+        self.pointer.last_cell = Some((row, col));
         if let Some(bytes) = mouse_bytes(action, row, col, modifiers, self.emu.mode()) {
             self.send(&bytes);
         }
     }
 
-    fn mouse_up(&mut self, event: &gpui::MouseUpEvent) -> PointerEffect {
-        let held = self.pointer.borrow().held;
-        let Some((button, grab)) = held.filter(|(button, _)| *button == event.button) else {
+    fn mouse_up(&mut self, button: MouseButton, at: (f64, f64), modifiers: &Modifiers) -> PointerEffect {
+        let Some((button, grab)) = self.pointer.held.filter(|(held, _)| *held == button) else {
             return PointerEffect::default();
         };
-        let cell = self.cell_at(event.position);
-        {
-            let mut pointer = self.pointer.borrow_mut();
-            pointer.held = None;
-            pointer.last_cell = None;
-        }
-        let Some((row, col, side)) = cell else {
-            return PointerEffect::default();
-        };
+        self.pointer.held = None;
+        self.pointer.last_cell = None;
+        let (row, col, side) = self.cell_at(at);
         match grab {
             PointerGrab::Select => {
                 self.emu.update_selection(row, col, side);
                 PointerEffect { redraw: true, consumed: true }
             }
             PointerGrab::Report => {
-                if let Some(bytes) = mouse_bytes(MouseAction::Release(button), row, col, &event.modifiers, self.emu.mode()) {
+                if let Some(bytes) = mouse_bytes(MouseAction::Release(button), row, col, modifiers, self.emu.mode()) {
                     self.send(&bytes);
                 }
                 PointerEffect { redraw: false, consumed: true }
@@ -504,19 +536,12 @@ impl TerminalView {
 
     /// Wheel: report to a program that wants the mouse, send arrow keys on
     /// the alternate screen (less, vim), otherwise walk the scrollback.
-    fn scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent) -> PointerEffect {
-        let cell_h = self.pointer.borrow().cell.1;
-        let delta = match event.delta {
-            gpui::ScrollDelta::Lines(p) => p.y,
-            gpui::ScrollDelta::Pixels(p) => f32::from(p.y) / cell_h,
-        };
-        let lines = {
-            let mut pointer = self.pointer.borrow_mut();
-            pointer.wheel_remainder += delta;
-            let whole = pointer.wheel_remainder.trunc();
-            pointer.wheel_remainder -= whole;
-            whole as i32
-        };
+    fn scroll_wheel(&mut self, dy: f32, precise: bool, at: (f64, f64), modifiers: &Modifiers) -> PointerEffect {
+        let delta = if precise { dy / self.pointer.cell.1 } else { dy };
+        self.pointer.wheel_remainder += delta;
+        let whole = self.pointer.wheel_remainder.trunc();
+        self.pointer.wheel_remainder -= whole;
+        let lines = whole as i32;
         let consumed = PointerEffect { redraw: false, consumed: true };
         if lines == 0 {
             return consumed;
@@ -525,9 +550,9 @@ impl TerminalView {
         let action = if lines > 0 { MouseAction::WheelUp } else { MouseAction::WheelDown };
         let mode = self.emu.mode();
         let count = lines.unsigned_abs().min(20) as usize;
-        if self.reports(action, &event.modifiers) {
-            let (row, col, _) = self.cell_at(event.position).unwrap_or((0, 0, Side::Left));
-            if let Some(bytes) = mouse_bytes(action, row, col, &event.modifiers, mode) {
+        if self.reports(action, modifiers) {
+            let (row, col, _) = self.cell_at(at);
+            if let Some(bytes) = mouse_bytes(action, row, col, modifiers, mode) {
                 self.send(&bytes.repeat(count));
             }
             return consumed;
@@ -545,154 +570,44 @@ impl TerminalView {
         self.emu.scroll_by(lines);
         PointerEffect { redraw: true, consumed: true }
     }
-}
 
-impl Focusable for TerminalView {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
-    }
-}
-
-/// Runs a pointer handler on the view and redraws if it asks.
-fn pointer_event(view: &gpui::WeakEntity<TerminalView>, cx: &mut App, handler: impl FnOnce(&mut TerminalView) -> PointerEffect) -> PointerEffect {
-    view.update(cx, |view, cx| {
-        let effect = handler(view);
-        if effect.redraw {
-            cx.notify();
-        }
-        effect
-    })
-    .unwrap_or_default()
-}
-
-impl Render for TerminalView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (fg, bg, accent) = (theme.fg(), theme.bg(), theme.accent());
-        let base = gpui::font(self.font.clone());
-        let fonts = [base.clone(), base.clone().bold(), base.clone().italic(), base.bold().italic()];
-        let font_size = self.font_size;
-        let (cell_w, cell_h) = mono_cell(window, &fonts[0], font_size, self.line_height);
-        let TermFrame { spans, backgrounds, cursor, images } = terminal_frame(&self.emu, &self.placements, fg, bg, accent, &fonts);
-        let retired = std::mem::take(&mut self.graphics.retired);
-        let pointer = self.pointer.clone();
-        let measured = self.measured.clone();
-        let weak = cx.entity().downgrade();
-        let (move_view, up_view, resize_view) = (weak.clone(), weak.clone(), weak.clone());
-        let on_down = |view: gpui::WeakEntity<TerminalView>, focus: FocusHandle| {
-            move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
-                focus.focus(window, cx);
-                pointer_event(&view, cx, |term| term.mouse_down(event));
-            }
-        };
-        div()
-            .id("terminal-screen")
-            .key_context("Terminal")
-            .track_focus(&self.focus)
-            .size_full()
-            .p(px(6.))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.on_key(event, cx)))
-            // Dropped files arrive as typed paths, like Terminal.app; CLI agents spot image paths and attach them.
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
-                this.focus.focus(window, cx);
-                let bytes = paste_bytes(&dropped_paths(paths.paths()), this.emu.bracketed_paste());
-                this.write_input(&bytes, cx);
-            }))
-            .on_mouse_down(gpui::MouseButton::Left, on_down(weak.clone(), self.focus.clone()))
-            .on_mouse_down(gpui::MouseButton::Middle, on_down(weak.clone(), self.focus.clone()))
-            // A right click no program asked for goes on up to the window's terminal menu.
-            .on_mouse_down(gpui::MouseButton::Right, {
-                let focus = self.focus.clone();
-                move |event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
-                    focus.focus(window, cx);
-                    if pointer_event(&weak, cx, |term| term.mouse_down(event)).consumed {
-                        cx.stop_propagation();
-                    }
-                }
+    /// The screen as it should look now.
+    fn paint(&mut self) -> TermPaint {
+        let [fg, bg, accent] = super::colors();
+        let TermFrame { spans, backgrounds, cursor, images } = terminal_frame(&self.emu, &self.placements, fg, bg, accent);
+        let (cell_w, cell_h) = self.pointer.cell;
+        let at = |col: f32, row: f32| (f64::from(PAD + col * cell_w), f64::from(PAD + row * cell_h));
+        let mut rects = backgrounds
+            .iter()
+            .map(|run| {
+                let (x, y) = at(f32::from(run.col), f32::from(run.row));
+                (x, y, f64::from(f32::from(run.cols) * cell_w), f64::from(cell_h), run.color)
             })
-            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
-                if this.scroll_wheel(event).redraw {
-                    cx.notify();
-                }
-                cx.stop_propagation();
-            }))
-            .child(
-                gpui::canvas(
-                    move |bounds, window, cx| {
-                        {
-                            let mut pointer = pointer.borrow_mut();
-                            pointer.bounds = Some(bounds);
-                            pointer.cell = (cell_w, cell_h);
-                            pointer.scale = window.scale_factor();
-                        }
-                        let cols = (f32::from(bounds.size.width) / cell_w).floor().clamp(2., 500.) as u16;
-                        let rows = (f32::from(bounds.size.height) / cell_h).floor().clamp(2., 200.) as u16;
-                        let laid_out = bounds.size.width > px(0.) && bounds.size.height > px(0.);
-                        if laid_out && measured.get() != (rows, cols) {
-                            measured.set((rows, cols));
-                            cx.defer(move |cx| {
-                                let _ = resize_view.update(cx, |view, cx| {
-                                    view.resize(rows, cols);
-                                    cx.notify();
-                                });
-                            });
-                        }
-                    },
-                    move |bounds, (), window, cx| {
-                        for image in retired {
-                            let _ = window.drop_image(image);
-                        }
-                        let at = |col: f32, row: f32| gpui::point(bounds.left() + px(col * cell_w), bounds.top() + px(row * cell_h));
-                        for run in &backgrounds {
-                            let size = gpui::size(px(f32::from(run.cols) * cell_w), px(cell_h));
-                            window.paint_quad(gpui::fill(gpui::Bounds::new(at(f32::from(run.col), f32::from(run.row)), size), run.color));
-                        }
-                        for image in &images {
-                            let place = gpui::Bounds::new(at(f32::from(image.col), image.row), gpui::size(px(image.size.0), px(image.size.1)));
-                            let _ = window.paint_image(bounds, place, gpui::Corners::default(), image.image.clone(), 0, false);
-                        }
-                        for span in &spans {
-                            let shaped = window.text_system().shape_line(span.text.clone(), px(font_size), std::slice::from_ref(&span.run), None);
-                            let _ = shaped.paint(at(f32::from(span.col), f32::from(span.row)), px(cell_h), gpui::TextAlign::Left, None, window, cx);
-                        }
-                        if let Some(bar) = &cursor {
-                            let origin = at(f32::from(bar.col), f32::from(bar.row));
-                            let (origin, size) = if bar.underline {
-                                (gpui::point(origin.x, origin.y + px(cell_h - 2.)), gpui::size(px(f32::from(bar.cols) * cell_w), px(2.)))
-                            } else {
-                                (origin, gpui::size(px(2.), px(cell_h)))
-                            };
-                            window.paint_quad(gpui::fill(gpui::Bounds::new(origin, size), bar.color));
-                        }
-                        // Drags and releases are tracked window-wide so a selection
-                        // keeps extending, and a reported press ends, outside the pane.
-                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
-                            if phase == gpui::DispatchPhase::Bubble && pointer_event(&move_view, cx, |term| term.mouse_move(event)).consumed {
-                                cx.stop_propagation();
-                            }
-                        });
-                        window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _, cx| {
-                            if phase == gpui::DispatchPhase::Bubble && pointer_event(&up_view, cx, |term| term.mouse_up(event)).consumed {
-                                cx.stop_propagation();
-                            }
-                        });
-                    },
-                )
-                .size_full(),
-            )
+            .collect::<Vec<_>>();
+        if let Some(bar) = &cursor {
+            let (x, y) = at(f32::from(bar.col), f32::from(bar.row));
+            rects.push(if bar.underline {
+                (x, y + f64::from(cell_h - 2.), f64::from(f32::from(bar.cols) * cell_w), 2., bar.color)
+            } else {
+                (x, y, 2., f64::from(cell_h), bar.color)
+            });
+        }
+        let images = images
+            .into_iter()
+            .map(|image| {
+                let (x, y) = at(f32::from(image.col), image.row);
+                (x, y, f64::from(image.size.0), f64::from(image.size.1), image.image)
+            })
+            .collect();
+        let spans = spans
+            .into_iter()
+            .map(|span| {
+                let (x, y) = at(f32::from(span.col), f32::from(span.row));
+                TermSpan { x, y, text: span.text, font: span.font, color: span.color, underline: span.underline, strike: span.strike }
+            })
+            .collect();
+        TermPaint { font: self.font.clone(), size: f64::from(self.font_size), line_h: f64::from(cell_h), background: bg, rects, spans, images }
     }
-}
-
-/// Cell size for the monospace font: the real glyph advance when it resolves, else 0.6em.
-fn mono_cell(window: &Window, font: &gpui::Font, size: f32, line_height: f32) -> (f32, f32) {
-    let system = window.text_system();
-    let width = system
-        .advance(system.resolve_font(font), px(size), 'm')
-        .ok()
-        .map(|advance| f32::from(advance.width))
-        .filter(|w| *w > 1.)
-        .unwrap_or(size * 0.6);
-    (width, (size * line_height).round())
 }
 
 /// `~/dev/app` for a tab label.
@@ -747,14 +662,19 @@ struct TermBgRun {
     row: u16,
     col: u16,
     cols: u16,
-    color: gpui::Hsla,
+    color: Rgba,
 }
 
 struct GlyphSpan {
     row: u16,
     col: u16,
-    text: SharedString,
-    run: gpui::TextRun,
+    text: String,
+    /// 0 regular, 1 bold, 2 italic, 3 bold italic.
+    font: usize,
+    color: Rgba,
+    /// 0 none, 1 straight, 2 wavy.
+    underline: u8,
+    strike: bool,
 }
 
 /// A cursor drawn as a thin bar; a block cursor is a colour swap on its cell.
@@ -763,7 +683,7 @@ struct TermCursor {
     col: u16,
     cols: u16,
     underline: bool,
-    color: gpui::Hsla,
+    color: Rgba,
 }
 
 /// An image to draw; `row` may be negative when its top has scrolled above the viewport.
@@ -771,7 +691,7 @@ struct ImageDraw {
     row: f32,
     col: u16,
     size: (f32, f32),
-    image: Arc<RenderImage>,
+    image: Rc<TermImage>,
 }
 
 struct TermFrame {
@@ -785,33 +705,20 @@ struct OpenSpan {
     col: u16,
     text: String,
     font_index: usize,
-    color: gpui::Hsla,
+    color: Rgba,
     /// 0 none, 1 straight, 2 wavy.
     underline: u8,
     strike: bool,
 }
 
-fn flush_span(open: &mut Option<OpenSpan>, row: u16, spans: &mut Vec<GlyphSpan>, fonts: &[gpui::Font; 4]) {
+fn flush_span(open: &mut Option<OpenSpan>, row: u16, spans: &mut Vec<GlyphSpan>) {
     let Some(open) = open.take().filter(|open| !open.text.is_empty()) else {
         return;
     };
-    let len = open.text.len();
-    spans.push(GlyphSpan {
-        row,
-        col: open.col,
-        text: SharedString::from(open.text),
-        run: gpui::TextRun {
-            len,
-            font: fonts[open.font_index].clone(),
-            color: open.color,
-            background_color: None,
-            underline: (open.underline > 0).then(|| gpui::UnderlineStyle { thickness: px(1.), color: Some(open.color), wavy: open.underline == 2 }),
-            strikethrough: open.strike.then(|| gpui::StrikethroughStyle { thickness: px(1.), color: Some(open.color) }),
-        },
-    });
+    spans.push(GlyphSpan { row, col: open.col, text: open.text, font: open.font_index, color: open.color, underline: open.underline, strike: open.strike });
 }
 
-fn push_bg(runs: &mut Vec<TermBgRun>, row: u16, col: u16, cols: u16, color: gpui::Hsla, default_bg: gpui::Hsla) {
+fn push_bg(runs: &mut Vec<TermBgRun>, row: u16, col: u16, cols: u16, color: Rgba, default_bg: Rgba) {
     if color == default_bg {
         return;
     }
@@ -828,7 +735,7 @@ fn push_bg(runs: &mut Vec<TermBgRun>, row: u16, col: u16, cols: u16, color: gpui
 ///
 /// A shell row is a handful of spans, each placed on its column, instead of
 /// one element per cell.
-fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hsla, bg_default: gpui::Hsla, accent: gpui::Hsla, fonts: &[gpui::Font; 4]) -> TermFrame {
+fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: Rgba, bg_default: Rgba, accent: Rgba) -> TermFrame {
     let content = emu.term().renderable_content();
     let offset = content.display_offset as i32;
     let colors = content.colors;
@@ -849,7 +756,7 @@ fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hs
         };
         let col = indexed.point.column.0 as u16;
         if row != open_row {
-            flush_span(&mut open, open_row, &mut spans, fonts);
+            flush_span(&mut open, open_row, &mut spans);
             open_row = row;
         }
         let cell = indexed.cell;
@@ -898,7 +805,7 @@ fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hs
         let strike = flags.contains(Flags::STRIKEOUT);
         let blank = flags.contains(Flags::HIDDEN) || ((cell.c == ' ' || cell.c == '\0') && underline == 0 && !strike);
         if blank {
-            flush_span(&mut open, row, &mut spans, fonts);
+            flush_span(&mut open, row, &mut spans);
             continue;
         }
         let font_index = match (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC)) {
@@ -911,7 +818,7 @@ fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hs
             .as_ref()
             .is_some_and(|span| span.font_index == font_index && span.color == fg && span.underline == underline && span.strike == strike);
         if !continues {
-            flush_span(&mut open, row, &mut spans, fonts);
+            flush_span(&mut open, row, &mut spans);
             open = Some(OpenSpan { col, text: String::new(), font_index, color: fg, underline, strike });
         }
         if let Some(span) = open.as_mut() {
@@ -921,10 +828,10 @@ fn terminal_frame(emu: &Emulator, placements: &[Placement], fg_default: gpui::Hs
             }
         }
         if width == 2 {
-            flush_span(&mut open, row, &mut spans, fonts);
+            flush_span(&mut open, row, &mut spans);
         }
     }
-    flush_span(&mut open, open_row, &mut spans, fonts);
+    flush_span(&mut open, open_row, &mut spans);
     TermFrame { spans, backgrounds, cursor: bar, images }
 }
 
@@ -952,22 +859,28 @@ fn anchor(id: &str) -> Option<(u64, usize)> {
 }
 
 /// A colour faded toward the background, for SGR 2 and the dim palette.
-fn dimmed(color: gpui::Hsla, bg: gpui::Hsla) -> gpui::Hsla {
-    bg.blend(gpui::Hsla { a: 0.6, ..color })
+fn dimmed(color: Rgba, bg: Rgba) -> Rgba {
+    std::array::from_fn(|i| if i == 3 { 1. } else { color[i] * 0.6 + bg[i] * 0.4 })
 }
 
-fn rgb_hsla(rgb: Rgb) -> gpui::Hsla {
-    gpui::rgb((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32).into()
+fn rgb_color(rgb: Rgb) -> Rgba {
+    hex((rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32)
 }
 
-fn terminal_color(color: AnsiColor, colors: &Colors, fg_default: gpui::Hsla, bg_default: gpui::Hsla) -> gpui::Hsla {
+/// `0xRRGGBB`, opaque.
+fn hex(value: u32) -> Rgba {
+    let channel = |shift: u32| f64::from((value >> shift) & 0xff) / 255.;
+    [channel(16), channel(8), channel(0), 1.]
+}
+
+fn terminal_color(color: AnsiColor, colors: &Colors, fg_default: Rgba, bg_default: Rgba) -> Rgba {
     match color {
-        AnsiColor::Spec(rgb) => rgb_hsla(rgb),
-        AnsiColor::Indexed(index) => colors[usize::from(index)].map(rgb_hsla).unwrap_or_else(|| indexed_color(index)),
+        AnsiColor::Spec(rgb) => rgb_color(rgb),
+        AnsiColor::Indexed(index) => colors[usize::from(index)].map(rgb_color).unwrap_or_else(|| indexed_color(index)),
         AnsiColor::Named(named) => {
             // A program can repaint any slot with OSC 4/10/11.
             if let Some(rgb) = colors[named] {
-                return rgb_hsla(rgb);
+                return rgb_color(rgb);
             }
             match named {
                 NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::Cursor => fg_default,
@@ -988,7 +901,7 @@ fn terminal_color(color: AnsiColor, colors: &Colors, fg_default: gpui::Hsla, bg_
 }
 
 /// The xterm 256-colour palette: 16 ANSI, a 6x6x6 cube, then a grey ramp.
-fn indexed_color(index: u8) -> gpui::Hsla {
+fn indexed_color(index: u8) -> Rgba {
     const PALETTE: [u32; 16] = [
         0x111111, 0xcc5555, 0x55aa55, 0xaaaa55, 0x5555cc, 0xaa55aa, 0x55aaaa, 0xcccccc, 0x555555, 0xff7777, 0x77ff77, 0xffff77, 0x7777ff, 0xff77ff, 0x77ffff,
         0xffffff,
@@ -1003,7 +916,7 @@ fn indexed_color(index: u8) -> gpui::Hsla {
         let v = 8 + (index as u32 - 232) * 10;
         v << 16 | v << 8 | v
     };
-    gpui::rgb(value).into()
+    hex(value)
 }
 
 #[cfg(test)]

@@ -12,23 +12,16 @@ use browser_core::{
 use browser_engine::{DialogKind, Dir, EngineEvent, EngineSettings, Hole, LogicalRect, Notch, ScreenshotArea, Shortcut, WebEngine};
 use browser_engine_macos::{Extensions, LiveTab, MacEngine, EXTENSION_SCHEME};
 use browser_extensions::{discover, install_from_store, local_id, patch_missing_apis, patch_unpacked_copy, read_manifest, store_id, Manifest};
-use gpui::{
-    canvas, div, prelude::*, px, Context, Entity, FocusHandle,
-    Focusable, MouseButton, MouseDownEvent, Pixels, Render, SharedString,
-    Subscription, Task, Window,
-};
+use crate::geom::{point, size, Bounds, Point, Size};
+use browser_engine_macos::ShellWindow;
 use crate::settings::logical;
 use tiling::{cell, move_border, neighbour, set_span, span, uncell, Side, Tile};
-use gpuikit::layout::{h_stack, v_stack};
-use gpuikit::theme::{parse_hex, ActiveTheme, GlobalTheme, Theme, ThemeVariant, Themeable};
-use futures::StreamExt;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, MutexGuard, PoisonError};
+use std::sync::{MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -40,8 +33,10 @@ pub struct BrowserWindow {
     pub(crate) model: WindowModel,
     /// Space chip being dragged, so a release outside the window can open it in its own.
     space_drag: Option<String>,
-    /// Held during a window drag when nothing else has GPUI focus: modifier changes only travel the focus path.
-    gesture_focus: FocusHandle,
+    /// The OS window this is.
+    pub(crate) shell: ShellWindow,
+    /// A frame is already on its way.
+    scheduled: Cell<bool>,
     /// The shortcut whose new keys settings is waiting for; app shortcuts are paused meanwhile.
     pub(crate) recording: Option<&'static str>,
     /// Takes the keys being recorded.
@@ -68,7 +63,7 @@ pub struct BrowserWindow {
     pub(crate) settings_section: SettingsSection,
     /// Filters the settings nav and the shortcut list.
     /// Confirmation shown in the settings footer after an action.
-    pub(crate) settings_note: Option<SharedString>,
+    pub(crate) settings_note: Option<String>,
     pub(crate) settings_profile: Option<String>,
     pub(crate) delete_prompt: Option<String>,
     /// Bounds of open modal cards this frame; web pages are cut out beneath them.
@@ -99,7 +94,7 @@ pub struct BrowserWindow {
     /// hidden and the gap open; the engine slides it there once the row is in place.
     pub(crate) list_arrangements: Vec<Arrangement>,
     /// A dropped tab gliding from where its pill was (and that wide) into its slot.
-    pub(crate) tab_landing: Option<(String, gpui::Point<Pixels>, f64, Instant)>,
+    pub(crate) tab_landing: Option<(String, Point, f64, Instant)>,
     /// The address field was just opened and wants the caret.
     address_caret: bool,
     /// The address field was asked for by clicking the shown tab.
@@ -111,8 +106,8 @@ pub struct BrowserWindow {
     /// How wide the space chips' capsule was last laid out, to centre it.
     spaces_w: f64,
     /// Where a dragged space chip is.
-    space_drag_at: Option<gpui::Point<Pixels>>,
-    /// How wide the native title bar tools are, kept clear in the GPUI bar.
+    space_drag_at: Option<Point>,
+    /// How wide the native title bar tools are, kept clear in the title bar.
     pub(crate) toolbar_w: f64,
     /// The main window's dock at the stage's foot: a line at rest, sliding up into the spaces and tools on hover.
     dock: Tween,
@@ -127,7 +122,7 @@ pub struct BrowserWindow {
     /// What is typed in the open popover's text fields, by field id.
     pub(crate) popover_texts: HashMap<u32, String>,
     /// Where each popover's button was last drawn, for the popover to point at.
-    pub(crate) popover_anchors: HashMap<Popover, gpui::Bounds<Pixels>>,
+    pub(crate) popover_anchors: HashMap<Popover, Bounds>,
     pub(crate) history_modal: bool,
     /// The extension whose logs are open in a modal.
     pub(crate) ext_logs: Option<String>,
@@ -164,18 +159,14 @@ pub struct BrowserWindow {
     pub(crate) chrome: HashMap<String, TabChrome>,
     gesture: Option<Gesture>,
     suppress_window_drag: bool,
-    /// Where the last tab pill was pressed: GPUI turns a 2px wobble into a drag, which must still count as a click.
-    tab_press: Option<gpui::Point<Pixels>>,
-    pub(crate) stage_bounds: Option<gpui::Bounds<Pixels>>,
+    /// Where the last tab pill was pressed: a 2px wobble starts a drag, which must still count as a click.
+    tab_press: Option<Point>,
+    pub(crate) stage_bounds: Option<Bounds>,
     layout_stage: Option<(i32, i32)>,
     /// When the stage last changed size; layouts are saved once it has settled, and `tick` saves the last one.
     stage_moved: Instant,
-    /// How much smaller than the window's content the stage was laid out, so `render` knows the stage's size
-    /// before layout measures it.
-    stage_inset: gpui::Size<Pixels>,
     order: Vec<String>,
-    subscriptions: Vec<Subscription>,
-    pub(crate) status: SharedString,
+    pub(crate) status: String,
     /// Space whose chip is showing the rename field.
     space_rename: Option<String>,
     /// Camera/microphone request the page is waiting on: (request, origin, kind).
@@ -200,21 +191,21 @@ pub struct BrowserWindow {
     /// A window carried up to the spaces bar shrinks under the pointer (open = small).
     lift: Tween,
     /// Space chips laid out this frame, so a carried window can be dropped on one.
-    space_chips: Vec<(String, gpui::Bounds<Pixels>)>,
+    space_chips: Vec<(String, Bounds)>,
     /// Rail profiles laid out this frame, so a carried window can be dropped on one.
-    pub(crate) rail_badges: Vec<(String, gpui::Bounds<Pixels>)>,
+    pub(crate) rail_badges: Vec<(String, Bounds)>,
     /// A dropped carried window growing back into place: (tab id, rect it was dropped at, started).
     landing: Option<(String, Frame, Instant)>,
     /// A window closed; re-tile the stage on the next layout pass.
     retile: bool,
     /// Tab pill being dragged and the pointer; drawn here so pages can be cut out beneath it.
-    tab_drag: Option<(browser_core::Tab, gpui::Point<Pixels>)>,
+    tab_drag: Option<(browser_core::Tab, Point)>,
     /// Where tab pills and rail badges were laid out last frame, before any slide offset.
-    slots: HashMap<String, gpui::Bounds<Pixels>>,
+    slots: HashMap<String, Bounds>,
     /// Items sliding into place after a reorder: the offset they start from, and when.
-    slides: HashMap<String, (gpui::Point<Pixels>, Instant)>,
+    slides: HashMap<String, (Point, Instant)>,
     /// Where the dragged tab pill was grabbed, so it stays under the pointer at that spot.
-    tab_grab: Rc<Cell<gpui::Point<Pixels>>>,
+    tab_grab: Rc<Cell<Point>>,
     /// A tab or profile being dragged, and the row it would drop into.
     reorder: Option<Reorder>,
     /// Where a link dragged from a page is over the chrome; applied to the tab rows on the next render.
@@ -222,7 +213,7 @@ pub struct BrowserWindow {
     /// Where the find bar's page sits (window coordinates), for the bar to hang at its top right.
     find_anchor: Option<LogicalRect>,
     /// Status message shown as a toast, and when it changed.
-    toast: (SharedString, Instant),
+    toast: (String, Instant),
     /// Load bar width for the active tab, and when its load finished (the bar then fades).
     load_bar: f32,
     load_done: Option<Instant>,
@@ -237,8 +228,8 @@ pub struct BrowserWindow {
     /// Address bar matches (url or search query, title, is a search) and the one picked with the arrow keys.
     pub(crate) suggestions: Vec<(String, String, bool)>,
     pub(crate) suggestion: Option<usize>,
-    /// In-flight search-engine completion fetch; replacing it cancels the stale one.
-    suggest_task: Option<Task<()>>,
+    /// Counts search-engine completion fetches; an answer to an older one than the last is dropped.
+    suggest_seq: u64,
     reduce_motion: bool,
     /// Theme variant and accent last applied, so the global theme is only swapped on change.
     applied_theme: String,
@@ -285,9 +276,9 @@ impl Tween {
 /// A drag over reorderable rows: tab rows keyed by window, or the profile rail.
 struct Reorder {
     id: String,
-    size: gpui::Size<Pixels>,
+    size: Size,
     /// Where the dragged item's top-left is drawn.
-    at: gpui::Point<Pixels>,
+    at: Point,
     /// The row under the dragged item and its order with a gap for it there; none off every row.
     row: Option<String>,
     order: Vec<String>,
@@ -322,12 +313,9 @@ struct SelfTest {
 }
 
 impl BrowserWindow {
-    pub fn new(model: SharedModel, handoff: Option<Handoff>, self_test: bool, started: Instant, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: SharedModel, handoff: Option<Handoff>, self_test: bool, started: Instant, shell: ShellWindow) -> Self {
         let (installs_tx, installs_rx) = mpsc::channel();
-        let mut subscriptions = Vec::new();
         let passwords = PasswordState::default();
-        // The update status lives app-wide; every window's title bar shows "Restart to Update".
-        subscriptions.push(cx.observe_global::<crate::update::Updates>(|_, cx| cx.notify()));
         let (detached, tab_window, extensions, pages, chrome) = match handoff {
             Some(handoff) => (Some(handoff.session), handoff.tab_window, Some(handoff.extensions), handoff.pages, handoff.chrome),
             None => (None, false, None, Vec::new(), HashMap::new()),
@@ -335,7 +323,8 @@ impl BrowserWindow {
         let mut view = Self {
             model: WindowModel { shared: model, detached },
             space_drag: None,
-            gesture_focus: cx.focus_handle(),
+            shell,
+            scheduled: Cell::new(false),
             recording: None,
             tiles: HashMap::new(),
             tab_window,
@@ -407,9 +396,7 @@ impl BrowserWindow {
             stage_bounds: None,
             layout_stage: None,
             stage_moved: Instant::now(),
-            stage_inset: gpui::Size::default(),
             order: Vec::new(),
-            subscriptions,
             passwords,
             status: "Ready".into(),
             space_rename: None,
@@ -454,7 +441,7 @@ impl BrowserWindow {
             opened: HashMap::new(),
             suggestions: Vec::new(),
             suggestion: None,
-            suggest_task: None,
+            suggest_seq: 0,
             reduce_motion: false,
             applied_theme: String::new(),
         };
@@ -485,28 +472,20 @@ impl BrowserWindow {
         view.sync_permissions();
         let url = view.model.lock().active_tab().map(|tab| tab.url.clone()).unwrap_or_else(|| "nxbrowser://home".into());
         view.set_typed(crate::native::ADDRESS_QUERY, url.clone());
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(TICK).await;
-                if this.update(cx, |view, cx| view.tick(cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+        crate::every(view.shell.number(), TICK, BrowserWindow::tick);
         view
     }
 
-    fn tick(&mut self, cx: &mut Context<Self>) {
-        let mut changed = self.drain(cx);
+    fn tick(&mut self) {
+        let mut changed = self.drain();
         self.warm_tabs();
-        changed |= self.sync_terminals(cx);
+        changed |= self.sync_terminals();
         while let Ok((id, result)) = self.installs_rx.try_recv() {
             changed = true;
             self.installing.retain(|pending| pending != &id);
             match result {
                 Ok(path) => self.add_extension(&id, &path, "store"),
-                Err(error) => self.status = format!("Install failed: {error}").into(),
+                Err(error) => self.status = format!("Install failed: {error}"),
             }
         }
         if self.model.detached.is_some() {
@@ -523,15 +502,14 @@ impl BrowserWindow {
         }
         if let Some(id) = self.engine.take_page_click() {
             changed = true;
-            // Page clicks never reach GPUI, so whichever input had GPUI focus would keep it. A later click on
-            // that input then fires no Focus event, the chrome never takes first responder, and keys go to the page.
+            // A click on a page ends an address edit.
             self.blur_address = true;
-            cx.notify();
-            self.close_palette(cx);
+            self.notify();
+            self.close_palette();
             let already = self.order.last().map(String::as_str) == Some(id.as_str())
                 && self.active_tab_id().as_deref() == Some(id.as_str());
             if !already {
-                self.focus_window(&id, cx);
+                self.focus_window(&id);
             }
         }
         // A resize ends without a frame of its own: the layout it left is saved here once the stage settles.
@@ -551,29 +529,28 @@ impl BrowserWindow {
         self.ticks = self.ticks.wrapping_add(1);
         // Extension errors have no change event; they only show in the popover, so poll them while it is open.
         if changed || self.self_test.is_some() || (self.popover == Some(Popover::Extensions) && self.ticks.is_multiple_of(4)) {
-            cx.notify();
+            self.notify();
         }
     }
 
     /// Copies each terminal's title and folder into its tab, closes tabs whose shell exited,
     /// and ends shells whose tab is gone; true if anything changed.
-    fn sync_terminals(&mut self, cx: &mut Context<Self>) -> bool {
+    fn sync_terminals(&mut self) -> bool {
         let tabs = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).cloned().collect::<Vec<_>>();
         let mut changed = false;
         let mut exited = Vec::new();
         let mut links = Vec::new();
         let active = self.active_tab_id();
         for tab in tabs {
-            let Some(view) = terminal::get(&tab.id, cx) else {
+            let Some(view) = terminal::get(&tab.id) else {
                 continue;
             };
             let seen = active.as_deref() == Some(tab.id.as_str());
-            let (url, agent_changed) = view.update(cx, |view, _| (view.open_url.take(), view.refresh_agent(seen)));
-            changed |= agent_changed;
-            if let Some(url) = url {
+            let mut view = view.borrow_mut();
+            changed |= view.refresh_agent(seen);
+            if let Some(url) = view.open_url.take() {
                 links.push((tab.id.clone(), url));
             }
-            let view = view.read(cx);
             if view.exited {
                 exited.push(tab.id.clone());
                 continue;
@@ -591,14 +568,14 @@ impl BrowserWindow {
         }
         for (id, url) in links {
             changed = true;
-            self.open_from(&id, &url, cx);
+            self.open_from(&id, &url);
         }
         if !exited.is_empty() {
             changed = true;
-            self.close_tabs(exited, cx);
+            self.close_tabs(exited);
         }
         let live = self.model.lock().tabs.iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        terminal::retain(|id| live.iter().any(|live| live == id), cx);
+        terminal::retain(|id| live.iter().any(|live| live == id));
         changed
     }
 
@@ -608,7 +585,7 @@ impl BrowserWindow {
     }
 
     /// Applies queued model effects, download updates and engine events; true if any arrived.
-    fn drain(&mut self, cx: &mut Context<Self>) -> bool {
+    fn drain(&mut self) -> bool {
         let effects = self.model.lock().take_effects();
         let mut changed = !effects.is_empty();
         self.apply(effects);
@@ -623,7 +600,7 @@ impl BrowserWindow {
         }
         changed |= !events.is_empty();
         for event in events {
-            self.on_event(event, cx);
+            self.on_event(event);
         }
         let suspend = self.model.lock().tabs_due_for_suspension();
         if suspend.is_empty() {
@@ -651,7 +628,7 @@ impl BrowserWindow {
         changed
     }
 
-    fn on_event(&mut self, event: EngineEvent, cx: &mut Context<Self>) {
+    fn on_event(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::Navigated { tab_id, url, title, loading } => {
                 // Title-only reports (unread counters, timers) re-send the finished URL; they need no cookie save or icon probe.
@@ -688,22 +665,22 @@ impl BrowserWindow {
                     let _ = self.engine.navigate(&tab_id, &http);
                 } else if self.active_tab_id().as_deref() == Some(tab_id.as_str()) {
                     // Other tabs show their failure in the page; a toast over this one would point at the wrong page.
-                    self.status = message.into();
+                    self.status = message;
                 }
             }
-            EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename, cx),
+            EngineEvent::Download { url, filename, download, .. } => self.start_download(download, &url, &filename),
             EngineEvent::DownloadDone { download, bytes, error } => {
                 // Unknown ids are downloads cancelled before they were recorded.
                 if let Some((id, path)) = self.web_downloads.remove(&download) {
                     let status = error.map_or_else(|| "done".to_string(), |error| format!("error: {error}"));
                     self.download_progress.insert(id.clone(), (bytes, Some(bytes)));
                     let _ = self.model.lock().update_download(&id, &status, &path);
-                    self.status = format!("Download {status}").into();
+                    self.status = format!("Download {status}");
                 }
             }
             EngineEvent::Screenshot { path, error } => {
                 self.status = match error {
-                    Some(error) => format!("Screenshot failed: {error}").into(),
+                    Some(error) => format!("Screenshot failed: {error}"),
                     None => {
                         let id = Uuid::new_v4().to_string();
                         let model = self.model.lock();
@@ -718,20 +695,20 @@ impl BrowserWindow {
                 if let Some((older, _, _)) = self.permission.replace((request, origin, kind)) {
                     self.engine.answer_permission(older, false);
                 }
-                cx.notify();
+                self.notify();
             }
-            EngineEvent::Passwords { tab_id, origin, request, message } => self.on_password_message(&tab_id, &origin, request, &message, cx),
+            EngineEvent::Passwords { tab_id, origin, request, message } => self.on_password_message(&tab_id, &origin, request, &message),
             EngineEvent::OpenInNewTab { url, from } => {
                 // `chrome.sidePanel.open()` arrives here as a plain `tabs.create` of the panel page.
                 let panel = self.ext_meta.keys().find(|id| self.panel_url(id).as_deref() == Some(url.as_str())).cloned();
                 // A side panel's links get a regular window, not a tab squeezed into the panel.
                 let from = from.filter(|id| !self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()));
                 match (panel, from) {
-                    (Some(id), _) => self.open_extension_panel(&id, &url, cx),
-                    (None, Some(from)) => self.open_from(&from, &url, cx),
+                    (Some(id), _) => self.open_extension_panel(&id, &url),
+                    (None, Some(from)) => self.open_from(&from, &url),
                     (None, None) => {
                         if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
-                            self.focus_window(&id, cx);
+                            self.focus_window(&id);
                         }
                     }
                 }
@@ -739,9 +716,9 @@ impl BrowserWindow {
             EngineEvent::Dialog { tab_id, origin, kind, message, default, request } => {
                 self.dialogs.push(PageDialog { tab_id, origin, kind, message, default, request });
                 if self.dialogs.len() == 1 {
-                    self.raise_dialog(cx);
+                    self.raise_dialog();
                 }
-                cx.notify();
+                self.notify();
             }
             EngineEvent::Eval { tab_id, token, value } if token == "find-count" => {
                 if tab_id == self.find_tab {
@@ -767,7 +744,7 @@ impl BrowserWindow {
                     }
                 }
             }
-            EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut, cx),
+            EngineEvent::Shortcut(shortcut) => self.on_shortcut(shortcut),
             EngineEvent::PopoverAction(action) => {
                 use crate::native::{BAR_BASE, FIND_BASE, HOME_BASE, LIST_BASE, PANEL_BASE, SHEET_BASE, WINDOW_BASE};
                 let (slot, base) = match action {
@@ -783,8 +760,8 @@ impl BrowserWindow {
                 // Taken while it runs, as it gets `self` mutably.
                 let actions = std::mem::take(slot);
                 if let Some(run) = actions.get((action - base) as usize) {
-                    run(self, cx);
-                    cx.notify();
+                    run(self);
+                    self.notify();
                 }
                 let slot = match action {
                     BAR_BASE.. => &mut self.bar_actions,
@@ -801,53 +778,54 @@ impl BrowserWindow {
                     *slot = actions;
                 }
             }
+            EngineEvent::TerminalMenu { tab_id, x, y } => self.open_term_menu(tab_id, point(x as f32, y as f32)),
             EngineEvent::NativeWindowClosed => {
                 if self.settings_open {
-                    self.toggle_settings(cx);
+                    self.toggle_settings();
                 }
             }
-            EngineEvent::RecordedKey(keys) => self.record_key(&keys, cx),
-            EngineEvent::PopoverKey { field, key } if field == crate::native::FIND_QUERY => self.find_key(&key, cx),
-            EngineEvent::PopoverKey { field, key } if field == crate::native::HOME_QUERY => self.home_key(&key, cx),
-            EngineEvent::PopoverKey { field, key } if field == crate::native::ADDRESS_QUERY => self.address_key(&key, cx),
+            EngineEvent::RecordedKey(keys) => self.record_key(&keys),
+            EngineEvent::PopoverKey { field, key } if field == crate::native::FIND_QUERY => self.find_key(&key),
+            EngineEvent::PopoverKey { field, key } if field == crate::native::HOME_QUERY => self.home_key(&key),
+            EngineEvent::PopoverKey { field, key } if field == crate::native::ADDRESS_QUERY => self.address_key(&key),
             // Only the address field cares that a field lost the caret.
             EngineEvent::PopoverKey { key, .. } if key == "blur" => {}
-            EngineEvent::PopoverKey { key, .. } => self.palette_key(&key, cx),
-            EngineEvent::ListReorder { list, from, to } if list == crate::rail::RAIL_LIST => self.reorder_rail(from, to, cx),
+            EngineEvent::PopoverKey { key, .. } => self.palette_key(&key),
+            EngineEvent::ListReorder { list, from, to } if list == crate::rail::RAIL_LIST => self.reorder_rail(from, to),
             EngineEvent::ListReorder { list, from, to } => {
-                self.reorder_list(list, from, to, cx);
+                self.reorder_list(list, from, to);
             }
             EngineEvent::WindowGesture { key, phase, x, y, edges, shift } => {
-                self.native_input.push(NativeInput::Gesture { key, phase, at: gpui::point(px(x as f32), px(y as f32)), edges, shift });
-                cx.notify();
+                self.native_input.push(NativeInput::Gesture { key, phase, at: point(x as f32, y as f32), edges, shift });
+                self.notify();
             }
             EngineEvent::ItemDrag { id, phase, x, y } => {
-                self.native_input.push(NativeInput::Drag { id, phase, at: gpui::point(px(x as f32), px(y as f32)) });
-                cx.notify();
+                self.native_input.push(NativeInput::Drag { id, phase, at: point(x as f32, y as f32) });
+                self.notify();
             }
             EngineEvent::PanelClosed => {
                 if self.palette_open {
                     self.palette_open = false;
                     self.focus_active_content();
-                    cx.notify();
+                    self.notify();
                 }
             }
             EngineEvent::PopoverText { field, text } => {
                 self.popover_texts.insert(field, text);
                 if field == crate::native::HOME_QUERY || field == crate::native::ADDRESS_QUERY {
                     self.suggestion = None;
-                    self.update_suggestions(self.typed(field), cx);
+                    self.update_suggestions(self.typed(field));
                 }
                 if field == crate::native::PALETTE_QUERY {
                     self.palette_index = 0;
-                    self.absorb_bang(cx);
+                    self.absorb_bang();
                 }
                 if field == crate::native::FIND_QUERY {
                     let query = self.typed(field);
                     self.find_fresh(&query);
                 }
                 // Sheets that show what is typed (the new profile's badge, history's matches) follow it.
-                cx.notify();
+                self.notify();
             }
             EngineEvent::PopoverClosed => {
                 if !self.engine.popover_shown() {
@@ -856,55 +834,55 @@ impl BrowserWindow {
                         self.passwords.prompt = None;
                     }
                     self.popover_texts.remove(&crate::extensions::EXT_FIELD);
-                    cx.notify();
+                    self.notify();
                 }
             }
             EngineEvent::MenuPick(index) => {
                 if let Some(Some(run)) = std::mem::take(&mut self.menu_actions).get(index) {
-                    run(self, cx);
-                    cx.notify();
+                    run(self);
+                    self.notify();
                 }
             }
             // Torn-off windows share the main window's extensions but not its event channel; repaint their badges too.
-            EngineEvent::ExtensionChanged { .. } => cx.refresh_windows(),
+            EngineEvent::ExtensionChanged { .. } => crate::notify_all(),
             EngineEvent::ExtensionPrompt { prompt, id, request } => {
                 self.ext_prompts.push((prompt, id, request));
                 self.popover = Some(Popover::Extensions);
             }
-            EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id, cx),
-            EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id], cx),
+            EngineEvent::ActivateTab { tab_id } => self.focus_window(&tab_id),
+            EngineEvent::CloseTab { tab_id } => self.close_tabs(vec![tab_id]),
             EngineEvent::LinkDrag { at } => {
                 self.link_hover = at;
                 if at.is_none() {
                     self.reorder = self.reorder.take().filter(|state| state.id != LINK_DROP);
                 }
-                cx.notify();
+                self.notify();
             }
             EngineEvent::LinkDrop { url, at } => {
                 self.link_hover = None;
-                self.drop_link(&url, at, cx);
+                self.drop_link(&url, at);
             }
-            EngineEvent::Peek { url } => self.open_peek(&url, cx),
+            EngineEvent::Peek { url } => self.open_peek(&url),
             EngineEvent::Audio { tab_id, playing } => {
                 if playing { self.playing.insert(tab_id) } else { self.playing.remove(&tab_id) };
-                cx.notify();
+                self.notify();
             }
             EngineEvent::Capture { tab_id, camera, microphone } => {
                 if camera || microphone { self.capturing.insert(tab_id, (camera, microphone)) } else { self.capturing.remove(&tab_id) };
-                cx.notify();
+                self.notify();
             }
         }
     }
 
-    pub(crate) fn on_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
+    pub(crate) fn on_shortcut(&mut self, shortcut: Shortcut) {
         match shortcut {
             Shortcut::NewTab => match self.active_tab_id() {
-                Some(id) => self.new_tab_in(&id, None, cx),
+                Some(id) => self.new_tab_in(&id, None),
                 None => self.with_model(|model| { let _ = model.create_tab(&model.settings.new_tab_url()); }),
             },
             Shortcut::CloseTab => {
                 if let Some(id) = self.active_tab_id() {
-                    self.close_tabs(vec![id], cx);
+                    self.close_tabs(vec![id]);
                 }
             }
             // A terminal's address pill is not editable.
@@ -913,10 +891,10 @@ impl BrowserWindow {
                 // Opens beside the active tab, in the active terminal's folder if there is one.
                 let url = self.model.lock().active_tab().map(|tab| tab.url.clone()).filter(|url| is_terminal(url)).unwrap_or_else(|| TERMINAL_URL.into());
                 match self.active_tab_id() {
-                    Some(id) => self.new_tab_in(&id, Some(&url), cx),
+                    Some(id) => self.new_tab_in(&id, Some(&url)),
                     None => {
                         if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
-                            self.focus_window(&id, cx);
+                            self.focus_window(&id);
                         }
                     }
                 }
@@ -926,9 +904,9 @@ impl BrowserWindow {
             Shortcut::Forward => self.forward(),
             Shortcut::Find => self.open_find(),
             Shortcut::Bookmark => self.bookmark(),
-            Shortcut::Settings => self.toggle_settings(cx),
+            Shortcut::Settings => self.toggle_settings(),
             Shortcut::ReopenTab => match self.with_model(|model| model.reopen_closed()) {
-                Ok(Some(id)) => self.focus_window(&id, cx),
+                Ok(Some(id)) => self.focus_window(&id),
                 _ => self.status = "No recently closed tabs".into(),
             },
             Shortcut::ZoomIn => self.zoom(1),
@@ -938,7 +916,7 @@ impl BrowserWindow {
                 let ids = self.model.lock().session_tabs().iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
                 let pick = if n == 9 { ids.last() } else { ids.get(n - 1) };
                 if let Some(id) = pick.cloned() {
-                    self.focus_window(&id, cx);
+                    self.focus_window(&id);
                 }
             }
             Shortcut::NextTab | Shortcut::PrevTab => {
@@ -946,7 +924,7 @@ impl BrowserWindow {
                 let at = self.active_tab_id().and_then(|id| ids.iter().position(|other| *other == id)).unwrap_or(0);
                 let step = if matches!(shortcut, Shortcut::NextTab) { 1 } else { ids.len().saturating_sub(1) };
                 if let Some(id) = ids.get((at + step) % ids.len().max(1)).cloned() {
-                    self.focus_window(&id, cx);
+                    self.focus_window(&id);
                 }
             }
             Shortcut::Print => {
@@ -971,10 +949,10 @@ impl BrowserWindow {
                     }
                 }
             }
-            Shortcut::CommandPalette => self.open_palette(cx),
+            Shortcut::CommandPalette => self.open_palette(),
             Shortcut::Dismiss => {
                 if let Some(id) = self.active_tab_id().filter(|id| self.chrome.get(id).is_some_and(|chrome| chrome.peek)) {
-                    self.close_tabs(vec![id], cx);
+                    self.close_tabs(vec![id]);
                 }
             }
             Shortcut::TileWindows => {
@@ -996,23 +974,23 @@ impl BrowserWindow {
             }
             Shortcut::FocusWindow(dir) => {
                 if let Some(id) = self.window_toward(dir) {
-                    self.focus_window(&id, cx);
+                    self.focus_window(&id);
                 }
             }
-            Shortcut::MoveWindow(dir) => self.move_window(dir, cx),
+            Shortcut::MoveWindow(dir) => self.move_window(dir),
             Shortcut::CloseWindow => {
                 if let Some(id) = self.active_tab_id() {
-                    self.close_window(&id, cx);
+                    self.close_window(&id);
                 }
             }
             Shortcut::MaximizeWindow => {
                 if let Some(id) = self.active_tab_id() {
-                    self.toggle_maximize(&id, cx);
+                    self.toggle_maximize(&id);
                 }
             }
             Shortcut::MinimizeWindow => {
                 if let Some(id) = self.active_tab_id() {
-                    self.minimize_window(&id, cx);
+                    self.minimize_window(&id);
                 }
             }
             Shortcut::NextSpace => self.step_space(1),
@@ -1022,24 +1000,24 @@ impl BrowserWindow {
                     self.with_model(|model| { let _ = model.create_session(); });
                 }
             }
-            Shortcut::History => self.open_history_modal(cx),
+            Shortcut::History => self.open_history_modal(),
             Shortcut::Downloads | Shortcut::Bookmarks => {
                 let popover = if shortcut == Shortcut::Downloads { Popover::Downloads } else { Popover::Bookmarks };
                 self.popover = (self.popover != Some(popover)).then_some(popover);
             }
             Shortcut::CopyUrl => {
                 if let Some(url) = self.model.lock().active_tab().map(|tab| tab.url.clone()) {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    browser_engine_macos::set_clipboard_text(&url);
                     self.status = "Copied page address".into();
                 }
             }
             Shortcut::ClearTerminal => {
-                if let Some(view) = self.active_tab_id().and_then(|id| terminal::get(&id, cx)) {
-                    view.update(cx, |view, cx| view.clear(cx));
+                if let Some(view) = self.active_tab_id().and_then(|id| terminal::get(&id)) {
+                    view.borrow_mut().clear();
                 }
             }
         }
-        self.refresh_url(cx);
+        self.refresh_url();
     }
 
     pub(crate) fn with_model<T>(&mut self, f: impl FnOnce(&mut Model) -> T) -> T {
@@ -1162,27 +1140,27 @@ impl BrowserWindow {
         let manifest = match read_manifest(path) {
             Ok(manifest) => manifest,
             Err(error) => {
-                self.status = format!("Not an extension: {error}").into();
+                self.status = format!("Not an extension: {error}");
                 return;
             }
         };
         let _ = self.model.lock().upsert_extension(id, &manifest.name, path, source);
         self.sync_extension(id);
-        self.status = format!("Installed {}", manifest.name).into();
+        self.status = format!("Installed {}", manifest.name);
         self.popover = Some(Popover::Extensions);
     }
 
     /// Installs from a Chrome Web Store URL or extension id, downloading on a background thread.
-    pub(crate) fn install_from_input(&mut self, raw: &str, cx: &mut Context<Self>) {
+    pub(crate) fn install_from_input(&mut self, raw: &str) {
         let Some(id) = store_id(raw) else {
             self.status = "Paste a Chrome Web Store link or a 32-letter extension id".into();
-            cx.notify();
+            self.notify();
             return;
         };
         self.popover_texts.remove(&crate::extensions::EXT_FIELD);
         self.engine.set_popover_field(crate::extensions::EXT_FIELD, "");
         self.install_from_store(id);
-        cx.notify();
+        self.notify();
     }
 
     pub(crate) fn install_from_store(&mut self, id: String) {
@@ -1198,22 +1176,19 @@ impl BrowserWindow {
         });
     }
 
-    pub(crate) fn load_unpacked(&mut self, cx: &mut Context<Self>) {
-        // gpui's sheet, not runModal: a modal loop inside a gpui handler lets its timers re-enter and abort.
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: false, directories: true, multiple: false, prompt: None });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| {
+    pub(crate) fn load_unpacked(&mut self) {
+        let no = self.shell.number();
+        browser_engine_macos::choose_path(no, true, move |path| {
+            let Some(path) = path else { return };
+            crate::update(no, |this| {
                 if path.join("manifest.json").is_file() {
                     this.add_extension(&local_id(&path), &path, "unpacked");
                 } else {
                     this.status = "That folder has no manifest.json".into();
                 }
-                cx.notify();
+                this.notify();
             });
-        })
-        .detach();
+        });
     }
 
     pub(crate) fn remove_extension(&mut self, id: &str) {
@@ -1237,34 +1212,34 @@ impl BrowserWindow {
 
     /// What clicking an extension's button at window x `at` does: its popup (a popover under the
     /// title bar there) or `onClicked` via WebKit, or its side panel in a slim window.
-    pub(crate) fn open_extension(&mut self, id: &str, at: f32, cx: &mut Context<Self>) {
+    pub(crate) fn open_extension(&mut self, id: &str, at: f32) {
         let meta = self.ext_meta.get(id).cloned().unwrap_or_default();
         match self.panel_url(id).filter(|_| !meta.popup) {
-            Some(url) => self.open_extension_panel(id, &url, cx),
+            Some(url) => self.open_extension_panel(id, &url),
             None => {
                 let (store, tab) = (self.active_store(), self.active_tab_id());
                 // Over the dock's extensions button in the main window, under the title bar in a torn-off one.
                 let (y, height) = self.popover_anchors.get(&Popover::Extensions).filter(|_| self.model.detached.is_none()).map_or((0., f64::from(self.titlebar_h())), |bounds| (f64::from(bounds.origin.y), f64::from(bounds.size.height)));
                 let anchor = [f64::from(at) - 13., y, 26., height];
                 if !self.engine.extensions().perform_action(id, &store, tab.as_deref(), anchor) {
-                    self.status = format!("Open a website to use {}", meta.name).into();
-                    cx.notify();
+                    self.status = format!("Open a website to use {}", meta.name);
+                    self.notify();
                 }
             }
         }
     }
 
-    pub(crate) fn open_extension_options(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn open_extension_options(&mut self, id: &str) {
         match self.engine.extensions().options_url(id, &self.active_store()) {
-            Some(url) => self.open_extension_window(&url, cx),
+            Some(url) => self.open_extension_window(&url),
             None => self.status = "This extension has no options page".into(),
         }
     }
 
     /// Options pages open as a regular floating window.
-    fn open_extension_window(&mut self, url: &str, cx: &mut Context<Self>) {
+    fn open_extension_window(&mut self, url: &str) {
         if let Ok(id) = self.with_model(|model| model.create_tab(url)) {
-            self.focus_window(&id, cx);
+            self.focus_window(&id);
         }
     }
 
@@ -1274,7 +1249,7 @@ impl BrowserWindow {
     }
 
     /// A floating window centred over the stage, out of the tiling, for a quick look at a link.
-    fn open_peek(&mut self, url: &str, cx: &mut Context<Self>) {
+    fn open_peek(&mut self, url: &str) {
         let Ok(tab_id) = self.with_model(|model| model.create_tab(url)) else {
             return;
         };
@@ -1285,11 +1260,11 @@ impl BrowserWindow {
             let (w, h) = (sw * 0.8, sh * 0.85);
             entry.frame = Some(Frame { x: (sw - w) / 2.0, y: (sh - h) / 2.0, w, h });
         }
-        self.focus_window(&tab_id, cx);
+        self.focus_window(&tab_id);
     }
 
     /// A side panel: a narrow window docked right, titled with just the extension. One per space.
-    fn open_extension_panel(&mut self, id: &str, url: &str, cx: &mut Context<Self>) {
+    fn open_extension_panel(&mut self, id: &str, url: &str) {
         let open = self
             .model
             .lock()
@@ -1307,7 +1282,7 @@ impl BrowserWindow {
                 entry.frame = Some(panel_frame(f64::from(bounds.size.width) as f32, f64::from(bounds.size.height) as f32));
             }
         }
-        self.focus_window(&tab_id, cx);
+        self.focus_window(&tab_id);
     }
 
     pub(crate) fn apply_settings(&mut self) {
@@ -1358,7 +1333,7 @@ impl BrowserWindow {
             }
         });
         self.engine.set_zoom(&tab.id, next);
-        self.status = format!("Zoom {:.0}%", next * 100.0).into();
+        self.status = format!("Zoom {:.0}%", next * 100.0);
     }
 
     fn anim(&self, duration: Duration) -> Duration {
@@ -1366,7 +1341,7 @@ impl BrowserWindow {
     }
 
     /// Closes tabs; a whole window shrinks away first, then its tabs close.
-    pub(crate) fn close_tabs(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+    pub(crate) fn close_tabs(&mut self, ids: Vec<String>) {
         let Some(first) = ids.first() else {
             return;
         };
@@ -1384,7 +1359,7 @@ impl BrowserWindow {
         });
         if self.model.detached.is_some() && current.iter().all(|id| ids.contains(id)) {
             self.close_window = true;
-            cx.notify();
+            self.notify();
             return;
         }
         // A closed page can't wait on its dialogs; answer them so WebKit lets go of their handlers.
@@ -1403,14 +1378,14 @@ impl BrowserWindow {
                 let _ = model.close_tab(id);
             }
         });
-        self.refresh_url(cx);
+        self.refresh_url();
         if let Some(survivor) = survivor {
-            self.focus_window(&survivor, cx);
+            self.focus_window(&survivor);
         }
         if !self.dialogs.is_empty() && self.dialogs.first().map(|dialog| dialog.request) != front {
-            self.raise_dialog(cx);
+            self.raise_dialog();
         }
-        cx.notify();
+        self.notify();
     }
 
     /// Scale and opacity for a window opening; (1, 1) when at rest.
@@ -1429,11 +1404,11 @@ impl BrowserWindow {
 
     /// The main window's dock: its right edge and top now, and its top when open. Shut, it sits just below the
     /// window, out of sight; it rises into the stage's foot, over the windows, centred on the stage.
-    pub(crate) fn dock_at(&self, window: &Window) -> Option<(f64, f64, f64)> {
+    pub(crate) fn dock_at(&self) -> Option<(f64, f64, f64)> {
         if self.model.detached.is_some() {
             return None;
         }
-        let size = window.viewport_size();
+        let size = self.viewport();
         let (width, height, rail) = (f64::from(size.width), f64::from(size.height), f64::from(crate::rail::RAIL_W));
         let right = rail + (width - rail) / 2. + (self.spaces_w + DOCK_GAP + self.toolbar_w) / 2.;
         let (open, shut) = (height - f64::from(SNAP_INSET) - DOCK_H, height + 2.);
@@ -1442,34 +1417,42 @@ impl BrowserWindow {
 
     /// Opens the dock while the pointer is on it, while what it opened is up, or while a window or tab is carried
     /// down to it to drop on a space.
-    fn update_dock(&mut self, window: &Window) {
-        let low = f64::from(window.viewport_size().height) - 48.;
+    fn update_dock(&mut self) {
+        let low = f64::from(self.viewport().height) - 48.;
         let carried = (self.gesture.is_some() || self.tab_drag.is_some()) && self.engine.pointer().is_some_and(|(_, y)| y > low);
         let busy = matches!(self.popover, Some(Popover::History | Popover::Bookmarks | Popover::Extensions)) || self.history_modal || self.space_rename.is_some();
         self.dock.set(self.dock_hovered || carried || busy, self.anim(DOCK_ANIM));
     }
 
     /// The dock's hover target, wider than its resting line, and the line itself, fading as the dock rises.
-    fn dock_zone(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = self.dock.progress();
-        let lerp = |from: f32, to: f32| from + (to - from) * p;
-        let open_w = (self.spaces_w + DOCK_GAP + self.toolbar_w) as f32;
-        div().absolute().bottom_0().left(px(crate::rail::RAIL_W)).right_0().flex().justify_center().child(
-            div()
-                .id("dock")
-                .relative()
-                .w(px(lerp(DOCK_REST_W + 56., open_w + 24.)))
-                .h(px(lerp(14., DOCK_H as f32 + SNAP_INSET + 12.)))
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    this.dock_hovered = *hovered;
-                    cx.notify();
-                }))
-                .child(
-                    div().absolute().bottom(px(2.)).left_0().right_0().flex().justify_center().child(
-                        div().w(px(DOCK_REST_W)).h(px(DOCK_REST_H)).rounded_full().bg(paint(cx).muted).opacity(0.6 * (1. - p)),
-                    ),
-                ),
-        )
+    fn sync_dock(&mut self, pop: &mut crate::native::Pop, bars: &mut Vec<&'static str>) {
+        use crate::native::{Ink, Node};
+        if self.model.detached.is_some() {
+            return;
+        }
+        let p = f64::from(self.dock.progress());
+        let lerp = |from: f64, to: f64| from + (to - from) * p;
+        let size = self.viewport();
+        let (width, height, rail) = (f64::from(size.width), f64::from(size.height), f64::from(crate::rail::RAIL_W));
+        let center = rail + (width - rail) / 2.;
+        let open_w = self.spaces_w + DOCK_GAP + self.toolbar_w;
+        let (zone_w, zone_h) = (lerp(f64::from(DOCK_REST_W) + 56., open_w + 24.), lerp(14., DOCK_H + f64::from(SNAP_INSET) + 12.));
+        let enter = pop.act(|this| {
+            this.dock_hovered = true;
+            this.notify();
+        });
+        let leave = pop.act(|this| {
+            this.dock_hovered = false;
+            this.notify();
+        });
+        let zone = LogicalRect { x: center - zone_w / 2., y: height - zone_h, width: zone_w, height: zone_h };
+        self.engine.set_bar("dock-zone", zone, None, &Node::Watch { enter, leave, child: Box::new(Node::Spacer) });
+        let (line_w, line_h) = (f64::from(DOCK_REST_W), f64::from(DOCK_REST_H));
+        let line = LogicalRect { x: center - line_w / 2., y: height - 2. - line_h, width: line_w, height: line_h };
+        let pill = Node::Round { radius: line_h / 2., tint: Some(Ink::Tertiary), child: Box::new(Node::Spacer) };
+        self.engine.set_bar("dock-line", line, None, &pill);
+        self.engine.set_bar_alpha("dock-line", 1. - p);
+        bars.extend(["dock-zone", "dock-line"]);
     }
 
     fn title_h(&self) -> f64 {
@@ -1481,7 +1464,7 @@ impl BrowserWindow {
         self.title_h() as f32 - 6.0
     }
 
-    fn apply_theme(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn apply_theme(&mut self) {
         let (theme, accent, wallpaper) = {
             let model = self.model.lock();
             (model.settings.theme.clone(), model.settings.accent.clone(), model.settings.wallpaper.clone())
@@ -1490,23 +1473,25 @@ impl BrowserWindow {
         let dark = match theme.as_str() {
             "light" => false,
             "dark" => true,
-            _ => matches!(window.appearance(), gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark),
+            _ => self.shell.is_dark(),
         };
         let key = format!("{theme}{dark}{accent}");
-        if key != self.applied_theme || (cx.theme().variant == ThemeVariant::Dark) != dark {
+        if key != self.applied_theme {
             // Pages read prefers-color-scheme from the app appearance; None follows the system.
             self.engine.set_appearance(match theme.as_str() {
                 "light" => Some(false),
                 "dark" => Some(true),
                 _ => None,
             });
-            let mut next = if dark { Theme::default() } else { light_theme() };
+            let mut next = if dark { DARK } else { LIGHT };
             if !accent.is_empty() {
-                next.accent_color = parse_hex(&accent);
+                next.accent = parse_hex(&accent);
             }
-            cx.set_global(GlobalTheme(Arc::new(next)));
+            THEME.set(next);
             self.applied_theme = key;
         }
+        let paint = paint();
+        terminal::set_colors([paint.fg, paint.bg, paint.accent]);
     }
 
     pub(crate) fn sync_permissions(&mut self) {
@@ -1515,7 +1500,7 @@ impl BrowserWindow {
         }
     }
 
-    pub(crate) fn refresh_url(&mut self, _cx: &mut Context<Self>) {
+    pub(crate) fn refresh_url(&mut self) {
         if self.address_focused {
             return;
         }
@@ -1526,7 +1511,7 @@ impl BrowserWindow {
     }
 
     /// Chrome-style: history and bookmark matches first, then the search engine's completions once they arrive.
-    pub(crate) fn update_suggestions(&mut self, typed: String, cx: &mut Context<Self>) {
+    pub(crate) fn update_suggestions(&mut self, typed: String) {
         let (history, template) = {
             let model = self.model.lock();
             (model.suggest(&typed, 4).unwrap_or_default(), model.settings.suggest_template())
@@ -1539,26 +1524,26 @@ impl BrowserWindow {
             .filter(|(text, _, search)| *search && !query.is_empty() && text.to_lowercase().starts_with(&query));
         self.suggestions = history.into_iter().map(|(url, title)| (url, title, false)).chain(kept).collect();
         self.suggestion = None;
-        self.suggest_task = template.filter(|_| !typed.trim().is_empty()).map(|template| {
-            let fetch = fetch_suggestions(template, typed.trim());
-            cx.spawn(async move |this, cx| {
-                let found = fetch.await.unwrap_or_default();
-                let _ = this.update(cx, |view, cx| {
-                    if !view.address_focused {
+        self.suggest_seq += 1;
+        if let Some(template) = template.filter(|_| !typed.trim().is_empty()) {
+            let (fetch, seq, no) = (fetch_suggestions(template, typed.trim()), self.suggest_seq, self.shell.number());
+            std::thread::spawn(move || {
+                let found = futures::executor::block_on(fetch).unwrap_or_default();
+                crate::later(no, move |view| {
+                    if !view.address_focused || view.suggest_seq != seq {
                         return;
                     }
                     view.suggestions.retain(|(_, _, search)| !search);
                     let room = 8usize.saturating_sub(view.suggestions.len());
                     view.suggestions.extend(found.into_iter().take(room).map(|query| (query, String::new(), true)));
-                    cx.notify();
                 });
-            })
-        });
-        cx.notify();
+            });
+        }
+        self.notify();
     }
 
     /// Arrow, Tab, Enter, Escape and losing the caret in the native address field.
-    fn address_key(&mut self, key: &str, cx: &mut Context<Self>) {
+    fn address_key(&mut self, key: &str) {
         let count = self.suggestions.len();
         match key {
             "down" if count > 0 => self.suggestion = Some(self.suggestion.map_or(0, |at| (at + 1) % count)),
@@ -1567,7 +1552,7 @@ impl BrowserWindow {
                 let picked = self.suggestion.and_then(|at| self.suggestions.get(at)).map(|(url, _, _)| url.clone());
                 let typed = self.typed(crate::native::ADDRESS_QUERY);
                 match picked.or_else(|| (!typed.trim().is_empty()).then_some(typed)) {
-                    Some(target) => self.commit_navigation(&target, cx),
+                    Some(target) => self.commit_navigation(&target),
                     None => return,
                 }
             }
@@ -1575,16 +1560,16 @@ impl BrowserWindow {
             "tab" if count > 0 => {
                 let text = self.suggestions[self.suggestion.unwrap_or(0).min(count - 1)].0.clone();
                 self.set_typed(crate::native::ADDRESS_QUERY, text.clone());
-                self.update_suggestions(text, cx);
+                self.update_suggestions(text);
             }
             "escape" if count > 0 => self.suggestions.clear(),
-            "escape" | "blur" => self.end_address_edit(cx),
+            "escape" | "blur" => self.end_address_edit(),
             _ => return,
         }
-        cx.notify();
+        self.notify();
     }
 
-    pub(crate) fn commit_navigation(&mut self, raw: &str, _cx: &mut Context<Self>) {
+    pub(crate) fn commit_navigation(&mut self, raw: &str) {
         let (url, tab_id) = {
             let model = self.model.lock();
             (normalize_url(raw, model.settings.search_template(), model.settings.https_only), model.active_tab().map(|tab| tab.id.clone()))
@@ -1601,8 +1586,7 @@ impl BrowserWindow {
         self.address_editing = false;
         self.suggestions.clear();
         self.suggestion = None;
-        self.suggest_task = None;
-        // Let go of the hidden input's GPUI focus, or a later click on the chrome would send keys to it.
+        self.suggest_seq += 1;
         self.blur_address = true;
         self.set_typed(crate::native::ADDRESS_QUERY, url.clone());
         self.with_model(|model| {
@@ -1622,7 +1606,7 @@ impl BrowserWindow {
         if self.modal_open() {
             return;
         }
-        // Drop GPUI focus too, or a later click on the input that had it fires no Focus and keys stay with the page.
+        // An open address edit ends with it.
         self.blur_address = true;
         let Some(tab) = self.model.lock().active_tab().cloned() else {
             return;
@@ -1635,21 +1619,21 @@ impl BrowserWindow {
     }
 
     /// A popover button: opens its popover, or closes it if open.
-    pub(crate) fn toggle_popover(&mut self, popover: Popover, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_popover(&mut self, popover: Popover) {
         // A press on its own button closed it a moment ago (popovers close on any press outside them): keep it closed.
         let closing = self.popover == Some(popover) || self.engine.popover_just_closed(popover as u64);
         self.popover = (!closing).then_some(popover);
-        cx.notify();
+        self.notify();
     }
 
     /// Shows the open popover natively, or updates it from the model; closes it once `popover` is `None`.
-    fn sync_popover(&mut self, window: &Window) {
+    fn sync_popover(&mut self) {
         let mut pop = crate::native::Pop::default();
         let Some(kind) = self.popover else {
             // The save-password offer sits under the title bar's right end until answered.
             match self.save_password_popover(&mut pop) {
                 Some(content) => {
-                    let anchor = LogicalRect { x: f64::from(window.viewport_size().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) };
+                    let anchor = LogicalRect { x: f64::from(self.viewport().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) };
                     self.engine.present_popover(SAVE_PASSWORD_KEY, &anchor, browser_engine_macos::Edge::Below, 320., false, &content);
                     self.popover_actions = pop.actions;
                 }
@@ -1682,15 +1666,15 @@ impl BrowserWindow {
         };
         // Opened from the keyboard before its button was drawn: under the title bar's right end, or by the rail.
         let anchor = self.popover_anchors.get(&kind).map(|bounds| logical(*bounds)).unwrap_or_else(|| match kind {
-            Popover::Downloads => LogicalRect { x: 8., y: f64::from(window.viewport_size().height) - 40., width: 28., height: 28. },
-            _ => LogicalRect { x: f64::from(window.viewport_size().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) },
+            Popover::Downloads => LogicalRect { x: 8., y: f64::from(self.viewport().height) - 40., width: 28., height: 28. },
+            _ => LogicalRect { x: f64::from(self.viewport().width) - 40., y: 0., width: 28., height: f64::from(self.titlebar_h()) },
         });
         self.engine.present_popover(kind as u64, &anchor, edge, width, true, &content);
         self.popover_actions = pop.actions;
     }
 
     /// Shows the topmost open dialog as a native sheet, or updates it; closes the sheet once none is open.
-    fn sync_sheet(&mut self, cx: &mut Context<Self>) {
+    fn sync_sheet(&mut self) {
         let mut pop = crate::native::Pop::sheet();
         // Checked top down, in the order the dialogs used to stack.
         let page = self.dialog_sheet(&mut pop).or_else(|| self.permission_sheet(&mut pop));
@@ -1707,11 +1691,11 @@ impl BrowserWindow {
         } else if self.history_modal {
             Some(("history".into(), 560., self.history_sheet(&mut pop)))
         } else if !self.pending_links.is_empty() {
-            Some(("links".into(), 380., self.link_sheet(&mut pop, cx)))
+            Some(("links".into(), 380., self.link_sheet(&mut pop)))
         } else if let Some(id) = self.delete_prompt.clone() {
             Some((format!("delete:{id}"), 380., self.delete_sheet(&id, &mut pop)))
         } else if self.new_profile.is_some() {
-            Some(("profile".into(), 440., self.profile_sheet(&mut pop, cx)))
+            Some(("profile".into(), 440., self.profile_sheet(&mut pop)))
         } else {
             None
         };
@@ -1728,24 +1712,24 @@ impl BrowserWindow {
     }
 
     /// Shows the settings window while settings are open, or updates it; closes it once they're not.
-    fn sync_settings(&mut self, cx: &mut Context<Self>) {
+    fn sync_settings(&mut self) {
         if !self.settings_open {
             return self.engine.close_window();
         }
         let mut pop = crate::native::Pop::window();
-        let content = self.settings_window(&mut pop, cx);
+        let content = self.settings_window(&mut pop);
         // One key: it stays the same window, updated in place, from section to section.
         self.engine.present_window(1, "Settings", 780., &content);
         self.window_actions = pop.actions;
     }
 
     /// Shows the command palette's panel while it is open, or updates it; closes it once it's not.
-    fn sync_palette(&mut self, cx: &mut Context<Self>) {
+    fn sync_palette(&mut self) {
         if !self.palette_open {
             return self.engine.close_panel();
         }
         let mut pop = crate::native::Pop::panel();
-        let content = self.palette_node(&mut pop, cx);
+        let content = self.palette_node(&mut pop);
         self.engine.present_panel(1, 560., 72., &content);
         self.panel_actions = pop.actions;
     }
@@ -1762,11 +1746,11 @@ impl BrowserWindow {
     }
 
     /// Records where `popover`'s button is drawn; goes inside the button.
-    pub(crate) fn open_history_url(&mut self, url: &str, cx: &mut Context<Self>) {
+    pub(crate) fn open_history_url(&mut self, url: &str) {
         let url = url.to_string();
         self.popover = None;
         self.history_modal = false;
-        self.commit_navigation(&url, cx);
+        self.commit_navigation(&url);
     }
 
     fn back(&mut self) {
@@ -1797,7 +1781,7 @@ impl BrowserWindow {
     }
 
     /// Picks the file for a download WebKit is holding, then lets it write there.
-    fn start_download(&mut self, download: u64, url: &str, filename: &str, cx: &mut Context<Self>) {
+    fn start_download(&mut self, download: u64, url: &str, filename: &str) {
         let (dir, ask) = {
             let settings = &self.model.lock().settings;
             (settings.download_dir.clone(), settings.ask_download_path)
@@ -1808,13 +1792,11 @@ impl BrowserWindow {
             let _ = std::fs::create_dir_all(&dir);
             return self.begin_download(download, url, path);
         }
-        // gpui's save sheet, not runModal: this runs from the tick, and a modal loop here lets gpui re-enter and abort.
+        // A sheet, not runModal: this runs from the tick, and a modal loop here would let the tick re-enter.
         let name = path.file_name().map(|name| name.to_string_lossy().into_owned());
-        let chosen = cx.prompt_for_new_path(&dir, name.as_deref());
-        let url = url.to_string();
-        cx.spawn(async move |this, cx| {
-            let path = chosen.await.ok().and_then(Result::ok).flatten();
-            let _ = this.update(cx, |this, cx| {
+        let (no, url) = (self.shell.number(), url.to_string());
+        browser_engine_macos::save_path(no, &dir, name.as_deref(), move |path| {
+            crate::update(no, |this| {
                 match path {
                     Some(path) => {
                         // The save sheet already asked about replacing it; WebKit won't write over a file.
@@ -1823,10 +1805,9 @@ impl BrowserWindow {
                     }
                     None => this.engine.save_download(download, None),
                 }
-                cx.notify();
+                this.notify();
             });
-        })
-        .detach();
+        });
     }
 
     /// Lets WebKit write a held download to `path` and starts tracking it.
@@ -1848,46 +1829,42 @@ impl BrowserWindow {
         }
     }
 
-    pub(crate) fn export_profile(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn export_profile(&mut self) {
         let bundle = self.model.lock().export_active();
         let Ok(bundle) = bundle else {
             self.status = "Export failed".into();
             return;
         };
-        // gpui's sheets, not runModal: a modal loop inside a gpui handler lets its timers re-enter and abort.
-        let path = cx.prompt_for_new_path(&downloads_dir(), Some("profile.json"));
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(path))) = path.await else { return };
-            let _ = this.update(cx, |this, cx| {
+        let no = self.shell.number();
+        browser_engine_macos::save_path(no, &downloads_dir(), Some("profile.json"), move |path| {
+            let Some(path) = path else { return };
+            crate::update(no, |this| {
                 match std::fs::write(&path, serde_json::to_string_pretty(&bundle).unwrap_or_default()) {
-                    Ok(()) => this.status = format!("Exported {}", path.display()).into(),
-                    Err(error) => this.status = error.to_string().into(),
+                    Ok(()) => this.status = format!("Exported {}", path.display()),
+                    Err(error) => this.status = error.to_string(),
                 }
-                cx.notify();
+                this.notify();
             });
-        })
-        .detach();
+        });
     }
 
-    pub(crate) fn import_profile(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| {
+    pub(crate) fn import_profile(&mut self) {
+        let no = self.shell.number();
+        browser_engine_macos::choose_path(no, false, move |path| {
+            let Some(path) = path else { return };
+            crate::update(no, |this| {
                 this.import_profile_from(&path);
-                this.refresh_url(cx);
-                cx.notify();
+                this.refresh_url();
+                this.notify();
             });
-        })
-        .detach();
+        });
     }
 
     fn import_profile_from(&mut self, path: &std::path::Path) {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                self.status = error.to_string().into();
+                self.status = error.to_string();
                 return;
             }
         };
@@ -1898,29 +1875,15 @@ impl BrowserWindow {
                 });
                 self.status = "Profile imported".into();
             }
-            Err(error) => self.status = error.to_string().into(),
+            Err(error) => self.status = error.to_string(),
         }
     }
 
-    fn attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn attach(&mut self) {
         if self.attached {
             return;
         }
-        // A live resize redraws GPUI's surface but renders no view that wasn't notified, so the pages, frames and
-        // native bars would keep their old places until the mouse came up.
-        if self.subscriptions.len() == 1 {
-            self.subscriptions.push(cx.observe_window_bounds(window, |_, _, cx| cx.notify()));
-        }
-        if let Some(id) = self.model.detached.clone() {
-            // Closed by the user (not at quit): the space goes back to the main window.
-            let model = self.model.shared.clone();
-            let tab_window = self.tab_window;
-            // A closed space comes back to the main window; a closed window closes its tabs, like any window.
-            window.on_window_should_close(cx, move |_, _| {
-                forget_detached(&mut model.lock().unwrap_or_else(PoisonError::into_inner), &id, tab_window);
-                true
-            });
-        } else if self.self_test.is_none() {
+        if self.model.detached.is_none() && self.self_test.is_none() {
             let saved = {
                 let model = self.model.lock();
                 let spaces = model.settings.detached_spaces.iter().map(|id| (id.clone(), false));
@@ -1928,58 +1891,45 @@ impl BrowserWindow {
             };
             let extensions = self.engine.extensions().clone();
             let model = self.model.shared.clone();
-            let origin = window.bounds().origin;
-            cx.defer(move |cx| {
+            let (x, y) = self.shell.origin();
+            crate::defer(move || {
                 for (n, (id, tab_window)) in saved.into_iter().enumerate() {
-                    let at = origin + gpui::point(px(40. * (n + 1) as f32), px(40. * (n + 1) as f32));
-                    open_space(cx, model.clone(), extensions.clone(), id, tab_window, Vec::new(), HashMap::new(), at);
+                    let at = point(x as f32 + 40. * (n + 1) as f32, y as f32 + 40. * (n + 1) as f32);
+                    open_space(model.clone(), extensions.clone(), id, tab_window, Vec::new(), HashMap::new(), at);
                 }
             });
         }
-        let Ok(handle) = HasWindowHandle::window_handle(window) else {
-            return;
-        };
-        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return;
-        };
-        if self.engine.attach(handle.ns_view.as_ptr()).is_ok() {
+        if self.engine.attach(self.shell.chrome()).is_ok() {
             self.attached = true;
-            // Page clicks never reach GPUI, so popovers and the palette can't see them as outside presses.
-            // They close at once; refocusing waits for the mouse-up, as raising a window mid-press could drop the click.
-            let (wake, mut clicks) = futures::channel::mpsc::unbounded();
+            let no = self.shell.number();
+            // Page clicks close popovers and the palette at once; refocusing waits for the mouse-up, as raising a
+            // window mid-press could drop the click.
             self.engine.on_page_click(move || {
-                let _ = wake.unbounded_send(());
+                crate::later(no, |view| {
+                    view.popover = None;
+                    view.close_palette();
+                });
             });
             // Shortcuts and finished page clicks run at once rather than on the next tick.
-            let (wake, mut wakes) = futures::channel::mpsc::unbounded::<()>();
-            self.engine.on_wake(move || {
-                let _ = wake.unbounded_send(());
-            });
-            cx.spawn(async move |this, cx| {
-                while wakes.next().await.is_some() {
-                    // One tick handles everything queued so far.
-                    while wakes.try_recv().is_ok() {}
-                    if this.update(cx, |view, cx| view.tick(cx)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .detach();
-            cx.spawn(async move |this, cx| {
-                while clicks.next().await.is_some() {
-                    let closed = this.update(cx, |view, cx| {
-                        view.popover = None;
-                        view.close_palette(cx);
-                        cx.notify();
-                    });
-                    if closed.is_err() {
-                        break;
-                    }
-                }
-            })
-            .detach();
+            self.engine.on_wake(move || crate::later(no, BrowserWindow::tick));
             let effects = self.model.lock().take_effects();
             self.apply(effects);
+        }
+    }
+
+    /// The close button or ⌘W on the OS window: a closed space comes back to the main window; a closed torn-off
+    /// window closes its tabs, like any window.
+    pub(crate) fn should_close(&mut self) -> bool {
+        if let Some(id) = &self.model.detached {
+            forget_detached(&mut self.model.shared.lock().unwrap_or_else(PoisonError::into_inner), id, self.tab_window);
+        }
+        true
+    }
+
+    /// Draws this window again on the next turn of the main thread; several asks before then make one frame.
+    pub(crate) fn notify(&self) {
+        if !self.scheduled.replace(true) {
+            crate::later(self.shell.number(), |_| {});
         }
     }
 
@@ -2088,7 +2038,7 @@ impl BrowserWindow {
 
 
     /// Collapses the expanded address field back to its tab pill, dropping any unsubmitted edit.
-    fn end_address_edit(&mut self, cx: &mut Context<Self>) {
+    fn end_address_edit(&mut self) {
         if !self.address_editing && !self.address_focused {
             return;
         }
@@ -2096,21 +2046,19 @@ impl BrowserWindow {
         self.address_editing = false;
         self.suggestions.clear();
         self.suggestion = None;
-        self.refresh_url(cx);
-        cx.notify();
+        self.refresh_url();
+        self.notify();
     }
 
-    fn request_terminal_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Gives keys to the active terminal; after the windows are placed, so a brand-new one's screen is in the window.
+    fn request_terminal_focus(&mut self) {
         if !std::mem::take(&mut self.focus_terminal) {
             return;
         }
-        let Some(tab) = self.model.lock().active_tab().filter(|tab| is_terminal(&tab.url)).cloned() else {
-            return;
-        };
-        // A brand-new terminal is created here rather than later in this render, so it can take focus now.
-        let view = terminal::terminal_for(&tab.id, &tab.url, cx);
-        self.engine.focus_chrome();
-        window.defer(cx, move |window, cx| window.focus(&view.focus_handle(cx), cx));
+        let active = self.model.lock().active_tab().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone());
+        if let Some(id) = active {
+            self.engine.focus_page(&id);
+        }
     }
 
     /// Opens the find bar on the active window, unless it's a terminal, which has no page to search.
@@ -2151,13 +2099,13 @@ impl BrowserWindow {
 
     /// Moves to the next (or previous, `backwards`) match.
     // shortcut: the index is counted here, so it drifts if the user selects text on the page; read WebKit's match index if that matters.
-    fn find_step(&mut self, backwards: bool, cx: &mut Context<Self>) {
+    fn find_step(&mut self, backwards: bool) {
         if let Some(count) = self.find_count.filter(|&count| count > 0) {
             self.find_index = if backwards { (self.find_index + count - 2) % count + 1 } else { self.find_index % count + 1 };
         }
         let query = self.typed(crate::native::FIND_QUERY);
         self.engine.find(&self.find_tab, &query, backwards);
-        cx.notify();
+        self.notify();
     }
 
     /// The find bar is open on the active window.
@@ -2165,12 +2113,10 @@ impl BrowserWindow {
         self.find_open && self.active_tab_id().is_some_and(|id| id == self.find_tab)
     }
 
-    /// Follows GPUI's focus on the address input. The input's own Focus/Blur events fire only while it is drawn,
-    /// so they went stale once the field collapsed to a pill, and a stale Blur closed the next edit as it opened.
     /// Opens the active window's address field for typing, or closes it, as asked since the last frame.
-    fn request_address_focus(&mut self, cx: &mut Context<Self>) {
+    fn request_address_focus(&mut self) {
         if std::mem::take(&mut self.blur_address) && !self.focus_address {
-            self.end_address_edit(cx);
+            self.end_address_edit();
         }
         if !std::mem::take(&mut self.focus_address) {
             return;
@@ -2203,83 +2149,80 @@ impl BrowserWindow {
     }
 }
 
+/// sRGB with alpha.
+pub(crate) type Color = [f64; 4];
+
 #[derive(Clone, Copy)]
 pub(crate) struct Paint {
-    pub(crate) bg: gpui::Hsla,
-    pub(crate) fg: gpui::Hsla,
-    pub(crate) muted: gpui::Hsla,
-    pub(crate) surface: gpui::Hsla,
-    pub(crate) secondary: gpui::Hsla,
-    pub(crate) border: gpui::Hsla,
-    pub(crate) accent: gpui::Hsla,
-    /// The interface font size setting, in points.
-    pub(crate) font: f32,
+    pub(crate) bg: Color,
+    pub(crate) fg: Color,
+    pub(crate) muted: Color,
+    pub(crate) secondary: Color,
+    pub(crate) border: Color,
+    pub(crate) accent: Color,
 }
 
-impl Paint {
-    /// A text size designed at the 13pt default, scaled to the interface font size setting.
-    pub(crate) fn text(&self, size: f32) -> Pixels {
-        px(size * self.font / 13.)
-    }
+/// Gruvbox dark, the dark palette the app has always had.
+const DARK: Paint = Paint {
+    fg: hex(0xebdbb2),
+    bg: hex(0x282828),
+    secondary: hex(0x504945),
+    border: hex(0x504945),
+    muted: hex(0xa89984),
+    accent: hex(0x8ec07c),
+};
+
+/// Neutral macOS-style light palette.
+const LIGHT: Paint = Paint {
+    fg: hex(0x1d1d1f),
+    bg: hex(0xffffff),
+    secondary: hex(0xe8e8ed),
+    border: hex(0xd2d2d7),
+    muted: hex(0x6e6e73),
+    accent: hex(0x007aff),
+};
+
+thread_local! {
+    /// The palette `apply_theme` picked for the theme setting, the system appearance and the accent.
+    static THEME: Cell<Paint> = const { Cell::new(DARK) };
 }
 
-/// Neutral macOS-style light palette (gpuikit only ships tinted light themes).
-fn light_theme() -> Theme {
-    let mut t = Theme::new(
-        "Light",
-        ThemeVariant::Light,
-        parse_hex("#1d1d1f"), // fg
-        parse_hex("#ffffff"), // bg
-        parse_hex("#f5f5f7"), // surface
-        parse_hex("#d2d2d7"), // border
-        parse_hex("#007aff"), // accent
-    );
-    t.fg_muted_color = Some(parse_hex("#6e6e73"));
-    t.fg_disabled_color = Some(parse_hex("#aeaeb2"));
-    t.surface_secondary_color = Some(parse_hex("#e8e8ed"));
-    t.surface_tertiary_color = Some(parse_hex("#dcdce1"));
-    t.border_secondary_color = Some(parse_hex("#c7c7cc"));
-    t.border_subtle_color = Some(parse_hex("#e5e5ea"));
-    t.info_color = Some(parse_hex("#007aff"));
-    t.success_color = Some(parse_hex("#248a3d"));
-    t.warning_color = Some(parse_hex("#c93400"));
-    t.danger_color = Some(parse_hex("#d70015"));
-    t.button_bg_color = Some(parse_hex("#f5f5f7"));
-    t.button_bg_hover_color = Some(parse_hex("#e8e8ed"));
-    t.button_bg_active_color = Some(parse_hex("#dcdce1"));
-    t.button_border_color = Some(parse_hex("#d2d2d7"));
-    t.input_border_hover_color = Some(parse_hex("#c7c7cc"));
-    t
+/// `0xRRGGBB`, opaque.
+pub(crate) const fn hex(value: u32) -> Color {
+    [((value >> 16) & 0xff) as f64 / 255., ((value >> 8) & 0xff) as f64 / 255., (value & 0xff) as f64 / 255., 1.]
 }
 
-pub(crate) fn paint(cx: &gpui::App) -> Paint {
-    let theme = cx.theme();
-    Paint {
-        bg: theme.bg(),
-        fg: theme.fg(),
-        muted: theme.fg_muted(),
-        surface: theme.surface(),
-        secondary: theme.surface_secondary(),
-        border: theme.border(),
-        accent: theme.accent(),
-        font: crate::terminal::prefs(cx).ui_font_size as f32,
-    }
+/// `#rrggbb` as a colour; malformed digits read as 0.
+pub(crate) fn parse_hex(text: &str) -> Color {
+    let digits = text.trim_start_matches('#');
+    let channel = |at: usize| digits.get(at..at + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()).map_or(0., |v| f64::from(v) / 255.);
+    [channel(0), channel(2), channel(4), 1.]
 }
 
-impl Focusable for BrowserWindow {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
-        self.gesture_focus.clone()
-    }
+/// A colour from hue, saturation and lightness, each 0..=1.
+fn hsl(hue: f64, saturation: f64, lightness: f64) -> Color {
+    let chroma = (1. - (2. * lightness - 1.).abs()) * saturation;
+    let channel = |n: f64| {
+        let k = (n + hue * 12.) % 12.;
+        lightness - chroma / 2. * (k - 3.).min(9. - k).clamp(-1., 1.)
+    };
+    [channel(0.), channel(8.), channel(4.), 1.]
 }
 
-impl Render for BrowserWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.attach(window, cx);
-        self.run_native_input(window, cx);
+pub(crate) fn paint() -> Paint {
+    THEME.get()
+}
+
+impl BrowserWindow {
+    /// Lays the window out and syncs every native view with the model: on a change, an animation frame, a resize.
+    pub(crate) fn frame(&mut self) {
+        self.scheduled.set(false);
+        self.attach();
+        self.run_native_input();
         self.overlay_rects.clear();
         self.space_chips.clear();
         self.rail_badges.clear();
-        // A link drag is AppKit's, not GPUI's: its gap stays until the engine says it left or dropped.
+        // A link drag's gap stays until the engine says it left or dropped.
         // Once a frame, against the slots last laid out, as AppKit reports moves far more often.
         if let Some(at) = self.link_hover {
             self.preview_link(at);
@@ -2291,20 +2234,20 @@ impl Render for BrowserWindow {
         }
         // Only rows drawn this frame count as drop targets.
         self.slots.clear();
-        self.apply_theme(window, cx);
-        self.sync_popover(window);
-        self.sync_sheet(cx);
-        self.sync_settings(cx);
-        self.sync_palette(cx);
+        self.apply_theme();
+        self.sync_popover();
+        self.sync_sheet();
+        self.sync_settings();
+        self.sync_palette();
         self.sync_suggestions();
-        self.sync_homes(cx);
+        self.sync_homes();
         self.sync_find();
         self.sync_toast();
-        self.update_dock(window);
+        self.update_dock();
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
         let active_session = self.model.lock().active_session_id.clone();
         let all_tabs = self.model.lock().tabs.clone();
-        let colors = paint(cx);
+
         // Keep layouts of every open tab, not just this session's, so switching profile and back keeps them.
         let live_ids = all_tabs.iter().map(|tab| tab.id.as_str()).collect::<HashSet<_>>();
         self.chrome.retain(|id, _| live_ids.contains(id.as_str()));
@@ -2319,35 +2262,29 @@ impl Render for BrowserWindow {
         }
         let maximized = tabs.iter().any(|tab| self.chrome.get(&tab.id).is_some_and(|chrome| chrome.maximized));
         // Laid out before the title strips are built, so they show this frame's frames.
-        self.sync_stage(window);
+        self.sync_stage();
         self.prepare_frames(&tabs);
         self.sync_groups();
         // Before the window strips are built, so a click on a tab shows its address field in this very frame: a
         // notify from inside render asks for no further frame, and the field waited for the next event.
-        self.request_address_focus(cx);
-        self.sync_bars(window, cx);
-        self.request_terminal_focus(window, cx);
-        let _subscriptions = &self.subscriptions;
-        let entity = cx.entity();
+        self.request_address_focus();
+        self.sync_bars();
         if let Some(own) = self.model.detached.clone().filter(|_| self.close_window) {
             // Its last tab closed: the window and its space go, tabs and all.
             forget_detached(&mut self.model.shared.lock().unwrap_or_else(PoisonError::into_inner), &own, true);
-            window.remove_window();
+            return self.shell.close();
         }
         if let Some(own) = &self.model.detached {
             // Its space was deleted (with its profile): nothing left to show.
             if !self.model.lock().sessions.iter().any(|session| session.id == *own) {
-                window.remove_window();
+                return self.shell.close();
             }
         }
         if std::mem::take(&mut self.merge_requested) {
-            self.merge_into_main(window, cx);
+            return self.merge_into_main();
         }
         self.save_layouts(&tabs);
         self.step_motion();
-        if self.animating() {
-            window.request_animation_frame();
-        }
         if self.self_test.is_none() {
             // Spaces are separate desktops: pages from the others stay hidden.
             for tab in all_tabs.iter().filter(|tab| tab.session_id != active_session) {
@@ -2362,54 +2299,57 @@ impl Render for BrowserWindow {
                 }
             }
         }
-        // Read before the tree below, which locks the model again while this statement is still open.
-        let (ui_font, line_height) = {
-            let settings = &self.model.lock().settings;
-            (settings.ui_font.clone(), settings.ui_line_height as f32)
-        };
-        v_stack()
-            .relative()
-            .size_full()
-            // Shift pressed or released without moving still shows or drops the swap at once.
-            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, window, cx| {
-                if let Some((x, y)) = this.gesture.as_ref().map(|gesture| gesture.pointer) {
-                    this.track_gesture(gpui::point(px(x), px(y)), event.modifiers.shift, window, cx);
-                }
-            }))
-            .child(div().absolute().track_focus(&self.gesture_focus))
-            .text_color(colors.fg)
-            .text_size(paint(cx).text(13.))
-            .line_height(gpui::relative(line_height))
-            .when(!ui_font.is_empty(), |root| root.font_family(ui_font))
-            // Inputs only ask for keys on a GPUI focus change; clicking one that already had GPUI focus while a page
-            // held first responder left typing going to the page. Once the click settles, give keys to whoever GPUI focused.
-            .capture_any_mouse_down(cx.listener(|_, _: &MouseDownEvent, window, cx| {
-                let view = cx.entity();
-                window.defer(cx, move |window, cx| {
-                    if window.focused(cx).is_some() {
-                        view.update(cx, |view, _| view.engine.focus_chrome());
-                    }
-                });
-            }))
-            .when(self.model.detached.is_some(), |root| root.child(self.titlebar(cx)))
-            .child(
-                h_stack()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .when(self.model.detached.is_none(), |row| row.child(self.rail_ground(cx)))
-                    .child(
-                v_stack()
-                    .relative()
-                    .flex_1()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(self.stage(&tabs, entity, cx))
-                    // No title bar here: the gap windows leave along the stage's top moves the window.
-                    .when(self.model.detached.is_none(), |column| column.child(drag_area().absolute().top_0().left_0().w_full().h(px(SNAP_INSET)))),
-            ),
-            )
-            .when(self.model.detached.is_none(), |root| root.child(self.dock_zone(cx)))
+        // Last, once this frame has laid everything out. A new tab page whose area changed is laid out again next frame.
+        if self.place_windows() {
+            self.notify();
+        }
+        self.request_terminal_focus();
+        self.shell.set_drag_zones(self.drag_zones());
+        self.shell.animate(self.animating());
+    }
+
+    /// Where a press moves the OS window, as a title bar's would: a torn-off window's title bar; in the main window,
+    /// the rail's free space and the gap windows leave along the stage's top.
+    fn drag_zones(&self) -> Vec<LogicalRect> {
+        let (width, height) = self.shell.size();
+        if self.model.detached.is_some() {
+            return vec![LogicalRect { x: 0., y: 0., width, height: f64::from(self.titlebar_h()) }];
+        }
+        let rail = f64::from(crate::rail::RAIL_W);
+        vec![LogicalRect { x: 0., y: 0., width: rail, height }, LogicalRect { x: rail, y: 0., width: width - rail, height: f64::from(SNAP_INSET) }]
+    }
+
+    /// The content's size in points.
+    pub(crate) fn viewport(&self) -> Size {
+        let (width, height) = self.shell.size();
+        size(width as f32, height as f32)
+    }
+
+    /// The OS window's top-left on screen.
+    pub(crate) fn screen_origin(&self) -> Point {
+        let (x, y) = self.shell.origin();
+        point(x as f32, y as f32)
+    }
+
+    /// Whether `at` (window point) is past the OS window's edge and margin: a window let go there tears off.
+    pub(crate) fn torn_off(&self, at: Point) -> bool {
+        let (margin, size) = (TEAR_OFF_MARGIN, self.viewport());
+        !Bounds::new(point(-margin, -margin), crate::geom::size(size.width + margin * 2., size.height + margin * 2.)).contains(&at)
+    }
+
+    /// The OS window was dragged by a drag area; a torn-off window let go over the main window's rail merges back.
+    pub(crate) fn dragged(&mut self, moved: bool, (x, y): (f64, f64)) {
+        let (left, top) = self.shell.origin();
+        if moved && self.model.detached.is_some() && over_main_bar(point((left + x) as f32, (top + y) as f32)) {
+            self.merge_into_main();
+        }
+    }
+
+    /// Shift pressed or released without moving still shows or drops the swap at once.
+    pub(crate) fn shift(&mut self, down: bool) {
+        if let Some((x, y)) = self.gesture.as_ref().map(|gesture| gesture.pointer) {
+            self.track_gesture(point(x, y), down);
+        }
     }
 }
 
@@ -2481,7 +2421,7 @@ impl BrowserWindow {
                 children.push(crate::native::title(display_url(url), 12., Weight::Regular, Ink::Secondary));
             }
             children.push(Node::Spacer);
-            let go = pop.act(move |this, cx| this.commit_navigation(&target, cx));
+            let go = pop.act(move |this| this.commit_navigation(&target));
             let row = Node::Item { height: 26., click: Some(go), drag: None, children };
             rows.push(if self.suggestion == Some(index) { Node::Card { tint: Ink::Accent, child: Box::new(row) } } else { row });
         }
@@ -2491,22 +2431,23 @@ impl BrowserWindow {
     }
 
     /// Builds every piece of native chrome for this frame, and drops what is no longer shown.
-    fn sync_bars(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn sync_bars(&mut self) {
         let mut pop = crate::native::Pop::bar();
         let mut bars = Vec::new();
         self.drag_items.clear();
         self.reorder_lists.clear();
         self.list_arrangements.clear();
-        self.sync_rail(&mut pop, &mut bars, window, cx);
+        self.sync_rail(&mut pop, &mut bars);
+        self.sync_dock(&mut pop, &mut bars);
         if self.model.detached.is_some() {
             // A torn-off window keeps its title bar and the lights in a row along it.
             self.engine.place_traffic_lights((12., 8.), false);
         }
-        self.sync_toolbar(&mut pop, &mut bars, window, cx);
+        self.sync_toolbar(&mut pop, &mut bars);
         let tabs = self.model.lock().session_tabs().into_iter().cloned().collect::<Vec<_>>();
-        self.sync_spaces(&mut pop, &mut bars, &tabs, window, cx);
-        self.sync_frames(&mut pop, &tabs, cx);
-        self.sync_drag_views(&mut bars, &tabs, cx);
+        self.sync_spaces(&mut pop, &mut bars, &tabs);
+        self.sync_frames(&mut pop, &tabs);
+        self.sync_drag_views(&mut bars, &tabs);
         self.engine.keep_bars(&bars);
         self.bar_actions = pop.actions;
     }
@@ -2662,12 +2603,12 @@ impl BrowserWindow {
     }
 
     /// Switches space `id` between tiling and free windows.
-    pub(crate) fn toggle_free(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_free(&mut self, id: &str) {
         let free = !self.model.lock().sessions.iter().any(|session| session.id == id && session.free);
         self.with_model(|model| { let _ = model.set_session_free(id, free); });
         // Into tiling, every window joins from where it is, as with Tile windows.
         self.retile = !free;
-        cx.notify();
+        self.notify();
     }
 
     /// Brings this space's tile tree in line with its tiled windows, then lays their frames out from it:
@@ -2801,7 +2742,7 @@ impl BrowserWindow {
     }
 
     /// Takes `bounds` as the stage's; true if its size changed.
-    fn note_stage(&mut self, bounds: gpui::Bounds<Pixels>) -> bool {
+    fn note_stage(&mut self, bounds: Bounds) -> bool {
         let changed = self.stage_bounds.map(|old| (f64::from(old.size.width) - f64::from(bounds.size.width)).abs() > 1.0 || (f64::from(old.size.height) - f64::from(bounds.size.height)).abs() > 1.0).unwrap_or(true);
         self.stage_bounds = Some(bounds);
         if changed {
@@ -2810,18 +2751,18 @@ impl BrowserWindow {
         changed
     }
 
-    /// The stage for the window's size now, before layout measures it: during a live resize the pages, frames and
-    /// title strips then move in the very frame the window does, rather than one behind.
-    fn sync_stage(&mut self, window: &Window) {
-        if let Some(stage) = self.stage_bounds {
-            let size = window.viewport_size() - self.stage_inset;
-            self.note_stage(gpui::Bounds::new(stage.origin, size));
-        }
+    /// The stage for the window's size now: right of the rail in the main window, under the title bar in a torn-off
+    /// one. Set before anything is placed, so during a live resize everything moves in the very frame the window does.
+    fn sync_stage(&mut self) {
+        let rail = if self.model.detached.is_none() { crate::rail::RAIL_W } else { 0. };
+        let origin = point(rail, self.titlebar_h());
+        let viewport = self.viewport();
+        self.note_stage(Bounds::new(origin, size(viewport.width - origin.x, viewport.height - origin.y)));
     }
 
-    fn track_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, window: &Window, cx: &mut Context<Self>) {
-        let out = torn_off(window, position);
-        self.apply_gesture(position, shift, cx);
+    fn track_gesture(&mut self, position: Point, shift: bool) {
+        let out = self.torn_off(position);
+        self.apply_gesture(position, shift);
         let tears = self.model.detached.is_none();
         // Out past the margin the window leaves on release, so it previews no snap or swap.
         if let Some(gesture) = self.gesture.as_mut().filter(|gesture| out && tears && gesture.kind == GestureKind::Move) {
@@ -2831,7 +2772,7 @@ impl BrowserWindow {
         }
     }
 
-    fn apply_gesture(&mut self, position: gpui::Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+    fn apply_gesture(&mut self, position: Point, shift: bool) {
         let Some(mut gesture) = self.gesture.clone() else {
             return;
         };
@@ -2907,7 +2848,7 @@ impl BrowserWindow {
                     }
                 }
                 self.gesture = Some(gesture);
-                cx.notify();
+                self.notify();
                 return;
             }
         }
@@ -2940,8 +2881,8 @@ impl BrowserWindow {
                                 let _ = model.move_tabs_to_session(&ids, &space);
                                 let _ = model.switch_profile(&profile);
                             });
-                            self.focus_window(&gesture.tab_id, cx);
-                            self.refresh_url(cx);
+                            self.focus_window(&gesture.tab_id);
+                            self.refresh_url();
                         }
                     }
                 } else if over_bar {
@@ -2956,8 +2897,8 @@ impl BrowserWindow {
                             let _ = model.move_tabs_to_session(&ids, &space);
                             let _ = model.switch_session(&space);
                         });
-                        self.focus_window(&gesture.tab_id, cx);
-                        self.refresh_url(cx);
+                        self.focus_window(&gesture.tab_id);
+                        self.refresh_url();
                     }
                 }
                 // With Shift held, a snapped window dropped on another snapped one (away from the snap edges) trades places with it.
@@ -3016,11 +2957,10 @@ impl BrowserWindow {
             entry.frame = Some(frame);
         }
         self.gesture = Some(gesture);
-        // Native views follow in the canvas paint, in the same frame as the GPUI chrome.
-        cx.notify();
+        self.notify();
     }
 
-    fn finish_gesture(&mut self, out: Option<gpui::Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+    fn finish_gesture(&mut self, out: Option<Point>) {
         let carried = self.carried();
         let Some(gesture) = self.gesture.take() else {
             return;
@@ -3039,7 +2979,7 @@ impl BrowserWindow {
             if let Some(entry) = self.chrome.get_mut(&gesture.tab_id) {
                 (entry.frame, entry.restore, entry.snap) = (Some(gesture.start), gesture.restore, None);
             }
-            self.detach_window(&gesture.tab_id, at, cx);
+            self.detach_window(&gesture.tab_id, at);
             return;
         }
         // Released still small: grow into its frame in whichever space is open now.
@@ -3091,11 +3031,8 @@ impl BrowserWindow {
             }
         }
         // The press gave keys to the chrome for the drag; hand them back to the window's page or terminal.
-        if self.gesture_focus.is_focused(window) {
-            window.blur();
-        }
         self.focus_active_content();
-        cx.notify();
+        self.notify();
     }
 
     /// Places pages for this frame; true when a new tab page's area changed size and needs laying out again.
@@ -3114,7 +3051,6 @@ impl BrowserWindow {
         let ids = self.order.clone();
         // `order` spans every space; only this space's windows are on the stage.
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
-        let drawn = self.model.lock().session_tabs().into_iter().filter(|tab| is_terminal(&tab.url)).map(|tab| tab.id.clone()).collect::<Vec<_>>();
         let mut stack = Vec::new();
         let mut resized = false;
         let carried = self.carried().map(|(id, _)| id);
@@ -3136,14 +3072,6 @@ impl BrowserWindow {
             };
             let (scale, alpha) = self.window_motion(&id);
             let frame = scaled(frame, scale);
-            if drawn.contains(&id) {
-                // Its screen is drawn by GPUI, hiding pages behind it; only its native title strip shows through.
-                self.engine.place_tab(&id, None);
-                let shell = LogicalRect { x: origin_x + f64::from(frame.x), y: origin_y + f64::from(frame.y), width: f64::from(frame.w), height: f64::from(frame.h) };
-                let strip = LogicalRect { height: if self.tab_window { 0.0 } else { self.title_h() }, ..shell.clone() };
-                stack.push((id, shell, strip));
-                continue;
-            }
             // A torn-off window's page fills it edge to edge: no title bar, no border.
             let (title_h, inset) = if self.tab_window { (0.0, 0.0) } else { (self.title_h(), PAGE_INSET) };
             let rect = LogicalRect {
@@ -3195,7 +3123,7 @@ impl BrowserWindow {
         resized
     }
 
-    fn begin_move(&mut self, id: &str, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_move(&mut self, id: &str, position: Point) {
         if self.suppress_window_drag {
             self.suppress_window_drag = false;
             return;
@@ -3203,11 +3131,11 @@ impl BrowserWindow {
         // The title bar covers the top edge, so a press there has to resize instead of drag.
         if let Some(edges) = self.edges_under_pointer(id, position) {
             if edges.top {
-                self.begin_resize(id, edges, position, cx);
+                self.begin_resize(id, edges, position);
                 return;
             }
         }
-        self.focus_window(id, cx);
+        self.focus_window(id);
         self.landing = None;
         let Some(start) = self.visual_frame(id) else {
             return;
@@ -3231,14 +3159,11 @@ impl BrowserWindow {
             insert: None,
         });
         self.engine.focus_chrome();
-        if window.focused(cx).is_none() {
-            window.focus(&self.gesture_focus, cx);
-        }
-        cx.notify();
+        self.notify();
     }
 
-    fn begin_resize(&mut self, id: &str, edges: Edges, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        self.focus_window(id, cx);
+    fn begin_resize(&mut self, id: &str, edges: Edges, position: Point) {
+        self.focus_window(id);
         let Some(start) = self.visual_frame(id) else {
             return;
         };
@@ -3270,111 +3195,11 @@ impl BrowserWindow {
             pointer: (f64::from(position.x) as f32, f64::from(position.y) as f32),
         });
         self.engine.focus_chrome();
-        cx.notify();
+        self.notify();
     }
 
     /// The stage under the windows: measured and laid out here, with each terminal's screen drawn where its
     /// page would be. The windows' frames are native, beneath this view (see `frames.rs`).
-    fn stage(&self, tabs: &[browser_core::Tab], entity: Entity<Self>, cx: &mut Context<Self>) -> gpui::Div {
-        let watch = entity.clone();
-        let paint_watch = entity;
-        let mut stage = div().relative().flex_1().w_full().min_h(px(0.)).overflow_hidden().child(
-            canvas(
-                move |bounds, window, cx| {
-                    let inset = window.viewport_size() - bounds.size;
-                    // Measured mid-draw, after this frame laid the windows out; a notify now would be dropped, so a
-                    // stage `render` got wrong (its surroundings changed) is laid out again next frame.
-                    if watch.update(cx, |view, _| {
-                        view.stage_inset = inset;
-                        view.note_stage(bounds)
-                    }) {
-                        window.request_animation_frame();
-                    }
-                },
-                move |_, _, window, cx| {
-                    // A new tab page's area changed size: it is laid out again next frame (a notify mid-draw is dropped).
-                    if paint_watch.update(cx, |view, _| view.place_windows()) {
-                        window.request_animation_frame();
-                    }
-                },
-            )
-            .absolute()
-            .size_full(),
-        );
-        let carried = self.carried().map(|(id, _)| id);
-        // Each window's shadow on the stage, back to front: deep under the focused one, as macOS gives the key
-        // window, and faint under the rest. Inside a window its own page or screen covers it.
-        if !self.tab_window {
-            let shown = self.shown_tabs(tabs).into_iter().filter(|tab| carried.as_deref() != Some(tab.id.as_str())).collect::<Vec<_>>();
-            for id in self.order.iter().filter(|id| shown.iter().any(|tab| tab.id == **id)) {
-                let Some(frame) = self.visual_frame(id) else {
-                    continue;
-                };
-                let (scale, alpha) = self.window_motion(id);
-                let frame = scaled(frame, scale);
-                let active = shown.iter().any(|tab| tab.id == *id && tab.active);
-                let shadow = if active {
-                    vec![gpui::BoxShadow::new(px(0.), px(10.), gpui::hsla(0., 0., 0., 0.38 * alpha)).blur_radius(px(30.))]
-                } else {
-                    vec![gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.16 * alpha)).blur_radius(px(8.))]
-                };
-                stage = stage.child(div().absolute().left(px(frame.x)).top(px(frame.y)).w(px(frame.w)).h(px(frame.h)).rounded(px(WINDOW_RADIUS as f32)).shadow(shadow));
-            }
-        }
-        for tab in self.shown_tabs(tabs).into_iter().filter(|tab| is_terminal(&tab.url) && carried.as_deref() != Some(tab.id.as_str())) {
-            if let Some(screen) = self.terminal_screen(tab, cx) {
-                stage = stage.child(screen);
-            }
-        }
-        stage
-    }
-
-    /// A terminal window's screen, in its frame below the native title strip.
-    fn terminal_screen(&self, tab: &browser_core::Tab, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        let paint = paint(cx);
-        let frame = self.visual_frame(&tab.id)?;
-        let (scale, alpha) = self.window_motion(&tab.id);
-        let frame = scaled(frame, scale);
-        let (title_h, inset) = if self.tab_window { (0., 0.) } else { (self.title_h() as f32, PAGE_INSET as f32) };
-        let ring = paint.border;
-        Some(
-            div()
-                .absolute()
-                .left(px(frame.x))
-                .top(px(frame.y + title_h - 1.))
-                .w(px(frame.w))
-                .h(px(frame.h - title_h + 1.))
-                .opacity(alpha)
-                // The frame's ring, which this screen covers along the sides and bottom.
-                .when(!self.tab_window, |screen| screen.border_1().border_t_0().border_color(ring).rounded_b(px(WINDOW_RADIUS as f32)))
-                .child(
-                    div()
-                        // A click here must itself take keys back from a page that had them, and make this the
-                        // active tab (else ⌘W closes the other one).
-                        .capture_any_mouse_down({
-                            let id = tab.id.clone();
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                this.engine.focus_chrome();
-                                this.focus_window(&id, cx);
-                            })
-                        })
-                        // Only right clicks the program didn't take reach here; see TerminalView's handler.
-                        .on_mouse_down(MouseButton::Right, {
-                            let id = tab.id.clone();
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| this.open_term_menu(id.clone(), event.position, cx))
-                        })
-                        .size_full()
-                        .mt(px(1.))
-                        .mx(px(inset - 1.).max(px(0.)))
-                        .rounded_b(px(PAGE_RADIUS as f32))
-                        .overflow_hidden()
-                        .bg(paint.bg)
-                        // Cached: the screen rebuilds only when the terminal itself notifies, not on every chrome repaint.
-                        .child(terminal::terminal_for(&tab.id, &tab.url, cx).cached(gpui::StyleRefinement::default().size_full())),
-                ),
-        )
-    }
-
     /// Where `snap` puts window `id`, fitted beside this space's other snapped windows.
     fn snap_frame(&self, snap: Snap, id: &str, sw: f32, sh: f32) -> Frame {
         let current = self.model.lock().session_tabs().into_iter().map(|tab| tab.id.clone()).collect::<Vec<_>>();
@@ -3408,7 +3233,7 @@ impl BrowserWindow {
         Some((gesture.tab_id.clone(), frame))
     }
 
-    fn edges_under_pointer(&self, id: &str, position: gpui::Point<Pixels>) -> Option<Edges> {
+    fn edges_under_pointer(&self, id: &str, position: Point) -> Option<Edges> {
         let frame = self.visual_frame(id)?;
         let stage = self.stage_bounds?;
         let x = (f64::from(position.x) - f64::from(stage.origin.x)) as f32 - frame.x;
@@ -3431,7 +3256,7 @@ impl BrowserWindow {
         Frame { x: margin, y: margin, w: (w - margin * 2.0).max(1.0), h: (h - margin * 2.0).max(1.0) }
     }
 
-    pub(crate) fn focus_window(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn focus_window(&mut self, id: &str) {
         self.order.retain(|existing| existing != id);
         self.order.push(id.to_string());
         if let Some(entry) = self.chrome.get_mut(id) {
@@ -3439,12 +3264,12 @@ impl BrowserWindow {
         }
         if self.active_tab_id().as_deref() != Some(id) {
             self.with_model(|model| { let _ = model.activate_tab(id); });
-            self.refresh_url(cx);
+            self.refresh_url();
         }
         // After placing: a page un-minimized just now is hidden until placed, and AppKit won't focus a hidden view.
         let _ = self.place_windows();
         self.focus_active_content();
-        cx.notify();
+        self.notify();
     }
 
     /// The profile of window `id` when it was moved in from another profile than the open one.
@@ -3465,14 +3290,14 @@ impl BrowserWindow {
             .collect()
     }
 
-    fn minimize_window(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn minimize_window(&mut self, id: &str) {
         let entry = self.chrome.entry(id.to_string()).or_default();
         entry.minimized = true;
         entry.maximized = false;
-        cx.notify();
+        self.notify();
     }
 
-    fn toggle_maximize(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn toggle_maximize(&mut self, id: &str) {
         let next = !self.chrome.get(id).is_some_and(|chrome| chrome.maximized);
         for chrome in self.chrome.values_mut() {
             chrome.maximized = false;
@@ -3480,14 +3305,14 @@ impl BrowserWindow {
         let entry = self.chrome.entry(id.to_string()).or_default();
         entry.maximized = next;
         entry.minimized = false;
-        self.focus_window(id, cx);
+        self.focus_window(id);
     }
 
     /// Closes every tab of the window holding `id`.
-    fn close_window(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn close_window(&mut self, id: &str) {
         let group = self.group_id(id);
         let members = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
-        self.close_tabs(members, cx);
+        self.close_tabs(members);
     }
 
     /// The shown window nearest the active one in direction `dir`.
@@ -3507,7 +3332,7 @@ impl BrowserWindow {
     }
 
     /// Tiled: trades places with the neighbour that way. Free: snaps to that half of the stage.
-    fn move_window(&mut self, dir: Dir, cx: &mut Context<Self>) {
+    fn move_window(&mut self, dir: Dir) {
         let Some(active) = self.active_tab_id() else {
             return;
         };
@@ -3533,7 +3358,7 @@ impl BrowserWindow {
             }
         }
         let _ = self.place_windows();
-        cx.notify();
+        self.notify();
     }
 
     /// Switches to the next space (`step` 1) or the previous one (-1), in the order the spaces bar shows.
@@ -3554,42 +3379,6 @@ impl BrowserWindow {
     }
 
     /// A torn-off window's title bar: what its native spaces and tools don't cover drags the window.
-    fn titlebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let paint = paint(cx);
-        h_stack().h(px(self.titlebar_h())).w_full().flex_none().bg(paint.surface).border_b_1().border_color(paint.border).child(self.bar_area(cx).flex_1())
-    }
-
-    /// The main window's rail column under the native rail: its free space drags the window, as a title bar's
-    /// would, and it is where torn-off windows and spaces are dropped to come back.
-    fn rail_ground(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let main = cx.entity().downgrade();
-        drag_area()
-            .relative()
-            .flex_none()
-            .w(px(crate::rail::RAIL_W))
-            .child(canvas(move |bounds, window, _| MAIN_BAR.with(|cell| *cell.borrow_mut() = Some((main, gpui::Window::window_handle(window), bounds))), |_, _, _, _| {}).absolute().size_full())
-    }
-
-    /// Empty title bar space. In a torn-off window, dragging it onto the main window's bar merges the two.
-    fn bar_area(&self, cx: &mut Context<Self>) -> gpui::Div {
-        if self.model.detached.is_none() {
-            return drag_area();
-        }
-        div().h_full().on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
-            if event.click_count == 2 {
-                window.titlebar_double_click();
-                return;
-            }
-            let before = window.bounds().origin;
-            // AppKit runs the move in its own loop and returns on release; the grab point stays put in the window.
-            window.start_window_move();
-            let after = window.bounds().origin;
-            if after != before && over_main_bar(after + event.position, cx) {
-                this.merge_into_main(window, cx);
-            }
-        }))
-    }
-
     /// The shown tab of a torn-off window and all its tabs in order.
     fn window_front<'a>(&self, all_tabs: &'a [browser_core::Tab], session: &str) -> Option<(String, Vec<&'a browser_core::Tab>)> {
         let mut members = all_tabs.iter().filter(|tab| tab.session_id == session).collect::<Vec<_>>();
@@ -3600,11 +3389,11 @@ impl BrowserWindow {
     }
 
     /// Gives this torn-off window's pages and layout back to the main window and closes this one.
-    fn merge_into_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn merge_into_main(&mut self) {
         let Some(own) = self.model.detached.clone() else {
             return;
         };
-        let Some(main) = MAIN_BAR.with(|cell| cell.borrow().as_ref().and_then(|(main, ..)| main.upgrade())) else {
+        let Some(main) = crate::main_window() else {
             return;
         };
         let ids = self.model.lock().tabs.iter().filter(|tab| tab.session_id == own).map(|tab| tab.id.clone()).collect::<Vec<_>>();
@@ -3619,12 +3408,15 @@ impl BrowserWindow {
             }
         }
         let tab_window = self.tab_window;
-        window.remove_window();
-        main.update(cx, |main, cx| main.take_back(&own, tab_window, pages, chrome, cx));
+        self.shell.close();
+        crate::update(main, |main| {
+            main.take_back(&own, tab_window, pages, chrome);
+            main.notify();
+        });
     }
 
     /// Main window: takes back a torn-off space, or a torn-off window into the space it shows now.
-    fn take_back(&mut self, space: &str, tab_window: bool, pages: Vec<(String, LiveTab)>, chrome: HashMap<String, TabChrome>, cx: &mut Context<Self>) {
+    fn take_back(&mut self, space: &str, tab_window: bool, pages: Vec<(String, LiveTab)>, chrome: HashMap<String, TabChrome>) {
         let first = pages.first().map(|(id, _)| id.clone());
         for (id, page) in pages {
             self.engine.adopt_tab(&id, page);
@@ -3639,7 +3431,7 @@ impl BrowserWindow {
             self.with_model(|model| {
                 let _ = model.switch_session(space);
             });
-            self.refresh_url(cx);
+            self.refresh_url();
             return;
         }
         let profile = self.model.lock().sessions.iter().find(|s| s.id == space).map(|s| s.profile_id.clone());
@@ -3658,32 +3450,32 @@ impl BrowserWindow {
             let _ = model.delete_session(space);
         });
         if let Some(id) = first {
-            self.focus_window(&id, cx);
+            self.focus_window(&id);
         }
-        self.refresh_url(cx);
+        self.refresh_url();
     }
 
     /// Moves the window holding `id` into a new space and opens that space in an OS window at `at` (screen point).
-    fn detach_window(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn detach_window(&mut self, id: &str, at: Point) {
         let group = self.group_id(id);
         let ids = self.chrome.keys().filter(|other| self.group_of(other) == group).cloned().collect::<Vec<_>>();
-        self.detach_tabs(&ids, at, cx);
+        self.detach_tabs(&ids, at);
     }
 
     /// Moves `ids` into a new space and opens that space in an OS window at `at` (screen point).
-    fn detach_tabs(&mut self, ids: &[String], at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn detach_tabs(&mut self, ids: &[String], at: Point) {
         let Ok(space) = self.with_model(|model| model.create_empty_session()) else {
             return;
         };
         self.with_model(|model| {
-            let _ = model.move_tabs_to_session(&ids, &space);
+            let _ = model.move_tabs_to_session(ids, &space);
         });
-        self.open_space_window(&space, true, at, cx);
+        self.open_space_window(&space, true, at);
     }
 
     /// Hands `space` with its live pages and window layout to a new OS window at `at` (screen point).
     /// `tab_window`: `space` is a hidden one holding a torn-off window.
-    fn open_space_window(&mut self, space: &str, tab_window: bool, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn open_space_window(&mut self, space: &str, tab_window: bool, at: Point) {
         if self.model.detached.is_some() {
             return;
         }
@@ -3712,20 +3504,20 @@ impl BrowserWindow {
         self.order.retain(|id| !ids.contains(id));
         let (model, extensions, space) = (self.model.shared.clone(), self.engine.extensions().clone(), space.to_string());
         // A grab near the title bar's left end, so the new window lands under the pointer.
-        let at = at - gpui::point(px(80.), px(16.));
-        cx.defer(move |cx| open_space(cx, model, extensions, space, tab_window, pages, chrome, at));
-        self.refresh_url(cx);
+        let at = at - point(80., 16.);
+        crate::defer(move || open_space(model, extensions, space, tab_window, pages, chrome, at));
+        self.refresh_url();
     }
 
     /// Opens a new tab inside the window holding `id`, sharing its frame. `None` opens the new-tab page
     /// with the address field focused.
-    pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>, cx: &mut Context<Self>) {
+    pub(crate) fn new_tab_in(&mut self, id: &str, url: Option<&str>) {
         if self.chrome.get(id).is_some_and(|chrome| chrome.panel.is_some()) {
             // A side panel holds only its extension page: the new tab gets a regular window.
             let Ok(new) = self.with_model(|model| model.create_tab(&url.map_or_else(|| model.settings.new_tab_url(), str::to_string))) else {
                 return;
             };
-            self.focus_window(&new, cx);
+            self.focus_window(&new);
             self.focus_address = url.is_none();
             return;
         }
@@ -3737,14 +3529,14 @@ impl BrowserWindow {
             return;
         };
         self.chrome.insert(new.clone(), chrome);
-        self.focus_window(&new, cx);
+        self.focus_window(&new);
         self.focus_address = url.is_none();
     }
 
     /// A link opened from tab `from`'s page: the new tab lands right after `from` and the tabs it
     /// opened before, so several links keep their order.
-    fn open_from(&mut self, from: &str, url: &str, cx: &mut Context<Self>) {
-        self.new_tab_in(from, Some(url), cx);
+    fn open_from(&mut self, from: &str, url: &str) {
+        self.new_tab_in(from, Some(url));
         let Some(child) = self.active_tab_id().filter(|child| child != from) else {
             return;
         };
@@ -3757,50 +3549,50 @@ impl BrowserWindow {
     }
 
     /// Links opened from other apps: ask which profile takes them, or use the active one.
-    pub(crate) fn open_external(&mut self, urls: Vec<String>, cx: &mut Context<Self>) {
+    pub(crate) fn open_external(&mut self, urls: Vec<String>) {
         let (ask, active) = {
             let model = self.model.lock();
             (model.settings.ask_link_profile && model.profiles.len() > 1, model.active_profile_id.clone())
         };
         if ask {
             self.pending_links.extend(urls);
-            cx.notify();
+            self.notify();
         } else {
-            self.open_links_in(&active, urls, cx);
+            self.open_links_in(&active, urls);
         }
     }
 
     /// Switches to `profile` and opens each link in a new tab, as Cmd+T would.
-    pub(crate) fn open_links_in(&mut self, profile: &str, urls: Vec<String>, cx: &mut Context<Self>) {
+    pub(crate) fn open_links_in(&mut self, profile: &str, urls: Vec<String>) {
         if self.model.lock().active_profile_id != profile {
             self.with_model(|model| { let _ = model.switch_profile(profile); });
-            self.refresh_url(cx);
+            self.refresh_url();
         }
         for url in urls {
             match self.active_tab_id() {
-                Some(id) => self.new_tab_in(&id, Some(&url), cx),
+                Some(id) => self.new_tab_in(&id, Some(&url)),
                 None => {
                     if let Ok(id) = self.with_model(|model| model.create_tab(&url)) {
-                        self.focus_window(&id, cx);
+                        self.focus_window(&id);
                     }
                 }
             }
         }
-        cx.notify();
+        self.notify();
     }
 
     /// The + button: a new tab in the window holding `id`, or a terminal with Shift held.
-    fn click_new_tab(&mut self, id: &str, shift: bool, cx: &mut Context<Self>) {
+    fn click_new_tab(&mut self, id: &str, shift: bool) {
         if shift {
-            self.focus_window(id, cx);
-            self.on_shortcut(Shortcut::NewTerminal, cx);
+            self.focus_window(id);
+            self.on_shortcut(Shortcut::NewTerminal);
         } else {
-            self.new_tab_in(id, None, cx);
+            self.new_tab_in(id, None);
         }
     }
 
     /// Moves a tab into the window holding `target`, in front, sharing its frame.
-    fn move_tab_to_window(&mut self, id: &str, target: &str, cx: &mut Context<Self>) {
+    fn move_tab_to_window(&mut self, id: &str, target: &str) {
         let group = self.group_id(target);
         if self.group_of(id) == group {
             return;
@@ -3808,11 +3600,11 @@ impl BrowserWindow {
         let mut chrome = self.chrome.get(target).cloned().unwrap_or_default();
         chrome.window = Some(group);
         self.chrome.insert(id.to_string(), chrome);
-        self.focus_window(id, cx);
+        self.focus_window(id);
     }
 
     /// Pulls a tab out of its window into one of its own, under the pointer.
-    pub(crate) fn detach_tab(&mut self, id: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn detach_tab(&mut self, id: &str, at: Point) {
         if self.group_len(id) < 2 {
             return;
         }
@@ -3841,7 +3633,7 @@ impl BrowserWindow {
         if !self.reduce_motion {
             self.opened.insert(id.to_string(), Instant::now());
         }
-        self.focus_window(id, cx);
+        self.focus_window(id);
     }
 
     /// The window being carried to another space and where it is drawn, in window coordinates:
@@ -3867,10 +3659,10 @@ impl BrowserWindow {
     }
 
     /// How far `id` is still drawn from its slot while it slides into place.
-    fn slide_offset(&self, id: &str) -> gpui::Point<Pixels> {
-        self.slides.get(id).map_or_else(gpui::Point::default, |(from, at)| {
+    fn slide_offset(&self, id: &str) -> Point {
+        self.slides.get(id).map_or_else(Point::default, |(from, at)| {
             let left = 1.0 - ease(at.elapsed().as_secs_f32() / SLIDE_ANIM.as_secs_f32());
-            gpui::point(from.x * left, from.y * left)
+            point(from.x * left, from.y * left)
         })
     }
 
@@ -3880,7 +3672,7 @@ impl BrowserWindow {
         if self.reduce_motion {
             return;
         }
-        let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
+        let along = |p: Point| if vertical { p.y } else { p.x };
         let start = before.iter().filter_map(|id| self.slots.get(id)).map(|slot| along(slot.origin)).reduce(|a, b| if b < a { b } else { a });
         let (Some(start), Some(size)) = (start, self.reorder.as_ref().map(|state| state.size)) else {
             return;
@@ -3888,19 +3680,19 @@ impl BrowserWindow {
         // A dragged item new to the row has no slot here yet, but its size is known.
         let slot_of = |id: &String| self.slots.get(id).copied().filter(|_| before.contains(id));
         let span = |id: &String| slot_of(id).map_or(size, |slot| slot.size);
-        let length = |ids: &[String]| ids.iter().map(|id| if vertical { span(id).height } else { span(id).width } + px(gap)).fold(px(0.), |a, b| a + b);
+        let length = |ids: &[String]| ids.iter().map(|id| if vertical { span(id).height } else { span(id).width } + (gap)).fold(0., |a, b| a + b);
         // Tab rows sit centred in their title bar, so one that grows or shrinks moves its start by half the change.
         let mut next = if vertical { start } else { start - (length(after) - length(before)) / 2. };
         let now = Instant::now();
         for id in after {
             let slot = slot_of(id);
             let target = match slot {
-                Some(slot) if vertical => gpui::point(slot.origin.x, next),
-                Some(slot) => gpui::point(next, slot.origin.y),
-                None => gpui::Point::default(),
+                Some(slot) if vertical => point(slot.origin.x, next),
+                Some(slot) => point(next, slot.origin.y),
+                None => Point::default(),
             };
             let span = span(id);
-            next += if vertical { span.height } else { span.width } + px(gap);
+            next += if vertical { span.height } else { span.width } + (gap);
             match slot {
                 Some(slot) => {
                     let from = slot.origin + self.slide_offset(id);
@@ -3939,14 +3731,14 @@ impl BrowserWindow {
     /// Opens a gap under the dragged `id` in whichever of `rows` it is over (the front one wins),
     /// sliding that row's items aside and closing the gap in the row it left.
     /// `origin` is where the dragged item's top-left is drawn; its centre decides the gap.
-    fn preview_drag(&mut self, id: &str, origin: gpui::Point<Pixels>, rows: Vec<(String, Vec<String>)>, vertical: bool, gap: f32) {
+    fn preview_drag(&mut self, id: &str, origin: Point, rows: Vec<(String, Vec<String>)>, vertical: bool, gap: f32) {
         let old = self.reorder.take().filter(|state| state.id == id);
         let Some(size) = old.as_ref().map(|state| state.size).or_else(|| self.slots.get(id).map(|slot| slot.size)) else {
             return;
         };
-        let along = |p: gpui::Point<Pixels>| if vertical { p.y } else { p.x };
-        let across = |p: gpui::Point<Pixels>| if vertical { p.x } else { p.y };
-        let probe = origin + gpui::point(size.width / 2., size.height / 2.);
+        let along = |p: Point| if vertical { p.y } else { p.x };
+        let across = |p: Point| if vertical { p.x } else { p.y };
+        let probe = origin + point(size.width / 2., size.height / 2.);
         let (length, depth) = if vertical { (size.height, size.width) } else { (size.width, size.height) };
         let mut target = None;
         for (key, ids) in &rows {
@@ -3990,35 +3782,35 @@ impl BrowserWindow {
     }
 
     /// Safari compact: a click selects a tab, a click on the selected one edits its address.
-    fn click_tab(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn click_tab(&mut self, id: &str) {
         // The shown tab is the address field, focused window or not, as clicking Safari's field always edits it.
         let edit = self.is_front(id);
-        self.focus_window(id, cx);
+        self.focus_window(id);
         if edit {
             self.focus_address = true;
             self.edit_in_strip = true;
         }
-        cx.notify();
+        self.notify();
     }
 
     /// A tab dropped on a window lands where the drag showed it in that window's tabs.
-    fn drop_tab_on(&mut self, id: &str, target: &str, at: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    fn drop_tab_on(&mut self, id: &str, target: &str, at: Point) {
         let group = self.group_id(target);
         let own = self.group_of(id) == group;
         if own && self.tab_press.take().is_some_and(|press| (at - press).magnitude() < TAP_SLOP) {
             self.reorder = None;
-            self.click_tab(id, cx);
+            self.click_tab(id);
             return;
         }
         let order = self.dropped_order(id, &group);
         self.reorder = None;
         // Only the tab row takes a tab in; dropped on the window's body it becomes a window of its own.
         if order.is_none() && self.group_len(id) > 1 {
-            self.detach_tab(id, at, cx);
+            self.detach_tab(id, at);
             return;
         }
         if !own && order.is_some() {
-            self.move_tab_to_window(id, target, cx);
+            self.move_tab_to_window(id, target);
         }
         if let Some(order) = &order {
             self.move_into_gap(id, order);
@@ -4027,7 +3819,7 @@ impl BrowserWindow {
         if order.is_some() || own {
             self.land(id, at - self.tab_grab.get());
         }
-        cx.notify();
+        self.notify();
     }
 
     /// Moves `id` to its place in `order`, a window's row as dropped.
@@ -4048,27 +3840,27 @@ impl BrowserWindow {
 
     /// Opens a gap in the tab row under a link dragged from a page, as for a dragged tab.
     fn preview_link(&mut self, at: (f64, f64)) {
-        let size = gpui::size(px(120.), px(self.pill_h()));
+        let size = size(120., self.pill_h());
         if self.reorder.as_ref().is_none_or(|state| state.id != LINK_DROP) {
-            self.reorder = Some(Reorder { id: LINK_DROP.into(), size, at: gpui::Point::default(), row: None, order: Vec::new() });
+            self.reorder = Some(Reorder { id: LINK_DROP.into(), size, at: Point::default(), row: None, order: Vec::new() });
         }
-        let origin = gpui::point(px(at.0 as f32), px(at.1 as f32)) - gpui::point(size.width / 2., size.height / 2.);
+        let origin = point(at.0 as f32, at.1 as f32) - point(size.width / 2., size.height / 2.);
         let rows = self.tab_rows();
         self.preview_drag(LINK_DROP, origin, rows, false, 2.0);
     }
 
     /// A link dropped into a tab row's gap opens there as a new tab of that window.
-    fn drop_link(&mut self, url: &str, at: (f64, f64), cx: &mut Context<Self>) {
+    fn drop_link(&mut self, url: &str, at: (f64, f64)) {
         self.preview_link(at);
         let dropped = self.reorder.take().and_then(|state| state.row.map(|_| state.order));
-        cx.notify();
+        self.notify();
         let Some(mut order) = dropped else {
             return;
         };
         let Some(member) = order.iter().find(|id| *id != LINK_DROP).cloned() else {
             return;
         };
-        self.new_tab_in(&member, Some(url), cx);
+        self.new_tab_in(&member, Some(url));
         let Some(new) = self.active_tab_id() else {
             return;
         };
@@ -4081,7 +3873,7 @@ impl BrowserWindow {
     }
 
     /// Glides a dropped item from where its drag preview was into its slot; the others already sit in theirs.
-    fn land(&mut self, id: &str, from: gpui::Point<Pixels>) {
+    fn land(&mut self, id: &str, from: Point) {
         if !self.reduce_motion {
             let width = frames::drag_pill_w(self.slots.get(id).map_or(160., |slot| f64::from(slot.size.width)));
             self.tab_landing = Some((id.to_string(), from, width, Instant::now()));
@@ -4089,7 +3881,7 @@ impl BrowserWindow {
     }
 
     /// The landing tab and how far along its glide is, while it glides.
-    pub(crate) fn landing(&self) -> Option<(&str, gpui::Point<Pixels>, f64, f32)> {
+    pub(crate) fn landing(&self) -> Option<(&str, Point, f64, f32)> {
         let (id, from, width, at) = self.tab_landing.as_ref()?;
         let t = at.elapsed().as_secs_f32() / SLIDE_ANIM.as_secs_f32();
         (t < 1.).then(|| (id.as_str(), *from, *width, ease(t)))
@@ -4172,9 +3964,9 @@ impl BrowserWindow {
             None => String::new(),
         };
         let mut pop = crate::native::Pop::find();
-        let previous = pop.act(|this, cx| this.find_step(true, cx));
-        let next = pop.act(|this, cx| this.find_step(false, cx));
-        let close = pop.act(|this, _| this.close_find());
+        let previous = pop.act(|this| this.find_step(true));
+        let next = pop.act(|this| this.find_step(false));
+        let close = pop.act(|this| this.close_find());
         let content = Node::Column {
             gap: 0.,
             pad: (10., 4.),
@@ -4198,17 +3990,17 @@ impl BrowserWindow {
     }
 
     /// A key from the find bar's field: Return finds the next match, ⇧Return the previous, Esc closes it.
-    fn find_key(&mut self, key: &str, cx: &mut Context<Self>) {
+    fn find_key(&mut self, key: &str) {
         match key {
-            "enter" => self.find_step(false, cx),
-            "shift-enter" => self.find_step(true, cx),
+            "enter" => self.find_step(false),
+            "shift-enter" => self.find_step(true),
             "escape" => {
                 self.close_find();
                 self.focus_active_content();
             }
             _ => {}
         }
-        cx.notify();
+        self.notify();
     }
 
     /// "site wants to use your camera" with Allow / Don't Allow, floating at the top of the window while WebKit waits.
@@ -4224,7 +4016,7 @@ impl BrowserWindow {
         let host = origin.split("://").nth(1).unwrap_or(&origin).to_string();
         let mut answer = |allow: bool| {
             let (origin, kind) = (origin.clone(), kind.clone());
-            pop.act(move |this, _| {
+            pop.act(move |this| {
                 let _ = this.model.lock().set_permission(&origin, &kind, if allow { "allow" } else { "deny" });
                 this.sync_permissions();
                 this.engine.answer_permission(request, allow);
@@ -4241,17 +4033,17 @@ impl BrowserWindow {
     }
 
     /// Brings the first waiting dialog's page to the front, with the prompt's preset text and the keys.
-    fn raise_dialog(&mut self, cx: &mut Context<Self>) {
+    fn raise_dialog(&mut self) {
         let Some(dialog) = self.dialogs.first() else {
             return;
         };
         let (tab_id, default) = (dialog.tab_id.clone(), dialog.default.clone());
         self.popover_texts.insert(crate::native::DIALOG_INPUT, default);
-        self.focus_window(&tab_id, cx);
+        self.focus_window(&tab_id);
     }
 
     /// Answers dialog `request` if it is the one showing: a key and a click can both land on the same one.
-    fn answer_dialog(&mut self, request: u64, ok: bool, cx: &mut Context<Self>) {
+    fn answer_dialog(&mut self, request: u64, ok: bool) {
         if self.dialogs.first().map(|dialog| dialog.request) != Some(request) {
             return;
         }
@@ -4261,9 +4053,9 @@ impl BrowserWindow {
         if self.dialogs.is_empty() {
             self.focus_active_content();
         } else {
-            self.raise_dialog(cx);
+            self.raise_dialog();
         }
-        cx.notify();
+        self.notify();
     }
 
     /// The page dialog in front, floating at the top of the window while the page waits.
@@ -4280,7 +4072,7 @@ impl BrowserWindow {
             DialogKind::Confirm | DialogKind::Prompt => (format!("{host} says"), dialog.message.clone(), Some("Cancel"), "OK"),
             DialogKind::OpenApp => (format!("Open \u{201c}{}\u{201d}?", dialog.message), format!("{host} wants to open this app."), Some("Cancel"), "Open"),
         };
-        let confirm = pop.act(move |this, cx| this.answer_dialog(request, true, cx));
+        let confirm = pop.act(move |this| this.answer_dialog(request, true));
         let mut body = Vec::new();
         if !message.is_empty() {
             body.push(Node::Scroll { max: 320., child: Box::new(para(message, 13., crate::native::Ink::Primary)) });
@@ -4290,7 +4082,7 @@ impl BrowserWindow {
         }
         let mut buttons = Vec::new();
         if let Some(label) = cancel {
-            buttons.push(button(label, pop.act(move |this, cx| this.answer_dialog(request, false, cx)), Style::Plain, Key::Escape));
+            buttons.push(button(label, pop.act(move |this| this.answer_dialog(request, false)), Style::Plain, Key::Escape));
         }
         // An alert has no Cancel, so Esc dismisses it like OK; otherwise Return is OK.
         buttons.push(button(ok, confirm, Style::Primary, if cancel.is_some() { Key::Return } else { Key::Escape }));
@@ -4434,7 +4226,7 @@ impl Snap {
 /// Pointer distance from a stage edge that arms a snap.
 const SNAP_EDGE: f32 = 14.0;
 /// How far a pressed tab pill may wobble and still count as a click rather than a drag.
-const TAP_SLOP: f64 = 6.0;
+const TAP_SLOP: f32 = 6.0;
 /// How far past the app window's edge a dragged window must be released to tear off, so snaps near the edge stay snaps.
 const TEAR_OFF_MARGIN: f32 = 48.0;
 /// On a side edge, this close to the top or bottom snaps to a quarter.
@@ -4693,16 +4485,6 @@ fn ease(t: f32) -> f32 {
 }
 
 /// Empty title bar space that drags the app window and zooms it on double click.
-fn drag_area() -> gpui::Div {
-    div().h_full().on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
-        if event.click_count == 2 {
-            window.titlebar_double_click();
-        } else {
-            window.start_window_move();
-        }
-    })
-}
-
 /// Whether `id` sits above every other tab in `order` (back to front) that `same` puts in its group.
 fn raised_last(order: &[String], id: &str, same: impl Fn(&str) -> bool) -> bool {
     let later = match order.iter().position(|other| other == id) {
@@ -4725,8 +4507,6 @@ fn find_count_js(query: &str) -> String {
 const TITLE_H: f64 = 30.0;
 /// Window border beside and below the page; PAGE_RADIUS in the macOS engine is WINDOW_RADIUS minus this.
 const PAGE_INSET: f64 = 1.0;
-/// Must match PAGE_RADIUS in the macOS engine, which rounds the page's bottom corners.
-const PAGE_RADIUS: f64 = WINDOW_RADIUS - PAGE_INSET;
 
 /// Visible parts of each page, as disjoint rects: a page is hidden wherever a window in front of it sits.
 /// `stack` is back to front: (tab id, window shell, page rect). Pages never show outside `stage`.
@@ -4935,7 +4715,7 @@ pub(crate) fn favicon_path(host: &str) -> std::path::PathBuf {
     app_support_dir().join("favicons").join(format!("icon-{name}"))
 }
 
-/// A new tab: drawn by GPUI as the new-tab page, its web view kept hidden until it navigates.
+/// A new tab: shown as the native new-tab page, its web view kept hidden until it navigates.
 pub(crate) fn is_blank(url: &str) -> bool {
     url.is_empty() || url == "about:blank" || url == "nxbrowser://home"
 }
@@ -4944,12 +4724,12 @@ fn is_web(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://")
 }
 
-pub(crate) fn site_color(host: &str) -> gpui::Hsla {
+pub(crate) fn site_color(host: &str) -> Color {
     let mut hash = 0u32;
     for byte in host.bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
     }
-    gpui::hsla((hash % 360) as f32 / 360.0, 0.62, 0.38, 1.)
+    hsl(f64::from(hash % 360) / 360., 0.62, 0.38)
 }
 
 fn full_title(tab: &browser_core::Tab) -> String {
@@ -4968,12 +4748,6 @@ pub(crate) struct Handoff {
     chrome: HashMap<String, TabChrome>,
 }
 
-thread_local! {
-    /// The main window, its handle and its title bar (window coordinates), where torn-off windows are dropped to merge back.
-    static MAIN_BAR: std::cell::RefCell<Option<MainBar>> = const { std::cell::RefCell::new(None) };
-}
-
-type MainBar = (gpui::WeakEntity<BrowserWindow>, gpui::AnyWindowHandle, gpui::Bounds<Pixels>);
 
 /// A torn-off window closing: it no longer reopens at launch, and with `delete` its space and tabs go too.
 fn forget_detached(model: &mut Model, id: &str, delete: bool) {
@@ -4986,29 +4760,19 @@ fn forget_detached(model: &mut Model, id: &str, delete: bool) {
     }
 }
 
-/// Whether `position` (window point) is past `TEAR_OFF_MARGIN` outside the window.
-fn torn_off(window: &Window, position: gpui::Point<Pixels>) -> bool {
-    let margin = px(TEAR_OFF_MARGIN);
-    let size = window.viewport_size();
-    let area = gpui::Bounds::new(gpui::point(-margin, -margin), gpui::size(size.width + margin * 2., size.height + margin * 2.));
-    !area.contains(&position)
-}
-
 /// Whether `at` (screen point) is over the main window's rail.
-fn over_main_bar(at: gpui::Point<Pixels>, cx: &mut gpui::App) -> bool {
-    let Some((handle, bar)) = MAIN_BAR.with(|cell| cell.borrow().as_ref().map(|(_, handle, bar)| (*handle, *bar))) else {
+fn over_main_bar(at: Point) -> bool {
+    let Some(((x, y), (_, height))) = crate::main_window().and_then(|main| crate::update(main, |view| (view.shell.origin(), view.shell.size()))) else {
         return false;
     };
-    handle.update(cx, |_, window, _| gpui::Bounds::new(window.bounds().origin + bar.origin, bar.size).contains(&at)).unwrap_or(false)
+    Bounds::new(point(x as f32, y as f32), size(crate::rail::RAIL_W, height as f32)).contains(&at)
 }
 
 /// Opens `session` in an OS window of its own whose top-left is at `at` (screen point).
-#[allow(clippy::too_many_arguments)]
-fn open_space(cx: &mut gpui::App, model: SharedModel, extensions: Extensions, session: String, tab_window: bool, pages: Vec<(String, LiveTab)>, chrome: HashMap<String, TabChrome>, at: gpui::Point<Pixels>) {
+/// Opens `session` in an OS window of its own whose top-left is at `at` (screen point).
+fn open_space(model: SharedModel, extensions: Extensions, session: String, tab_window: bool, pages: Vec<(String, LiveTab)>, chrome: HashMap<String, TabChrome>, at: Point) {
     let handoff = Handoff { session, tab_window, extensions, pages, chrome };
-    crate::open_browser_window(cx, gpui::Bounds::new(at, gpui::size(px(1000.), px(700.))), move |cx| {
-        BrowserWindow::new(model, Some(handoff), false, Instant::now(), cx)
-    });
+    crate::open_browser_window(Some((f64::from(at.x), f64::from(at.y))), (1000., 700.), move |shell| BrowserWindow::new(model, Some(handoff), false, Instant::now(), shell));
 }
 
 /// The shared model, seen from one window.
@@ -5066,7 +4830,7 @@ thread_local! {
 }
 
 /// The profile's color, or the theme accent when it has none.
-pub(crate) fn profile_tint(profile: &browser_core::Profile, paint: Paint) -> gpui::Hsla {
+pub(crate) fn profile_tint(profile: &browser_core::Profile, paint: Paint) -> Color {
     if profile.color.is_empty() { paint.accent } else { parse_hex(&profile.color) }
 }
 
@@ -5102,6 +4866,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn colours_parse_and_convert() {
+        assert_eq!(parse_hex("#ff8000"), [1., 128. / 255., 0., 1.]);
+        assert_eq!(parse_hex("bogus"), [0., 0., 0., 1.]);
+        assert_eq!(hsl(0., 1., 0.5), [1., 0., 0., 1.]);
+        assert_eq!(hsl(2. / 3., 1., 0.5), [0., 0., 1., 1.]);
+    }
+
+    #[test]
     fn fit_on_stage_brings_a_window_back_whole() {
         let fit = |x, y, w, h| {
             let frame = fit_on_stage(Frame { x, y, w, h }, 800.0, 600.0);
@@ -5117,7 +4889,7 @@ mod tests {
 
     fn window_model() -> WindowModel {
         let model = Model::open(browser_storage::Storage::open_in_memory().unwrap()).unwrap();
-        WindowModel { shared: Arc::new(std::sync::Mutex::new(model)), detached: None }
+        WindowModel { shared: std::sync::Arc::new(std::sync::Mutex::new(model)), detached: None }
     }
 
     #[test]

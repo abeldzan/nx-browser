@@ -7,8 +7,8 @@ use browser_core::{app_support_dir, Settings, TabState, SEARCH_ENGINES};
 use browser_engine::{Shortcut, WebEngine, SHORTCUTS};
 use crate::terminal::is_terminal;
 use browser_engine::LogicalRect;
-use gpui::Context;
-use gpuikit::theme::parse_hex;
+use crate::window::parse_hex;
+use crate::geom::{Bounds, Point};
 
 pub const PROFILE_ICONS: [&str; 17] =
     ["", "😀", "🦊", "🐱", "🐼", "🚀", "💼", "🏠", "🎮", "🎨", "📚", "🌙", "⭐", "🔥", "🌿", "☕", "🎵"];
@@ -126,7 +126,7 @@ impl SettingsSection {
 type Apply<T> = fn(&mut Settings, T);
 
 impl BrowserWindow {
-    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_settings(&mut self) {
         self.end_recording();
         self.settings_open = !self.settings_open;
         self.settings_note = None;
@@ -136,31 +136,31 @@ impl BrowserWindow {
         }
         if self.settings_open {
             let active = self.model.lock().active_profile_id.clone();
-            self.select_settings_profile(active, cx);
+            self.select_settings_profile(active);
         } else {
             // Keys go back to the page, which may have been opened or activated while settings held them.
             self.focus_active_content();
         }
-        cx.notify();
+        self.notify();
     }
 
     /// Opens settings on one profile.
-    pub(crate) fn open_profile_settings(&mut self, id: String, cx: &mut Context<Self>) {
+    pub(crate) fn open_profile_settings(&mut self, id: String) {
         if !self.settings_open {
-            self.toggle_settings(cx);
+            self.toggle_settings();
         }
         self.settings_section = SettingsSection::Profiles;
-        self.select_settings_profile(id, cx);
-        cx.notify();
+        self.select_settings_profile(id);
+        self.notify();
     }
 
-    pub(crate) fn open_new_profile(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_new_profile(&mut self) {
         self.popover_texts.remove(&PROFILE_NAME);
         self.new_profile = Some((String::new(), String::new()));
-        cx.notify();
+        self.notify();
     }
 
-    pub(crate) fn create_new_profile(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn create_new_profile(&mut self) {
         let Some((icon, color)) = self.new_profile.take() else {
             return;
         };
@@ -178,15 +178,15 @@ impl BrowserWindow {
             Some(id)
         });
         if let (Some(id), true) = (id, self.settings_open) {
-            self.select_settings_profile(id, cx);
+            self.select_settings_profile(id);
         }
-        self.refresh_url(cx);
-        cx.notify();
+        self.refresh_url();
+        self.notify();
     }
 
     /// Name, icon and color for a profile before it is created.
-    pub(crate) fn profile_sheet(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
-        let paint = paint(cx);
+    pub(crate) fn profile_sheet(&self, pop: &mut Pop) -> Node {
+        let paint = paint();
         let (icon, color) = self.new_profile.clone().unwrap_or_default();
         let typed = self.typed(PROFILE_NAME).trim().to_string();
         let preview = browser_core::Profile {
@@ -198,8 +198,8 @@ impl BrowserWindow {
             icon: icon.clone(),
             color: color.clone(),
         };
-        let create = pop.act(|this, cx| this.create_new_profile(cx));
-        let cancel = pop.act(|this, _| this.new_profile = None);
+        let create = pop.act(|this| this.create_new_profile());
+        let cancel = pop.act(|this| this.new_profile = None);
         let (icons, colors) = appearance_swatches(pop, &preview.name, &icon, &color, paint, |this, icon, color| this.new_profile = Some((icon, color)));
         let mut body = vec![
             para("Each profile keeps its own tabs, history, cookies and site data.", 13., Ink::Secondary),
@@ -212,7 +212,7 @@ impl BrowserWindow {
         sheet("New profile", body, vec![button("Cancel", cancel, Style::Plain, Key::Escape), button("Create profile", create, Style::Primary, Key::Return)])
     }
 
-    pub(crate) fn delete_profile_now(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn delete_profile_now(&mut self, id: &str) {
         let store = self.with_model(|model| model.delete_profile(id).ok().flatten());
         if let Some(store) = store {
             self.engine.remove_data_store(&store);
@@ -220,18 +220,18 @@ impl BrowserWindow {
         self.delete_prompt = None;
         if self.settings_profile.as_deref() == Some(id) {
             let active = self.model.lock().active_profile_id.clone();
-            self.select_settings_profile(active, cx);
+            self.select_settings_profile(active);
         }
-        self.refresh_url(cx);
-        cx.notify();
+        self.refresh_url();
+        self.notify();
     }
 
     /// Confirmation for deleting a profile, stacked above everything else.
     pub(crate) fn delete_sheet(&self, id: &str, pop: &mut Pop) -> Node {
         let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
         let id = id.to_string();
-        let cancel = pop.act(|this, _| this.delete_prompt = None);
-        let delete = pop.act(move |this, cx| this.delete_profile_now(&id, cx));
+        let cancel = pop.act(|this| this.delete_prompt = None);
+        let delete = pop.act(move |this| this.delete_profile_now(&id));
         sheet(
             format!("Delete “{name}”?"),
             vec![para("Its tabs, sessions, history, bookmarks, cookies and site data will be removed. This can't be undone.", 13., Ink::Secondary)],
@@ -240,8 +240,8 @@ impl BrowserWindow {
     }
 
     /// Which profile links from other apps open in.
-    pub(crate) fn link_sheet(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
-        let paint = paint(cx);
+    pub(crate) fn link_sheet(&self, pop: &mut Pop) -> Node {
+        let paint = paint();
         let (profiles, active) = {
             let model = self.model.lock();
             (model.profiles.clone(), model.active_profile_id.clone())
@@ -254,9 +254,9 @@ impl BrowserWindow {
         let mut rows = Vec::new();
         for profile in profiles {
             let id = profile.id.clone();
-            let open = pop.act(move |this, cx| {
+            let open = pop.act(move |this| {
                 let urls = std::mem::take(&mut this.pending_links);
-                this.open_links_in(&id, urls, cx);
+                this.open_links_in(&id, urls);
             });
             let mut children = vec![profile_badge_node(&profile, profile.id == active, 28., paint), crate::native::title(profile.name.clone(), 13., Weight::Regular, Ink::Primary), Node::Spacer];
             if profile.id == active {
@@ -265,56 +265,56 @@ impl BrowserWindow {
             rows.push(Node::Item { height: 40., click: Some(open), drag: None, children });
         }
         body.push(Node::Column { gap: 2., pad: (0., 0.), children: rows });
-        let cancel = pop.act(|this, _| this.pending_links.clear());
+        let cancel = pop.act(|this| this.pending_links.clear());
         sheet(heading, body, vec![button("Cancel", cancel, Style::Plain, Key::Escape)])
     }
 
-    pub(crate) fn open_rail_menu(&mut self, id: String, index: usize, position: gpui::Point<gpui::Pixels>) {
+    pub(crate) fn open_rail_menu(&mut self, id: String, index: usize, position: Point) {
         let count = self.model.lock().profiles.len().max(1);
         let rows = vec![
-            menu_item("Move up", index > 0, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index - 1); }) }),
-            menu_item("Move down", index + 1 < count, { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.move_profile(&id, index + 1); }) }),
+            menu_item("Move up", index > 0, { let id = id.clone(); move |this| this.with_model(|model| { let _ = model.move_profile(&id, index - 1); }) }),
+            menu_item("Move down", index + 1 < count, { let id = id.clone(); move |this| this.with_model(|model| { let _ = model.move_profile(&id, index + 1); }) }),
             None,
-            menu_item("Edit profile…", true, { let id = id.clone(); move |this, cx| this.open_profile_settings(id.clone(), cx) }),
-            menu_item("Delete profile…", count > 1, move |this, _| this.delete_prompt = Some(id.clone())),
+            menu_item("Edit profile…", true, { let id = id.clone(); move |this| this.open_profile_settings(id.clone()) }),
+            menu_item("Delete profile…", count > 1, move |this| this.delete_prompt = Some(id.clone())),
         ];
         self.show_menu(rows, position);
     }
 
     /// Right-click menu on a terminal's screen.
-    pub(crate) fn open_term_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        let view = crate::terminal::get(&id, cx);
-        let selected = view.as_ref().is_some_and(|view| view.read(cx).has_selection());
-        let on = |run: fn(&mut crate::terminal::TerminalView, &mut Context<crate::terminal::TerminalView>)| {
+    pub(crate) fn open_term_menu(&mut self, id: String, position: Point) {
+        let view = crate::terminal::get(&id);
+        let selected = view.as_ref().is_some_and(|view| view.borrow().has_selection());
+        let on = |run: fn(&mut crate::terminal::TerminalView)| {
             let view = view.clone();
-            move |_: &mut Self, cx: &mut Context<Self>| {
+            move |_: &mut Self| {
                 if let Some(view) = &view {
-                    view.update(cx, run);
+                    run(&mut view.borrow_mut());
                 }
             }
         };
         let rows = vec![
-            menu_item("Copy", selected, on(|view, cx| view.copy(cx))),
-            menu_item("Paste", true, on(|view, cx| view.paste(cx))),
+            menu_item("Copy", selected, on(|view| view.copy())),
+            menu_item("Paste", true, on(|view| view.paste())),
             None,
-            menu_item("Clear", true, on(|view, cx| view.clear(cx))),
+            menu_item("Clear", true, on(|view| view.clear())),
         ];
         self.show_menu(rows, position);
     }
 
     /// The title bar's screenshot button menu.
-    pub(crate) fn open_shot_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>) {
+    pub(crate) fn open_shot_menu(&mut self, id: String, position: Point) {
         let url = self.model.lock().session_tabs().into_iter().find(|tab| tab.id == id).map(|tab| tab.url.clone()).unwrap_or_default();
         let web = !url.is_empty() && !is_terminal(&url);
         let rows = vec![
-            menu_item("Whole Page", web, |this, cx| this.on_shortcut(Shortcut::Screenshot, cx)),
-            menu_item("Select Element", web, |this, cx| this.on_shortcut(Shortcut::ScreenshotElement, cx)),
+            menu_item("Whole Page", web, |this| this.on_shortcut(Shortcut::Screenshot)),
+            menu_item("Select Element", web, |this| this.on_shortcut(Shortcut::ScreenshotElement)),
         ];
         self.show_menu(rows, position);
     }
 
     /// Right-click menu on a tab pill; "other" and "to the right" stay within the tab's window.
-    pub(crate) fn open_tab_menu(&mut self, id: String, position: gpui::Point<gpui::Pixels>) {
+    pub(crate) fn open_tab_menu(&mut self, id: String, position: Point) {
         let row = self.tab_rows().into_iter().map(|(_, ids)| ids).find(|ids| ids.contains(&id)).unwrap_or_default();
         let at = row.iter().position(|other| *other == id).unwrap_or(0);
         let (others, right) = (row.iter().filter(|other| **other != id).cloned().collect::<Vec<_>>(), row[(at + 1).min(row.len())..].to_vec());
@@ -329,18 +329,18 @@ impl BrowserWindow {
         let pinned = bookmark.as_ref().is_some_and(|bookmark| bookmark.pinned);
         let muted = self.engine.is_muted(&id);
         let rows = vec![
-            menu_item("New Tab", true, { let id = id.clone(); move |this, cx| this.new_tab_in(&id, None, cx) }),
-            menu_item("Duplicate Tab", true, { let (id, url) = (id.clone(), url.clone()); move |this, cx| this.new_tab_in(&id, Some(&url), cx) }),
-            menu_item("Reload Tab", true, { let id = id.clone(); move |this, _| this.engine.reload(&id) }),
-            menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, { let id = id.clone(); move |this, _| this.engine.set_muted(&id, !muted) }),
+            menu_item("New Tab", true, { let id = id.clone(); move |this| this.new_tab_in(&id, None) }),
+            menu_item("Duplicate Tab", true, { let (id, url) = (id.clone(), url.clone()); move |this| this.new_tab_in(&id, Some(&url)) }),
+            menu_item("Reload Tab", true, { let id = id.clone(); move |this| this.engine.reload(&id) }),
+            menu_item(if muted { "Unmute Tab" } else { "Mute Tab" }, true, { let id = id.clone(); move |this| this.engine.set_muted(&id, !muted) }),
             None,
-            menu_item("Copy Link", web, { let url = url.clone(); move |this, cx| {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+            menu_item("Copy Link", web, { let url = url.clone(); move |this| {
+                browser_engine_macos::set_clipboard_text(&url.clone());
                 this.status = "Copied page address".into();
             } }),
             menu_item(if bookmark.is_some() { "Remove Bookmark" } else { "Add Bookmark" }, web, {
                 let (url, title, bookmark) = (url.clone(), title.clone(), bookmark.as_ref().map(|bookmark| bookmark.id.clone()));
-                move |this, _| this.with_model(|model| {
+                move |this| this.with_model(|model| {
                     let _ = match &bookmark {
                         Some(id) => model.delete_bookmark(id),
                         None => model.save_bookmark(None, &url, &title, false),
@@ -349,37 +349,37 @@ impl BrowserWindow {
             }),
             menu_item(if pinned { "Unpin from Start Page" } else { "Pin to Start Page" }, web, {
                 let bookmark = bookmark.as_ref().map(|bookmark| bookmark.id.clone());
-                move |this, _| this.with_model(|model| { let _ = model.save_bookmark(bookmark.as_deref(), &url, &title, !pinned); })
+                move |this| this.with_model(|model| { let _ = model.save_bookmark(bookmark.as_deref(), &url, &title, !pinned); })
             }),
             None,
-            menu_item("Move to New Window", self.group_len(&id) > 1, { let id = id.clone(); move |this, cx| this.detach_tab(&id, position, cx) }),
+            menu_item("Move to New Window", self.group_len(&id) > 1, { let id = id.clone(); move |this| this.detach_tab(&id, position) }),
             // A tab its window shows would go blank; only ones hidden behind another tab can sleep.
-            menu_item("Suspend Tab", web && !suspended && !self.is_front(&id), { let id = id.clone(); move |this, _| this.with_model(|model| { let _ = model.mark_suspended(&id); }) }),
+            menu_item("Suspend Tab", web && !suspended && !self.is_front(&id), { let id = id.clone(); move |this| this.with_model(|model| { let _ = model.mark_suspended(&id); }) }),
             None,
-            menu_item("Close Tab", true, move |this, cx| this.close_tabs(vec![id.clone()], cx)),
-            menu_item("Close Other Tabs", !others.is_empty(), move |this, cx| this.close_tabs(others.clone(), cx)),
-            menu_item("Close Tabs to the Right", !right.is_empty(), move |this, cx| this.close_tabs(right.clone(), cx)),
-            menu_item("Reopen Closed Tab", reopenable, |this, cx| this.on_shortcut(Shortcut::ReopenTab, cx)),
+            menu_item("Close Tab", true, move |this| this.close_tabs(vec![id.clone()])),
+            menu_item("Close Other Tabs", !others.is_empty(), move |this| this.close_tabs(others.clone())),
+            menu_item("Close Tabs to the Right", !right.is_empty(), move |this| this.close_tabs(right.clone())),
+            menu_item("Reopen Closed Tab", reopenable, |this| this.on_shortcut(Shortcut::ReopenTab)),
         ];
         self.show_menu(rows, position);
     }
 
     /// Shows `rows` as a native menu at `position`; `EngineEvent::MenuPick` runs the picked row.
-    pub(crate) fn show_menu(&mut self, rows: Vec<MenuRow>, position: gpui::Point<gpui::Pixels>) {
+    pub(crate) fn show_menu(&mut self, rows: Vec<MenuRow>, position: Point) {
         let items = rows.iter().map(|row| row.as_ref().map(|(label, enabled, _)| (label.as_ref(), *enabled))).collect::<Vec<_>>();
         self.engine.show_menu(&items, (f64::from(position.x), f64::from(position.y)));
         self.menu_actions = rows.into_iter().map(|row| row.map(|(_, _, run)| run)).collect();
     }
 
-    pub(crate) fn set_pref(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+    pub(crate) fn set_pref(&mut self, f: impl FnOnce(&mut Settings)) {
         let _ = self.model.lock().update_settings(f);
         self.apply_settings();
         let settings = self.model.lock().settings.clone();
-        crate::terminal::set_prefs(&settings, cx);
-        cx.notify();
+        crate::terminal::set_prefs(&settings);
+        self.notify();
     }
 
-    fn select_settings_profile(&mut self, id: String, _cx: &mut Context<Self>) {
+    fn select_settings_profile(&mut self, id: String) {
         let name = self.model.lock().profiles.iter().find(|profile| profile.id == id).map(|profile| profile.name.clone()).unwrap_or_default();
         // The field is rebuilt with this name; a stale edit of another profile must not rename this one.
         self.popover_texts.insert(PROFILE_EDIT, name);
@@ -387,19 +387,19 @@ impl BrowserWindow {
     }
 
     /// The native Settings window: sections in a glass sidebar, the chosen one's controls beside it.
-    pub(crate) fn settings_window(&self, pop: &mut Pop, cx: &mut Context<Self>) -> Node {
-        let paint = paint(cx);
+    pub(crate) fn settings_window(&self, pop: &mut Pop) -> Node {
+        let paint = paint();
         let query = self.typed(SETTINGS_QUERY).trim().to_lowercase();
         let shown = SettingsSection::ALL.into_iter().filter(|section| section.matches(&query)).collect::<Vec<_>>();
         let current = if shown.contains(&self.settings_section) { Some(self.settings_section) } else { shown.first().copied() };
-        let search = pop.act(|_, _| {});
+        let search = pop.act(|_| {});
         // Room for the traffic lights, which sit over the sidebar.
         let mut nav = vec![Node::Item { height: 30., click: None, drag: None, children: Vec::new() }, field(SETTINGS_QUERY, "", "Search", search), Node::Item { height: 6., click: None, drag: None, children: Vec::new() }];
         if shown.is_empty() {
             nav.push(Node::Item { height: 28., click: None, drag: None, children: vec![text("No matches", 13., Weight::Regular, Ink::Secondary)] });
         }
         for section in shown {
-            let open = pop.act(move |this, _| {
+            let open = pop.act(move |this| {
                 this.end_recording();
                 this.settings_section = section;
             });
@@ -415,7 +415,7 @@ impl BrowserWindow {
             if let Some(note) = &self.settings_note {
                 page.push(para(note.to_string(), 12., Ink::Secondary));
             }
-            page.extend(self.settings_page(section, &query, pop, paint, cx));
+            page.extend(self.settings_page(section, &query, pop, paint));
         }
         Node::Split {
             sidebar_width: 180.,
@@ -425,18 +425,18 @@ impl BrowserWindow {
         }
     }
 
-    fn settings_page(&self, section: SettingsSection, query: &str, pop: &mut Pop, paint: Paint, cx: &gpui::App) -> Vec<Node> {
+    fn settings_page(&self, section: SettingsSection, query: &str, pop: &mut Pop, paint: Paint) -> Vec<Node> {
         let settings = self.model.lock().settings.clone();
         match section {
             SettingsSection::Profiles => self.profiles_settings(pop, paint),
             SettingsSection::General => {
-                let home = pop.act(|this, cx| {
+                let home = pop.act(|this| {
                     let value = this.typed(HOME_PAGE).trim().to_string();
-                    this.set_pref(cx, |s| s.home_page = value);
+                    this.set_pref(|s| s.home_page = value);
                 });
-                let make_default = pop.act(|this, _| {
+                let make_default = pop.act(|this| {
                     if let Err(error) = browser_engine_macos::make_default_browser() {
-                        this.settings_note = Some(error.to_string().into());
+                        this.settings_note = Some(error.to_string());
                     }
                 });
                 vec![
@@ -458,25 +458,25 @@ impl BrowserWindow {
             SettingsSection::Shortcuts => self.shortcuts_settings(&settings, query, pop),
             SettingsSection::Appearance => {
                 let fonts = std::iter::once("System".to_string()).chain(crate::terminal::all_fonts().iter().cloned()).collect();
-                let font = pop.act(|this, cx| {
+                let font = pop.act(|this| {
                     let typed = this.typed(UI_FONT).trim().to_string();
                     // "System" is the interface's own font, stored as none.
                     let font = if typed == "System" { String::new() } else { typed };
-                    this.set_pref(cx, |s| s.ui_font = font);
+                    this.set_pref(|s| s.ui_font = font);
                 });
                 let shown = if settings.ui_font.is_empty() { "System".to_string() } else { settings.ui_font.clone() };
                 let mut accents = Vec::new();
                 for option in PROFILE_COLORS {
                     // Empty means the theme's own accent, so show that rather than the current override.
                     let fill = if option.is_empty() { paint.muted } else { parse_hex(option) };
-                    let pick = pop.act(move |this, cx| this.set_pref(cx, |s| s.accent = option.to_string()));
+                    let pick = pop.act(move |this| this.set_pref(|s| s.accent = option.to_string()));
                     accents.push(Node::Swatch { size: 18., fill: Some(rgba(fill)), selected: settings.accent == option, action: Some(pick), child: None });
                 }
                 let mut backgrounds = Vec::new();
                 if !settings.wallpaper.is_empty() {
-                    backgrounds.push(button("Use Liquid Glass", pop.act(|this, cx| this.set_pref(cx, |s| s.wallpaper.clear())), Style::Plain, Key::None));
+                    backgrounds.push(button("Use Liquid Glass", pop.act(|this| this.set_pref(|s| s.wallpaper.clear())), Style::Plain, Key::None));
                 }
-                backgrounds.push(button("Choose Image…", pop.act(|_, cx| pick_path(cx, false, |s, path| s.wallpaper = path)), Style::Plain, Key::None));
+                backgrounds.push(button("Choose Image…", pop.act(|this| pick_path(this.shell.number(), false, |s, path| s.wallpaper = path)), Style::Plain, Key::None));
                 let mut page = vec![
                     setting("Theme", None, choice(pop, vec![("System", "system".to_string()), ("Light", "light".into()), ("Dark", "dark".into())], settings.theme.clone(), |s, v| s.theme = v)),
                     setting("Font", Some("Used across the browser's interface. Type to search, or type any font name."), Node::Combo { field: UI_FONT, value: Initial(shown), items: fonts, submit: font }),
@@ -512,8 +512,8 @@ impl BrowserWindow {
                 for (host, zoom) in &settings.site_zoom {
                     let reset = {
                         let host = host.clone();
-                        pop.act(move |this, cx| {
-                            this.set_pref(cx, |s| {
+                        pop.act(move |this| {
+                            this.set_pref(|s| {
                                 s.site_zoom.remove(&host);
                             })
                         })
@@ -536,15 +536,15 @@ impl BrowserWindow {
                 choice(pop, SEARCH_ENGINES.iter().map(|(name, _)| (*name, name.to_string())).collect(), settings.search_engine.clone(), |s, v| s.search_engine = v),
             )],
             SettingsSection::Privacy => {
-                let clear_history = pop.act(|this, _| {
+                let clear_history = pop.act(|this| {
                     let _ = this.model.lock().clear_data(true, false);
                     this.settings_note = Some("History cleared".into());
                 });
-                let clear_downloads = pop.act(|this, _| {
+                let clear_downloads = pop.act(|this| {
                     let _ = this.model.lock().clear_data(false, true);
                     this.settings_note = Some("Download list cleared".into());
                 });
-                let clear_site_data = pop.act(|this, _| {
+                let clear_site_data = pop.act(|this| {
                     let store = Some(this.model.lock()).and_then(|model| model.active_profile().map(|p| p.data_store_id.clone()));
                     if let Some(store) = store {
                         this.engine.clear_site_data(&store);
@@ -581,9 +581,9 @@ impl BrowserWindow {
                 page
             }
             SettingsSection::Content => {
-                let agent = pop.act(|this, cx| {
+                let agent = pop.act(|this| {
                     let value = this.typed(USER_AGENT).trim().to_string();
-                    this.set_pref(cx, |s| s.user_agent = value);
+                    this.set_pref(|s| s.user_agent = value);
                 });
                 vec![
                     setting("JavaScript", Some("Applies to new tabs."), switch(pop, settings.javascript, |s, v| s.javascript = v)),
@@ -591,11 +591,11 @@ impl BrowserWindow {
                 ]
             }
             SettingsSection::Downloads => {
-                let downloads = pop.act(|_, cx| pick_path(cx, true, |s, dir| s.download_dir = dir));
-                let shots = pop.act(|_, cx| pick_path(cx, true, |s, dir| s.screenshot_dir = dir));
+                let downloads = pop.act(|this| pick_path(this.shell.number(), true, |s, dir| s.download_dir = dir));
+                let shots = pop.act(|this| pick_path(this.shell.number(), true, |s, dir| s.screenshot_dir = dir));
                 let mut shot_buttons = Vec::new();
                 if !settings.screenshot_dir.is_empty() {
-                    shot_buttons.push(button("Use Downloads", pop.act(|this, cx| this.set_pref(cx, |s| s.screenshot_dir.clear())), Style::Plain, Key::None));
+                    shot_buttons.push(button("Use Downloads", pop.act(|this| this.set_pref(|s| s.screenshot_dir.clear())), Style::Plain, Key::None));
                 }
                 shot_buttons.push(button("Change…", shots, Style::Plain, Key::None));
                 vec![
@@ -614,15 +614,15 @@ impl BrowserWindow {
                     // A font typed in earlier (or one CoreText doesn't flag as monospace) stays selectable.
                     fonts.insert(0, settings.terminal_font.clone());
                 }
-                let font = pop.act(|this, cx| {
+                let font = pop.act(|this| {
                     let font = this.typed(TERM_FONT).trim().to_string();
                     if !font.is_empty() {
-                        this.set_pref(cx, |s| s.terminal_font = font);
+                        this.set_pref(|s| s.terminal_font = font);
                     }
                 });
-                let shell = pop.act(|this, cx| {
+                let shell = pop.act(|this| {
                     let value = this.typed(SHELL).trim().to_string();
-                    this.set_pref(cx, |s| s.terminal_shell = value);
+                    this.set_pref(|s| s.terminal_shell = value);
                 });
                 let login_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
                 vec![
@@ -694,7 +694,7 @@ impl BrowserWindow {
             )],
             SettingsSection::About => vec![
                 setting("Version", None, text(env!("CARGO_PKG_VERSION"), 13., Weight::Regular, Ink::Secondary)),
-                self.update_row(pop, cx),
+                self.update_row(pop),
                 setting(
                     "Check for updates automatically",
                     Some("New versions download in the background and install when you restart."),
@@ -706,9 +706,9 @@ impl BrowserWindow {
         }
     }
 
-    fn update_row(&self, pop: &mut Pop, cx: &gpui::App) -> Node {
+    fn update_row(&self, pop: &mut Pop) -> Node {
         use crate::update::Status;
-        let status = crate::update::status(cx).clone();
+        let status = crate::update::status().clone();
         let detail = match &status {
             Status::Unavailable => "This build doesn't update itself.".to_string(),
             Status::Idle => "Updates come from GitHub releases.".to_string(),
@@ -719,11 +719,11 @@ impl BrowserWindow {
         };
         let ready = matches!(status, Status::Ready { .. });
         let enabled = matches!(status, Status::Idle | Status::Failed(_) | Status::Ready { .. });
-        let run = pop.act(move |_, cx| {
+        let run = pop.act(move |_| {
             if ready {
-                crate::update::restart(cx);
+                crate::update::restart();
             } else {
-                crate::update::check(true, cx);
+                crate::update::check(true);
             }
         });
         let control = Node::Button {
@@ -742,7 +742,7 @@ impl BrowserWindow {
             (model.profiles.clone(), model.active_profile_id.clone())
         };
         let only_one = profiles.len() <= 1;
-        let new_profile = pop.act(|this, cx| this.open_new_profile(cx));
+        let new_profile = pop.act(|this| this.open_new_profile());
         let mut page = vec![Node::Row {
             gap: 8.,
             children: vec![title("Click a profile to edit it.", 12., Weight::Regular, Ink::Secondary), Node::Spacer, button("New profile…", new_profile, Style::Primary, Key::None)],
@@ -752,22 +752,22 @@ impl BrowserWindow {
             let id = profile.id.clone();
             let is_active = profile.id == active;
             let expanded = self.settings_profile.as_deref() == Some(profile.id.as_str());
-            let toggle = pop.act(move |this, cx| {
+            let toggle = pop.act(move |this| {
                 if this.settings_profile.as_deref() == Some(id.as_str()) {
                     this.settings_profile = None;
                 } else {
-                    this.select_settings_profile(id.clone(), cx);
+                    this.select_settings_profile(id.clone());
                 }
             });
             let state = if is_active {
                 text("Active", 11., Weight::Regular, Ink::Secondary)
             } else {
                 let switch_id = profile.id.clone();
-                let switch_to = pop.act(move |this, cx| {
+                let switch_to = pop.act(move |this| {
                     this.with_model(|model| {
                         let _ = model.switch_profile(&switch_id);
                     });
-                    this.refresh_url(cx);
+                    this.refresh_url();
                 });
                 button("Switch", switch_to, Style::Plain, Key::None)
             };
@@ -781,7 +781,7 @@ impl BrowserWindow {
             if !expanded {
                 continue;
             }
-            let save = pop.act(|this, cx| this.save_profile_name(cx));
+            let save = pop.act(|this| this.save_profile_name());
             let mut editor = vec![commit(PROFILE_EDIT, profile.name.clone(), "Profile name", save), text("Icon", 12., Weight::Semibold, Ink::Secondary)];
             let (icons, colors) = appearance_swatches(pop, &profile.name, &profile.icon, &profile.color, paint, |this, icon, color| {
                 if let Some(id) = this.settings_profile.clone() {
@@ -792,7 +792,7 @@ impl BrowserWindow {
             editor.push(text("Color", 12., Weight::Semibold, Ink::Secondary));
             editor.extend(swatch_rows(colors));
             let delete_id = profile.id.clone();
-            let delete = pop.act(move |this, _| this.delete_prompt = Some(delete_id.clone()));
+            let delete = pop.act(move |this| this.delete_prompt = Some(delete_id.clone()));
             editor.push(Node::Row {
                 gap: 0.,
                 children: vec![Node::Spacer, Node::Button { title: "Delete profile…".into(), action: delete, style: Style::Danger, key: Key::None, enabled: !only_one }],
@@ -800,8 +800,8 @@ impl BrowserWindow {
             list.push(Node::Column { gap: 8., pad: (46., 8.), children: editor });
         }
         page.push(Node::Column { gap: 2., pad: (0., 8.), children: list });
-        let export = pop.act(|this, cx| this.export_profile(cx));
-        let import = pop.act(|this, cx| this.import_profile(cx));
+        let export = pop.act(|this| this.export_profile());
+        let import = pop.act(|this| this.import_profile());
         page.push(setting(
             "Backup",
             Some("Export the active profile, or import one from a file."),
@@ -810,7 +810,7 @@ impl BrowserWindow {
         page
     }
 
-    pub(crate) fn save_profile_name(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn save_profile_name(&mut self) {
         let name = self.typed(PROFILE_EDIT).trim().to_string();
         if let (false, Some(id)) = (name.is_empty(), self.settings_profile.clone()) {
             let mut model = self.model.lock();
@@ -821,7 +821,7 @@ impl BrowserWindow {
                 self.settings_note = Some("Profile renamed".into());
             }
         }
-        cx.notify();
+        self.notify();
     }
 
     fn permission_list(&self, pop: &mut Pop) -> Vec<Node> {
@@ -838,7 +838,7 @@ impl BrowserWindow {
             }];
             for (action, label) in [("allow", "Allow"), ("deny", "Deny"), ("reset", "Reset")] {
                 let (origin, kind) = (origin.clone(), kind.clone());
-                let run = pop.act(move |this, _| {
+                let run = pop.act(move |this| {
                     let model = this.model.lock();
                     let _ = if action == "reset" { model.remove_permission(&origin, &kind) } else { model.set_permission(&origin, &kind, action) };
                     drop(model);
@@ -863,13 +863,13 @@ fn appearance_swatches(pop: &mut Pop, name: &str, icon: &str, color: &str, paint
             Some(text(if option.is_empty() { crate::window::rail_mark(name) } else { option.to_string() }, 15., Weight::Regular, Ink::Primary))
         };
         let color = color.to_string();
-        let choose = pop.act(move |this, _| pick(this, option.to_string(), color.clone()));
+        let choose = pop.act(move |this| pick(this, option.to_string(), color.clone()));
         icons.push(Node::Swatch { size: 30., fill: Some(rgba(paint.secondary)), selected: icon == option, action: Some(choose), child: glyph.map(Box::new) });
     }
     let mut colors = Vec::new();
     for option in PROFILE_COLORS {
         let icon = icon.to_string();
-        let choose = pop.act(move |this, _| pick(this, icon.clone(), option.to_string()));
+        let choose = pop.act(move |this| pick(this, icon.clone(), option.to_string()));
         let fill = if option.is_empty() { paint.accent } else { parse_hex(option) };
         colors.push(Node::Swatch { size: 30., fill: Some(rgba(fill)), selected: color == option, action: Some(choose), child: None });
     }
@@ -888,7 +888,7 @@ fn swatch_rows(swatches: Vec<Node>) -> Vec<Node> {
 }
 
 fn switch(pop: &mut Pop, on: bool, apply: Apply<bool>) -> Node {
-    Node::Switch { on, action: pop.act(move |this, cx| this.set_pref(cx, |s| apply(s, !on))) }
+    Node::Switch { on, action: pop.act(move |this| this.set_pref(|s| apply(s, !on))) }
 }
 
 /// A pop-up menu of `options`, showing the one equal to `current`.
@@ -898,9 +898,9 @@ fn choice<T: Clone + PartialEq + 'static>(pop: &mut Pop, options: Vec<(&'static 
     let mut items = Vec::new();
     for (label, value) in options {
         // Consecutive ids: the pop-up runs `first + index`.
-        let id = pop.act(move |this, cx| {
+        let id = pop.act(move |this| {
             let value = value.clone();
-            this.set_pref(cx, |s| apply(s, value));
+            this.set_pref(|s| apply(s, value));
         });
         first.get_or_insert(id);
         items.push(label.to_string());
@@ -910,19 +910,18 @@ fn choice<T: Clone + PartialEq + 'static>(pop: &mut Pop, options: Vec<(&'static 
 
 fn stepper(pop: &mut Pop, value: String, minus: fn(&mut Settings), plus: fn(&mut Settings)) -> Node {
     // `plus` must follow `minus`: the stepper's up arrow runs `down + 1`.
-    let down = pop.act(move |this, cx| this.set_pref(cx, minus));
-    pop.act(move |this, cx| this.set_pref(cx, plus));
+    let down = pop.act(move |this| this.set_pref(minus));
+    pop.act(move |this| this.set_pref(plus));
     Node::Stepper { value, down }
 }
 
 
 /// A colour as RGBA for a native swatch.
-fn rgba(color: gpui::Hsla) -> [f64; 4] {
-    let [r, g, b] = crate::native::rgb(color);
-    [r, g, b, f64::from(color.a)]
+fn rgba(color: crate::window::Color) -> [f64; 4] {
+    color
 }
 
-pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
+pub(crate) fn logical(bounds: Bounds) -> LogicalRect {
     LogicalRect {
         x: f64::from(bounds.origin.x),
         y: f64::from(bounds.origin.y),
@@ -933,22 +932,19 @@ pub(crate) fn logical(bounds: gpui::Bounds<gpui::Pixels>) -> LogicalRect {
 
 /// A native menu row: (label, enabled, what picking it runs); `None` is a separator.
 pub(crate) type MenuRow = Option<(std::borrow::Cow<'static, str>, bool, MenuAction)>;
-pub(crate) type MenuAction = Box<dyn Fn(&mut BrowserWindow, &mut Context<BrowserWindow>)>;
+pub(crate) type MenuAction = Box<dyn Fn(&mut BrowserWindow)>;
 
-pub(crate) fn menu_item(label: impl Into<std::borrow::Cow<'static, str>>, enabled: bool, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> MenuRow {
+pub(crate) fn menu_item(label: impl Into<std::borrow::Cow<'static, str>>, enabled: bool, run: impl Fn(&mut BrowserWindow) + 'static) -> MenuRow {
     Some((label.into(), enabled, Box::new(run)))
 }
 
-/// Asks for a folder (or a file), then stores it with `set`.
-fn pick_path(cx: &mut Context<BrowserWindow>, folder: bool, set: fn(&mut Settings, String)) {
-    // gpui's sheet, not runModal: a modal loop inside this click lets gpui's timers re-enter and abort.
-    let paths = cx.prompt_for_paths(gpui::PathPromptOptions { files: !folder, directories: folder, multiple: false, prompt: None });
-    cx.spawn(async move |this, cx| {
-        let Ok(Ok(Some(paths))) = paths.await else { return };
-        let Some(path) = paths.into_iter().next() else { return };
-        let _ = this.update(cx, |this, cx| this.set_pref(cx, |s| set(s, path.display().to_string())));
-    })
-    .detach();
+/// Asks for a folder (or a file) in a sheet on window `no`, then stores it with `set`.
+fn pick_path(no: isize, folder: bool, set: fn(&mut Settings, String)) {
+    browser_engine_macos::choose_path(no, folder, move |path| {
+        if let Some(path) = path {
+            crate::update(no, |this| this.set_pref(|s| set(s, path.display().to_string())));
+        }
+    });
 }
 
 #[cfg(test)]

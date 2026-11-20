@@ -5,11 +5,11 @@
 //! shortcut: no animation, unicode placeholders, z-index, shared memory or relative placements; add when a tool needs them.
 
 use base64::Engine;
-use gpui::RenderImage;
+use browser_engine_macos::TermImage;
 use image::RgbaImage;
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
+use std::rc::Rc;
 
 /// Larger APC payloads are dropped rather than buffered.
 const MAX_COMMAND: usize = 64 << 20;
@@ -165,7 +165,7 @@ impl Control {
 
 /// Where and how big to draw an image; the view anchors it at the cursor.
 pub struct Show {
-    pub image: Arc<RenderImage>,
+    pub image: Rc<TermImage>,
     /// Image size in pixels.
     pub size: (u32, u32),
     /// Cells asked for with `c`/`r`; 0 means "from the image size".
@@ -189,7 +189,7 @@ pub struct Outcome {
 }
 
 struct Stored {
-    image: Arc<RenderImage>,
+    image: Rc<TermImage>,
     size: (u32, u32),
     bytes: usize,
     seq: u64,
@@ -201,8 +201,8 @@ pub struct Graphics {
     /// A chunked (`m=1`) transmission still arriving: its first chunk's control and the payload so far.
     pending: Option<(Control, Vec<u8>)>,
     seq: u64,
-    /// Freed images whose GPU atlas tiles the view must release.
-    pub retired: Vec<Arc<RenderImage>>,
+    /// Freed images, which the view lets go of after each feed.
+    pub retired: Vec<Rc<TermImage>>,
 }
 
 impl Graphics {
@@ -239,11 +239,11 @@ impl Graphics {
                 None => Err("ENOENT:no such image"),
             },
             b'q' => decode(&control, &payload).map(|_| None),
-            b't' | b'T' => decode(&control, &payload).map(|rgba| {
+            b't' | b'T' => decode(&control, &payload).and_then(|rgba| {
                 let size = rgba.dimensions();
-                let image = to_render_image(rgba);
+                let image = Rc::new(TermImage::new(size.0, size.1, rgba.as_raw()).ok_or("ENOMEM:image too large")?);
                 self.store(control.id, image.clone(), size);
-                (control.action == b'T').then_some((image, size))
+                Ok((control.action == b'T').then_some((image, size)))
             }),
             _ => Err("EINVAL:unsupported action"),
         };
@@ -269,7 +269,7 @@ impl Graphics {
         outcome
     }
 
-    fn store(&mut self, id: u32, image: Arc<RenderImage>, size: (u32, u32)) {
+    fn store(&mut self, id: u32, image: Rc<TermImage>, size: (u32, u32)) {
         if id == 0 {
             return;
         }
@@ -370,14 +370,6 @@ fn decode(control: &Control, payload: &[u8]) -> Result<RgbaImage, &'static str> 
         }
         _ => Err("EINVAL:unsupported format"),
     }
-}
-
-/// GPUI draws BGRA.
-fn to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
-    for px in rgba.pixels_mut() {
-        px.0.swap(0, 2);
-    }
-    Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]))
 }
 
 #[cfg(test)]

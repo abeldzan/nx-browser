@@ -112,9 +112,12 @@ pub enum EngineEvent {
     WindowGesture { key: String, phase: Phase, x: f64, y: f64, edges: u8, shift: bool },
     /// Native item `id` (a tab pill, a space chip) dragged past a few points, followed until released.
     ItemDrag { id: u32, phase: Phase, x: f64, y: f64 },
+    /// A right click on terminal tab `tab_id`'s screen that the program in it didn't ask for, at `x`, `y` in the
+    /// window's content (top-left origin): the window's terminal menu.
+    TerminalMenu { tab_id: String, x: f64, y: f64 },
     /// The native window (settings) was closed: its close button, Esc or ⌘W.
     NativeWindowClosed,
-    /// Keys pressed while recording a shortcut, in gpui keystroke form: `escape`, `backspace`, or a combination
+    /// Keys pressed while recording a shortcut, in keystroke form: `escape`, `backspace`, or a combination
     /// with ⌘ or ⌃; empty for a key without either.
     RecordedKey(String),
     /// An extension finished loading, failed, or changed its toolbar button (badge, icon).
@@ -286,7 +289,7 @@ impl Shortcut {
     }
 }
 
-/// A rebindable app shortcut; `keys` is the default, in gpui keystroke form, empty for none.
+/// A rebindable app shortcut; `keys` is the default, in keystroke form, empty for none.
 pub struct Binding {
     /// Settings key; stable across releases.
     pub id: &'static str,

@@ -2,7 +2,6 @@ use crate::native::{button_if, heading, setting, Key, Node, Pop, Style};
 use crate::window::BrowserWindow;
 use browser_core::Settings;
 use browser_engine::{Binding, Shortcut, SHORTCUTS};
-use gpui::{Context, Keystroke};
 
 /// The keys `binding` runs on: the user's own, else its default; empty when unbound.
 pub(crate) fn keys<'a>(settings: &'a Settings, binding: &'static Binding) -> &'a str {
@@ -14,17 +13,35 @@ pub(crate) fn keymap(settings: &Settings) -> Vec<(String, Shortcut)> {
     SHORTCUTS.iter().map(|binding| (keys(settings, binding).to_string(), binding.action)).filter(|(keys, _)| !keys.is_empty()).collect()
 }
 
+/// Modifiers in the key monitor's spelling and order.
+const MODIFIERS: [&str; 5] = ["fn-", "ctrl-", "alt-", "cmd-", "shift-"];
+
+/// `cmd-shift-t` as which of `MODIFIERS` it holds and its key; None without a key.
+fn parse(keys: &str) -> Option<([bool; 5], &str)> {
+    let (mut on, mut rest) = ([false; 5], keys);
+    while let Some(at) = MODIFIERS.iter().position(|modifier| rest.len() > modifier.len() && rest.starts_with(modifier)) {
+        on[at] = true;
+        rest = &rest[MODIFIERS[at].len()..];
+    }
+    (!rest.is_empty()).then_some((on, rest))
+}
+
+/// `keys` in the key monitor's spelling: modifiers in `MODIFIERS` order, then the key.
+fn canonical(keys: &str) -> Option<String> {
+    let (on, key) = parse(keys)?;
+    Some(MODIFIERS.iter().zip(on).filter_map(|(modifier, on)| on.then_some(*modifier)).chain([key]).collect())
+}
+
 /// `cmd-shift-t` as macOS writes it: ⇧⌘T.
 pub(crate) fn label(keys: &str) -> String {
-    let Ok(keystroke) = Keystroke::parse(keys) else {
+    let Some(([_, control, alt, platform, shift], key)) = parse(keys) else {
         return String::new();
     };
-    let m = keystroke.modifiers;
-    let mut out = [(m.control, "⌃"), (m.alt, "⌥"), (m.shift, "⇧"), (m.platform, "⌘")]
+    let mut out = [(control, "⌃"), (alt, "⌥"), (shift, "⇧"), (platform, "⌘")]
         .into_iter()
         .filter_map(|(on, glyph)| on.then_some(glyph))
         .collect::<String>();
-    out.push_str(&match keystroke.key.as_str() {
+    out.push_str(&match key {
         "left" => "←".into(),
         "right" => "→".into(),
         "up" => "↑".into(),
@@ -62,7 +79,7 @@ fn set_keys(settings: &mut Settings, binding: &'static Binding, keys: String) {
 
 impl BrowserWindow {
     pub(crate) fn shortcuts_settings(&self, settings: &Settings, query: &str, pop: &mut Pop) -> Vec<Node> {
-        let reset_all = pop.act(|this, cx| this.set_pref(cx, |s| s.shortcuts.clear()));
+        let reset_all = pop.act(|this| this.set_pref(|s| s.shortcuts.clear()));
         let mut page = vec![setting(
             "Change a shortcut",
             Some("Click a shortcut, then press the new keys. Delete clears it; Esc or click again to cancel."),
@@ -79,7 +96,7 @@ impl BrowserWindow {
             let keys = keys(settings, binding);
             let recording = self.recording == Some(binding.id);
             let shown = if recording { "Press keys… (Esc)".to_string() } else if keys.is_empty() { "None".into() } else { label(keys) };
-            let record = pop.act(move |this, _| {
+            let record = pop.act(move |this| {
                 this.settings_note = None;
                 if this.recording == Some(binding.id) {
                     this.end_recording();
@@ -91,8 +108,8 @@ impl BrowserWindow {
             });
             let mut controls = Vec::new();
             if settings.shortcuts.contains_key(binding.id) {
-                let reset = pop.act(move |this, cx| {
-                    this.set_pref(cx, |s| {
+                let reset = pop.act(move |this| {
+                    this.set_pref(|s| {
                         s.shortcuts.remove(binding.id);
                     })
                 });
@@ -113,7 +130,7 @@ impl BrowserWindow {
     }
 
     /// Keys pressed while recording, as `EngineEvent::RecordedKey` reports them.
-    pub(crate) fn record_key(&mut self, keys: &str, cx: &mut Context<Self>) {
+    pub(crate) fn record_key(&mut self, keys: &str) {
         let Some(binding) = self.recording.and_then(|id| SHORTCUTS.iter().find(|binding| binding.id == id)) else {
             return;
         };
@@ -121,32 +138,32 @@ impl BrowserWindow {
             "escape" => {}
             "backspace" => {
                 self.recording = None;
-                self.set_pref(cx, |s| set_keys(s, binding, String::new()));
+                self.set_pref(|s| set_keys(s, binding, String::new()));
             }
             // Without ⌘ or ⌃ it would swallow typing; the key monitor never matches such keys.
             "" => {
                 self.settings_note = Some("Use ⌘ or ⌃ with a key".into());
-                return cx.notify();
+                return self.notify();
             }
             keys => {
-                // In gpui's own spelling, which the defaults and the key monitor use.
-                let keys = Keystroke::parse(keys).map(|keystroke| keystroke.unparse()).unwrap_or_else(|_| keys.to_string());
+                // In the spelling the defaults and the key monitor use.
+                let keys = canonical(keys).unwrap_or_else(|| keys.to_string());
                 let taken = {
                     let settings = &self.model.lock().settings;
                     SHORTCUTS.iter().find(|other| other.id != binding.id && self::keys(settings, other) == keys)
                 };
                 self.recording = None;
-                self.set_pref(cx, |s| {
+                self.set_pref(|s| {
                     if let Some(other) = taken {
                         set_keys(s, other, String::new());
                     }
                     set_keys(s, binding, keys);
                 });
-                self.settings_note = taken.map(|other| format!("Removed from “{}”", other.label).into());
+                self.settings_note = taken.map(|other| format!("Removed from “{}”", other.label));
             }
         }
         self.end_recording();
-        cx.notify();
+        self.notify();
     }
 }
 
@@ -158,9 +175,8 @@ mod tests {
     fn defaults_parse_and_never_collide() {
         let mut seen = std::collections::HashSet::new();
         for binding in SHORTCUTS.iter().filter(|binding| !binding.keys.is_empty()) {
-            let parsed = Keystroke::parse(binding.keys).unwrap_or_else(|_| panic!("{} does not parse", binding.keys));
-            // The key monitor matches gpui's own spelling, so defaults must already be in it.
-            assert_eq!(parsed.unparse(), binding.keys);
+            // The key monitor matches one spelling, so defaults must already be in it.
+            assert_eq!(canonical(binding.keys).as_deref(), Some(binding.keys));
             assert!(seen.insert(binding.keys), "{} bound twice", binding.keys);
         }
     }
@@ -177,6 +193,8 @@ mod tests {
         assert!(!map.iter().any(|(keys, action)| keys == "cmd-t" || *action == Shortcut::CloseTab));
         assert_eq!(hint(&settings, Shortcut::NewTab), "⌃⌘T");
         assert_eq!(label("cmd-shift-["), "⇧⌘[");
+        assert_eq!(label("cmd--"), "⌘-");
+        assert_eq!(canonical("shift-cmd-t").as_deref(), Some("cmd-shift-t"));
         // Setting a default back drops the override.
         set_keys(&mut settings, new_tab, "cmd-t".into());
         assert!(!settings.shortcuts.contains_key("new_tab"));

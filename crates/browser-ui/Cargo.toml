@@ -14,15 +14,12 @@ browser-engine-macos = { path = "../browser-engine-macos" }
 browser-extensions = { path = "../browser-extensions" }
 browser-storage = { path = "../browser-storage" }
 core-text = "21"
+dispatch2 = "0.3"
 flate2 = "1"
 futures = "0.3"
-gpui = { workspace = true }
-gpui_platform = { workspace = true }
-gpuikit = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 portable-pty = "0.9"
-raw-window-handle = "0.6"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

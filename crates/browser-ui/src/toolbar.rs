@@ -1,23 +1,23 @@
 //! The tools at the title bar's right end: pinned extensions, find, history, bookmarks and extensions, in one
-//! Liquid Glass capsule over the GPUI view.
+//! Liquid Glass capsule.
 
 use crate::native::{text, Ink, Key, Node, Pop, Style, Weight};
 use crate::window::{BrowserWindow, Popover};
 use browser_engine::LogicalRect;
-use gpui::{px, Context, Window};
+use crate::geom::{point, size, Bounds};
 
 const BUTTON: f64 = 28.;
 const HEIGHT: f64 = 26.;
 
 impl BrowserWindow {
-    pub(crate) fn sync_toolbar(&mut self, pop: &mut Pop, bars: &mut Vec<&'static str>, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_toolbar(&mut self, pop: &mut Pop, bars: &mut Vec<&'static str>) {
         let mut tools = Vec::new();
         if self.store_page_id().is_some() {
-            let add = pop.act(|this, cx| {
+            let add = pop.act(|this| {
                 if let Some(id) = this.store_page_id() {
                     this.install_from_store(id);
                 }
-                cx.notify();
+                this.notify();
             });
             tools.push(Node::Button { title: "Add to NxBrowser".into(), action: add, style: Style::Primary, key: Key::None, enabled: true });
         }
@@ -27,36 +27,36 @@ impl BrowserWindow {
             let id = extension.id.clone();
             let icon = self.ext_meta.get(&id).and_then(|meta| meta.icon.clone());
             let badge = self.engine.extensions().badge(&id, &store, tab.as_deref());
-            let open = pop.act(move |this, cx| {
+            let open = pop.act(move |this| {
                 let x = this.engine.pointer().map_or(0., |(x, _)| x as f32);
-                this.open_extension(&id, x, cx);
+                this.open_extension(&id, x);
             });
             let item = button(open, crate::extensions::extension_image(&extension.name, icon, 16.));
             tools.push(if badge.is_empty() { item } else { Node::Overlay { child: Box::new(item), corner: Box::new(text(badge, 8., Weight::Semibold, Ink::Accent)) } });
         }
         if self.model.detached.is_some() {
             // Torn-off windows: the visible way back, besides dropping the title bar on the main one.
-            let merge = pop.act(|this, cx| {
+            let merge = pop.act(|this| {
                 this.merge_requested = true;
-                cx.notify();
+                this.notify();
             });
             tools.push(button(merge, glyph("rectangle.portrait.and.arrow.right")));
         }
-        if matches!(crate::update::status(cx), crate::update::Status::Ready { .. }) {
-            let restart = pop.act(|_, cx| crate::update::restart(cx));
+        if matches!(crate::update::status(), crate::update::Status::Ready { .. }) {
+            let restart = pop.act(|_| crate::update::restart());
             tools.push(Node::Button { title: "Restart to Update".into(), action: restart, style: Style::Primary, key: Key::None, enabled: true });
         }
-        let find = pop.act(|this, cx| {
+        let find = pop.act(|this| {
             if this.find_here() {
                 this.close_find();
             } else {
                 this.open_find();
             }
-            cx.notify();
+            this.notify();
         });
         tools.push(selected(self.find_here(), button(find, glyph("magnifyingglass"))));
         if !self.tab_window {
-            let windows = pop.act(|this, _| this.open_windows_menu());
+            let windows = pop.act(|this| this.open_windows_menu());
             tools.push(button(windows, glyph("square.on.square")));
         }
         let mut anchors = Vec::new();
@@ -65,15 +65,15 @@ impl BrowserWindow {
             (Popover::Bookmarks, glyph("bookmark"), self.popover == Some(Popover::Bookmarks)),
             (Popover::Extensions, Node::Svg { data: crate::native::asset(crate::PUZZLE_ICON).unwrap_or_default(), size: 14., ink: Ink::Secondary }, self.popover == Some(Popover::Extensions)),
         ] {
-            let toggle = pop.act(move |this, cx| this.toggle_popover(kind, cx));
+            let toggle = pop.act(move |this| this.toggle_popover(kind));
             anchors.push((toggle, kind));
             tools.push(selected(on, button(toggle, icon)));
         }
         let content = Node::Column { gap: 0., pad: (4., (HEIGHT - 22.) / 2.), children: vec![Node::Row { gap: 2., children: tools }] };
         // The dock's right end in the main window; a torn-off window's title bar's right end.
-        let (right, top, open) = match self.dock_at(window) {
+        let (right, top, open) = match self.dock_at() {
             Some((right, top, open)) => (right, top + (crate::window::DOCK_H - HEIGHT) / 2., open - top),
-            None => (f64::from(window.viewport_size().width) - 8., (f64::from(self.titlebar_h()) - HEIGHT) / 2., 0.),
+            None => (f64::from(self.viewport().width) - 8., (f64::from(self.titlebar_h()) - HEIGHT) / 2., 0.),
         };
         self.toolbar_w = self.engine.set_bar("toolbar", LogicalRect { x: right, y: top, width: 0., height: HEIGHT }, Some(HEIGHT / 2.), &content);
         bars.push("toolbar");
@@ -81,7 +81,7 @@ impl BrowserWindow {
             if let Some((_, kind)) = anchors.iter().find(|(toggle, _)| *toggle == action) {
                 // Where the button is once the dock is up, which it is while what it opened is.
                 let y = frame.y + open;
-                let bounds = gpui::Bounds::new(gpui::point(px(frame.x as f32), px(y as f32)), gpui::size(px(frame.width as f32), px(frame.height as f32)));
+                let bounds = Bounds::new(point(frame.x as f32, y as f32), size(frame.width as f32, frame.height as f32));
                 self.popover_anchors.insert(*kind, bounds);
             }
         }
@@ -105,14 +105,14 @@ impl BrowserWindow {
             let label = crate::tabs::tab_label(&tab.title, &tab.url);
             let label = if minimized { format!("{label} (Minimized)") } else { label };
             let id = tab.id.clone();
-            rows.push(crate::settings::menu_item(label, true, move |this, cx| this.focus_window(&id, cx)));
+            rows.push(crate::settings::menu_item(label, true, move |this| this.focus_window(&id)));
         }
         rows.push(None);
         let session = self.model.lock().active_session_id.clone();
         let label = if self.free_space() { "Tile Windows" } else { "Float Windows" };
-        rows.push(crate::settings::menu_item(label, true, move |this, cx| this.toggle_free(&session, cx)));
+        rows.push(crate::settings::menu_item(label, true, move |this| this.toggle_free(&session)));
         let (x, y) = self.engine.pointer().unwrap_or_default();
-        self.show_menu(rows, gpui::point(px(x as f32), px(y as f32)));
+        self.show_menu(rows, point(x as f32, y as f32));
     }
 }
 

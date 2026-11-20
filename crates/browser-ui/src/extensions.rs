@@ -2,7 +2,6 @@ use crate::native::{button, empty, field, rgb, sheet, text, title, Ink, Key, Nod
 use crate::window::Popover;
 use crate::window::{site_color, BrowserWindow};
 use browser_extensions::store_id;
-use gpui::Context;
 
 /// The install field in the extensions popover.
 pub(crate) const EXT_FIELD: u32 = 0;
@@ -24,7 +23,7 @@ impl BrowserWindow {
             children: vec![text("Extensions", 15., Weight::Semibold, Ink::Primary), text(summary, 12., Weight::Regular, Ink::Secondary)],
         }];
         if let Some(id) = self.store_page_id() {
-            let add = pop.act(move |this, _| this.install_from_store(id.clone()));
+            let add = pop.act(move |this| this.install_from_store(id.clone()));
             children.push(Node::Column {
                 gap: 0.,
                 pad: (12., 0.),
@@ -49,7 +48,7 @@ impl BrowserWindow {
         for (prompt, id, request) in self.ext_prompts.clone() {
             let name = extensions.iter().find(|extension| extension.id == id).map_or(id.clone(), |extension| extension.name.clone());
             let icon = self.ext_meta.get(&id).and_then(|meta| meta.icon.clone());
-            let (deny, allow) = (pop.act(move |this, _| this.answer_prompt(prompt, false)), pop.act(move |this, _| this.answer_prompt(prompt, true)));
+            let (deny, allow) = (pop.act(move |this| this.answer_prompt(prompt, false)), pop.act(move |this| this.answer_prompt(prompt, true)));
             children.push(Node::Column {
                 gap: 0.,
                 pad: (12., 4.),
@@ -108,20 +107,20 @@ impl BrowserWindow {
         } else {
             children.push(Node::Scroll { max: 360., child: Box::new(Node::Column { gap: 2., pad: (6., 0.), children: rows }) });
         }
-        let install = pop.act(|this, cx| {
+        let install = pop.act(|this| {
             let raw = this.popover_texts.get(&EXT_FIELD).cloned().unwrap_or_default();
-            this.install_from_input(&raw, cx);
+            this.install_from_input(&raw);
         });
-        let browse = pop.act(|this, _| {
+        let browse = pop.act(|this| {
             this.popover = None;
             this.with_model(|model| { let _ = model.create_tab(STORE_URL); });
         });
-        let unpacked = pop.act(|this, cx| this.load_unpacked(cx));
-        let done = pop.act(|this, cx| {
+        let unpacked = pop.act(|this| this.load_unpacked());
+        let done = pop.act(|this| {
             this.popover = None;
-            cx.notify();
+            this.notify();
         });
-        let reload = pop.act(|this, _| {
+        let reload = pop.act(|this| {
             this.reload_extensions();
             this.status = "Extensions reloaded".into();
         });
@@ -179,9 +178,9 @@ impl BrowserWindow {
             actions.push(Node::Tool {
                 symbol: "gearshape",
                 tip: "Options",
-                action: pop.act(move |this, cx| {
+                action: pop.act(move |this| {
                     this.popover = None;
-                    this.open_extension_options(&id, cx);
+                    this.open_extension_options(&id);
                 }),
                 on: false,
             });
@@ -190,14 +189,14 @@ impl BrowserWindow {
         actions.push(Node::Tool {
             symbol: "list.bullet.rectangle",
             tip: "Logs",
-            action: pop.act(move |this, _| {
+            action: pop.act(move |this| {
                 this.popover = None;
                 this.ext_logs = Some(logs.clone());
             }),
             on: false,
         });
         let remove = id.clone();
-        actions.push(Node::Tool { symbol: "trash", tip: "Remove", action: pop.act(move |this, _| this.remove_extension(&remove)), on: false });
+        actions.push(Node::Tool { symbol: "trash", tip: "Remove", action: pop.act(move |this| this.remove_extension(&remove)), on: false });
         let mut children = vec![
             if enabled { icon } else { Node::Faded(Box::new(icon)) },
             Node::Column { gap: 2., pad: (0., 0.), children: vec![title(name, 13., Weight::Medium, if enabled { Ink::Primary } else { Ink::Secondary }), detail] },
@@ -208,7 +207,7 @@ impl BrowserWindow {
             let pin = Node::Tool {
                 symbol: if pinned { "pin.fill" } else { "pin" },
                 tip: if pinned { "Unpin from the title bar" } else { "Pin to the title bar" },
-                action: pop.act(move |this, _| {
+                action: pop.act(move |this| {
                     let _ = this.model.lock().set_extension_pinned(&pin_id, !pinned);
                 }),
                 on: pinned,
@@ -218,7 +217,7 @@ impl BrowserWindow {
         let toggle_id = id.clone();
         children.push(Node::Switch {
             on: enabled,
-            action: pop.act(move |this, _| {
+            action: pop.act(move |this| {
                 let _ = this.model.lock().set_extension_enabled(&toggle_id, !enabled);
                 this.sync_extension(&toggle_id);
             }),
@@ -227,10 +226,10 @@ impl BrowserWindow {
         Node::Item {
             height: 44.,
             click: enabled.then(|| {
-                pop.act(move |this, cx| {
+                pop.act(move |this| {
                     this.popover = None;
-                    let at = this.popover_anchors.get(&Popover::Extensions).map_or(0., |bounds| f32::from(bounds.center().x));
-                    this.open_extension(&open, at, cx);
+                    let at = this.popover_anchors.get(&Popover::Extensions).map_or(0., |bounds| bounds.center().x);
+                    this.open_extension(&open, at);
                 })
             }),
             drag: None,
@@ -255,17 +254,17 @@ impl BrowserWindow {
             }
             Node::Scroll { max: 380., child: Box::new(Node::Column { gap: 6., pad: (0., 0.), children: rows }) }
         };
-        let copy = pop.act(move |this, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text_.clone()));
+        let copy = pop.act(move |this| {
+            browser_engine_macos::set_clipboard_text(&text_.clone());
             this.status = "Copied logs".into();
         });
-        let done = pop.act(|this, cx| this.close_ext_logs(cx));
+        let done = pop.act(|this| this.close_ext_logs());
         sheet(format!("Logs · {name}"), vec![list], vec![button("Copy", copy, Style::Plain, Key::None), button("Done", done, Style::Primary, Key::Escape)])
     }
 
-    fn close_ext_logs(&mut self, cx: &mut Context<Self>) {
+    fn close_ext_logs(&mut self) {
         self.ext_logs = None;
-        cx.notify();
+        self.notify();
     }
 
     fn answer_prompt(&mut self, prompt: u64, allow: bool) {

@@ -3,7 +3,6 @@
 use crate::settings::MenuAction;
 use crate::window::BrowserWindow;
 pub(crate) use browser_engine_macos::{Initial, Ink, Key, Node, Style, Weight, Wrap};
-use gpui::Context;
 
 /// Action ids from here up belong to the open sheet; below, to the open popover.
 pub(crate) const SHEET_BASE: u32 = 1 << 20;
@@ -81,26 +80,43 @@ impl Pop {
         Self { actions: Vec::new(), base: BAR_BASE }
     }
 
-    pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow, &mut Context<BrowserWindow>) + 'static) -> u32 {
+    pub(crate) fn act(&mut self, run: impl Fn(&mut BrowserWindow) + 'static) -> u32 {
         self.actions.push(Box::new(run));
         self.base + (self.actions.len() - 1) as u32
     }
 }
 
-/// An app asset (an SVG icon) for the life of the app; each is loaded once.
+/// An app asset (an SVG icon) by its path: the app's own icons, agent logos and profile icons.
 pub(crate) fn asset(path: &str) -> Option<&'static [u8]> {
-    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<String, &'static [u8]>>> = std::sync::Mutex::new(None);
-    let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cache = cache.get_or_insert_with(Default::default);
-    if let Some(bytes) = cache.get(path) {
-        return Some(bytes);
-    }
-    let bytes: &'static [u8] = match gpui::AssetSource::load(&crate::Assets, path).ok()?? {
-        std::borrow::Cow::Borrowed(bytes) => bytes,
-        std::borrow::Cow::Owned(bytes) => Box::leak(bytes.into_boxed_slice()),
-    };
-    cache.insert(path.to_string(), bytes);
-    Some(bytes)
+    Some(match path {
+        crate::PUZZLE_ICON => include_bytes!("../assets/puzzle.svg"),
+        crate::MIC_ICON => include_bytes!("../assets/mic.svg"),
+        // Agent logos for terminal tabs (simple-icons, CC0); paths from `terminal::Agent::icon`.
+        "icons/agents/claude.svg" => include_bytes!("../assets/agents/claude.svg"),
+        "icons/agents/openai.svg" => include_bytes!("../assets/agents/openai.svg"),
+        "icons/agents/opencode.svg" => include_bytes!("../assets/agents/opencode.svg"),
+        "icons/agents/gemini.svg" => include_bytes!("../assets/agents/gemini.svg"),
+        "icons/agents/cursor.svg" => include_bytes!("../assets/agents/cursor.svg"),
+        "icons/agents/copilot.svg" => include_bytes!("../assets/agents/copilot.svg"),
+        // Profile icons (Radix, MIT); the paths are saved in profiles, so they keep the names gpuikit gave them.
+        "icons/radix/home.svg" => include_bytes!("../assets/radix/home.svg"),
+        "icons/radix/person.svg" => include_bytes!("../assets/radix/person.svg"),
+        "icons/radix/rocket.svg" => include_bytes!("../assets/radix/rocket.svg"),
+        "icons/radix/star.svg" => include_bytes!("../assets/radix/star.svg"),
+        "icons/radix/heart.svg" => include_bytes!("../assets/radix/heart.svg"),
+        "icons/radix/gear.svg" => include_bytes!("../assets/radix/gear.svg"),
+        "icons/radix/globe.svg" => include_bytes!("../assets/radix/globe.svg"),
+        "icons/radix/lightning-bolt.svg" => include_bytes!("../assets/radix/lightning-bolt.svg"),
+        "icons/radix/moon.svg" => include_bytes!("../assets/radix/moon.svg"),
+        "icons/radix/sun.svg" => include_bytes!("../assets/radix/sun.svg"),
+        "icons/radix/code.svg" => include_bytes!("../assets/radix/code.svg"),
+        "icons/radix/backpack.svg" => include_bytes!("../assets/radix/backpack.svg"),
+        "icons/radix/camera.svg" => include_bytes!("../assets/radix/camera.svg"),
+        "icons/radix/laptop.svg" => include_bytes!("../assets/radix/laptop.svg"),
+        "icons/radix/reader.svg" => include_bytes!("../assets/radix/reader.svg"),
+        "icons/radix/target.svg" => include_bytes!("../assets/radix/target.svg"),
+        _ => return None,
+    })
 }
 
 /// One line of text that keeps its width.
@@ -197,7 +213,6 @@ pub(crate) fn label(text_: &str) -> Node {
     text(text_, 12., Weight::Regular, Ink::Secondary)
 }
 
-pub(crate) fn rgb(color: gpui::Hsla) -> [f64; 3] {
-    let rgba = gpui::Rgba::from(color);
-    [f64::from(rgba.r), f64::from(rgba.g), f64::from(rgba.b)]
+pub(crate) fn rgb([red, green, blue, _]: crate::window::Color) -> [f64; 3] {
+    [red, green, blue]
 }
